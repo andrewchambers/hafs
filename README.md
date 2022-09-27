@@ -1,14 +1,14 @@
 # foundation-fs
 
-An experimental and vapourware distributed filesystem library and fuse filesystem built on foundation db.
+An experimental and vapourware distributed filesystem library and fuse filesystem built on FoundationDB.
 
 # Goals
 
 ## Motivation
 
 [bupstash.io](https://bupstash.io/) needs a reliable and fault tolerant way to serve repository metadata 
-that is easy to administer and distribute across many machine. This project is an experiment to investigate the feasibiltiy and complexity
-of using foundationdb as the base system for a metadata filesystem.
+that is easy to administer and distribute across many machines. This project is an experiment to investigate the feasibiltiy and complexity
+of using FoundationDB as the base system for a metadata filesystem.
 
 ## Initial Goals
 
