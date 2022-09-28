@@ -66,6 +66,23 @@ type Stat struct {
 	Rdev      uint32
 }
 
+func (stat *Stat) setTime(t time.Time, secs *uint64, nsecs *uint32) {
+	*secs = uint64(t.Unix())
+	*nsecs = uint32((*secs)*1_000_000_000 - uint64(t.UnixNano()))
+}
+
+func (stat *Stat) SetMtime(t time.Time) {
+	stat.setTime(t, &stat.Mtime, &stat.Mtimensec)
+}
+
+func (stat *Stat) SetAtime(t time.Time) {
+	stat.setTime(t, &stat.Atime, &stat.Atimensec)
+}
+
+func (stat *Stat) SetCtime(t time.Time) {
+	stat.setTime(t, &stat.Ctime, &stat.Ctimensec)
+}
+
 type Fs struct {
 	db            fdb.Database
 	mountId       string
@@ -80,18 +97,16 @@ func init() {
 func Mkfs(db fdb.Database) error {
 	_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		now := time.Now()
-		unixNow := uint64(now.Unix())
-		unixNowNSec := uint32(unixNow*1_000_000_000 - uint64(now.UnixNano()))
 
 		rootStat := Stat{
 			Ino:       ROOT_INO,
 			Size:      0,
-			Atime:     unixNow,
-			Mtime:     unixNow,
-			Ctime:     unixNow,
-			Atimensec: unixNowNSec,
-			Mtimensec: unixNowNSec,
-			Ctimensec: unixNowNSec,
+			Atime:     0,
+			Mtime:     0,
+			Ctime:     0,
+			Atimensec: 0,
+			Mtimensec: 0,
+			Ctimensec: 0,
 			Mode:      S_IFDIR | 0o755,
 			Nlink:     1,
 			Nchild:    0,
@@ -99,6 +114,10 @@ func Mkfs(db fdb.Database) error {
 			Gid:       0,
 			Rdev:      0,
 		}
+
+		rootStat.SetMtime(now)
+		rootStat.SetCtime(now)
+		rootStat.SetAtime(now)
 
 		rootStatBytes, err := json.Marshal(rootStat)
 		if err != nil {
@@ -347,19 +366,15 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error
 			}
 		}
 
-		now := time.Now()
-		unixNow := uint64(now.Unix())
-		unixNowNSec := uint32(unixNow*1_000_000_000 - uint64(now.UnixNano()))
-
 		newStat := Stat{
 			Ino:       newIno,
 			Size:      0,
-			Atime:     unixNow,
-			Mtime:     unixNow,
-			Ctime:     unixNow,
-			Atimensec: unixNowNSec,
-			Mtimensec: unixNowNSec,
-			Ctimensec: unixNowNSec,
+			Atime:     0,
+			Mtime:     0,
+			Ctime:     0,
+			Atimensec: 0,
+			Mtimensec: 0,
+			Ctimensec: 0,
 			Mode:      opts.Mode,
 			Nlink:     1,
 			Nchild:    0,
@@ -367,6 +382,11 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error
 			Gid:       opts.Gid,
 			Rdev:      opts.Rdev,
 		}
+
+		now := time.Now()
+		newStat.SetMtime(now)
+		newStat.SetCtime(now)
+		newStat.SetAtime(now)
 
 		fs.txSetStat(tx, newStat)
 		dirStat.Nchild += 1
@@ -384,46 +404,47 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error
 	return newIno.(uint64), nil
 }
 
-func (fs *Fs) txUnlink(tx fdb.Transaction, dirIno uint64, name string) error {
-	dirStatFut := fs.txGetStat(tx, dirIno)
-
-	dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
-	if err != nil {
-		return err
-	}
-	stat, err := fs.txGetStat(tx, dirEnt.Ino).Get()
-	if err != nil {
-		return err
-	}
-
-	dirStat, err := dirStatFut.Get()
-	if err != nil {
-		return err
-	}
-
-	if dirEnt.Mode&S_IFMT == S_IFDIR {
-		if stat.Nchild != 0 {
-			return ErrNotEmpty
-		}
-	}
-
-	dirStat.Nchild -= 1
-	fs.txSetStat(tx, dirStat)
-
-	if stat.Nlink == 1 {
-		tx.ClearRange(tuple.Tuple{"fs", "ino", dirEnt.Ino})
-	} else {
-		stat.Nlink -= 1
-		fs.txSetStat(tx, stat)
-	}
-
-	tx.Clear(tuple.Tuple{"fs", "ino", dirIno, "child", name})
-	return nil
-}
-
 func (fs *Fs) Unlink(dirIno uint64, name string) error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		return nil, fs.txUnlink(tx, dirIno, name)
+		dirStatFut := fs.txGetStat(tx, dirIno)
+
+		dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
+		if err != nil {
+			return nil, err
+		}
+		stat, err := fs.txGetStat(tx, dirEnt.Ino).Get()
+		if err != nil {
+			return nil, err
+		}
+
+		dirStat, err := dirStatFut.Get()
+		if err != nil {
+			return nil, err
+		}
+
+		if dirEnt.Mode&S_IFMT == S_IFDIR {
+			if stat.Nchild != 0 {
+				return nil, ErrNotEmpty
+			}
+		}
+
+		dirStat.Nchild -= 1
+		now := time.Now()
+		dirStat.SetMtime(now)
+		dirStat.SetCtime(now)
+		fs.txSetStat(tx, dirStat)
+
+		if stat.Nlink == 1 {
+			tx.ClearRange(tuple.Tuple{"fs", "ino", dirEnt.Ino})
+		} else {
+			stat.Nlink -= 1
+			stat.SetMtime(now)
+			stat.SetCtime(now)
+			fs.txSetStat(tx, stat)
+		}
+
+		tx.Clear(tuple.Tuple{"fs", "ino", dirIno, "child", name})
+		return nil, nil
 	})
 	return err
 }
@@ -472,13 +493,15 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 		if toDirStatErr != nil {
 			return nil, toDirStatErr
 		}
-		if toDirStat.Mode&S_IFMT != S_IFDIR {
-			return nil, ErrNotDir
-		}
 
 		if fromDirStatErr != nil {
 			return nil, fromDirStatErr
 		}
+
+		if toDirStat.Mode&S_IFMT != S_IFDIR {
+			return nil, ErrNotDir
+		}
+
 		if fromDirStat.Mode&S_IFMT != S_IFDIR {
 			return nil, ErrNotDir
 		}
@@ -486,6 +509,8 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 		if fromDirEntErr != nil {
 			return nil, fromDirEntErr
 		}
+
+		now := time.Now()
 
 		if errors.Is(toDirEntErr, ErrNotExist) {
 			/* Nothing to do. */
@@ -505,6 +530,8 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 				tx.ClearRange(tuple.Tuple{"fs", "ino", toStat.Ino})
 			} else {
 				toStat.Nlink -= 1
+				toStat.SetMtime(now)
+				toStat.SetCtime(now)
 				fs.txSetStat(tx, toStat)
 			}
 		}
@@ -513,13 +540,19 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 			if errors.Is(toDirEntErr, ErrNotExist) {
 				toDirStat.Nchild += 1
 			}
+			toDirStat.SetMtime(now)
+			toDirStat.SetCtime(now)
 			fs.txSetStat(tx, toDirStat)
 			fromDirStat.Nchild -= 1
+			fromDirStat.SetMtime(now)
+			toDirStat.SetCtime(now)
 			fs.txSetStat(tx, fromDirStat)
 		} else {
 			if toDirEntErr == nil {
 				toDirStat.Nchild -= 1
 			}
+			toDirStat.SetMtime(now)
+			toDirStat.SetCtime(now)
 			fs.txSetStat(tx, toDirStat)
 		}
 

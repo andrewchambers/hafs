@@ -209,3 +209,133 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 	}
 
 }
+
+func TestRenameDifferentDir(t *testing.T) {
+	fs := tmpFs(t)
+
+	dIno, err := fs.Create(ROOT_INO, "d", CreateOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fooIno, err := fs.Create(ROOT_INO, "foo", CreateOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.Rename(ROOT_INO, dIno, "foo", "bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.Lookup(ROOT_INO, "foo")
+	if !errors.Is(err, ErrNotExist) {
+		t.Fatal(err)
+	}
+
+	barStat, err := fs.Lookup(dIno, "bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if barStat.Ino != fooIno {
+		t.Fatalf("bar1 stat is bad: %#v", barStat)
+	}
+
+	rootStat, err := fs.Stat(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootStat.Nchild != 1 {
+		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
+	}
+
+	dStat, err := fs.Stat(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dStat.Nchild != 1 {
+		t.Fatalf("unexpected number of children: %d", dStat.Nchild)
+	}
+
+}
+
+func TestRenameDifferentDirOverwrite(t *testing.T) {
+	fs := tmpFs(t)
+
+	dIno, err := fs.Create(ROOT_INO, "d", CreateOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	barIno, err := fs.Create(dIno, "bar", CreateOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fooIno, err := fs.Create(ROOT_INO, "foo", CreateOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.Rename(ROOT_INO, dIno, "foo", "bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.Lookup(ROOT_INO, "foo")
+	if !errors.Is(err, ErrNotExist) {
+		t.Fatal(err)
+	}
+
+	barStat, err := fs.Lookup(dIno, "bar")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if barStat.Ino != fooIno {
+		t.Fatalf("bar1 stat is bad: %#v", barStat)
+	}
+
+	rootStat, err := fs.Stat(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootStat.Nchild != 1 {
+		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
+	}
+
+	dStat, err := fs.Stat(dIno)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dStat.Nchild != 1 {
+		t.Fatalf("unexpected number of children: %d", dStat.Nchild)
+	}
+
+	_, err = fs.Stat(barIno)
+	if !errors.Is(err, ErrNotExist) {
+		t.Fatal(err)
+	}
+
+}
