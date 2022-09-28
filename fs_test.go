@@ -109,3 +109,103 @@ func TestUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestRenameSameDir(t *testing.T) {
+	fs := tmpFs(t)
+
+	foo1Ino, err := fs.Create(ROOT_INO, "foo1", CreateOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.Create(ROOT_INO, "foo2", CreateOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.Rename(ROOT_INO, ROOT_INO, "foo1", "bar1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.Lookup(ROOT_INO, "foo1")
+	if !errors.Is(err, ErrNotExist) {
+		t.Fatal(err)
+	}
+
+	bar1Stat, err := fs.Lookup(ROOT_INO, "bar1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if bar1Stat.Ino != foo1Ino {
+		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
+	}
+
+	rootStat, err := fs.Stat(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootStat.Nchild != 2 {
+		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
+	}
+
+}
+
+func TestRenameSameDirOverwrite(t *testing.T) {
+	fs := tmpFs(t)
+
+	foo1Ino, err := fs.Create(ROOT_INO, "foo1", CreateOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.Create(ROOT_INO, "bar1", CreateOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.Rename(ROOT_INO, ROOT_INO, "foo1", "bar1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.Lookup(ROOT_INO, "foo1")
+	if !errors.Is(err, ErrNotExist) {
+		t.Fatal(err)
+	}
+
+	bar1Stat, err := fs.Lookup(ROOT_INO, "bar1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if bar1Stat.Ino != foo1Ino {
+		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
+	}
+
+	rootStat, err := fs.Stat(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rootStat.Nchild != 1 {
+		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
+	}
+
+}

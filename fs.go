@@ -22,6 +22,7 @@ var (
 	ErrNotExist  = gofs.ErrNotExist
 	ErrExist     = gofs.ErrExist
 	ErrNotEmpty  = errors.New("directory is not empty")
+	ErrNotDir    = errors.New("not a directory")
 	ErrUnmounted = errors.New("filesystem unmounted")
 )
 
@@ -194,7 +195,7 @@ func (fs *Fs) Close() error {
 	fs.workerWg.Wait()
 
 	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		tx.ClearRange(tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"})
+		tx.ClearRange(tuple.Tuple{"fs", "mounts", fs.mountId})
 		return nil, nil
 	})
 	if err != nil {
@@ -245,37 +246,36 @@ func (fut futureStat) Get() (Stat, error) {
 	return stat, nil
 }
 
-func (fs *Fs) txStat(tx fdb.ReadTransaction, ino uint64) futureStat {
+func (fs *Fs) txGetStat(tx fdb.ReadTransaction, ino uint64) futureStat {
 	return futureStat{
 		ino:   ino,
 		bytes: tx.Get(tuple.Tuple{"fs", "ino", ino, "stat"}),
 	}
 }
 
-func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) error {
+func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) {
 	statBytes, err := json.Marshal(stat)
 	if err != nil {
-		return err
+		panic(err)
 	}
 	tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "stat"}, statBytes)
-	return nil
 }
 
-func (fs *Fs) txNextIno(tx fdb.Transaction) (uint64, error) {
+func (fs *Fs) txNextIno(tx fdb.Transaction) uint64 {
 	// XXX If we avoid json for this we can use fdb native increment.
 	// XXX Lots of contention, we could use an array of counters and choose one.
 	var ino uint64
 	nextInoBytes := tx.Get(tuple.Tuple{"fs", "nextino"}).MustGet()
 	err := json.Unmarshal(nextInoBytes, &ino)
 	if err != nil {
-		return 0, err
+		panic(err)
 	}
 	nextInoBytes, err = json.Marshal(ino + 1)
 	if err != nil {
-		return 0, err
+		panic(err)
 	}
 	tx.Set(tuple.Tuple{"fs", "nextino"}, nextInoBytes)
-	return ino, nil
+	return ino
 }
 
 type futureGetDirEnt struct {
@@ -298,13 +298,12 @@ func (fs *Fs) txGetDirEnt(tx fdb.ReadTransaction, dirIno uint64, name string) fu
 	}
 }
 
-func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, name string, ent DirEnt) error {
+func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, name string, ent DirEnt) {
 	dirEntBytes, err := json.Marshal(ent)
 	if err != nil {
-		return err
+		panic(err)
 	}
 	tx.Set(tuple.Tuple{"fs", "ino", dirIno, "child", name}, dirEntBytes)
-	return nil
 }
 
 func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
@@ -323,18 +322,20 @@ type CreateOpts struct {
 }
 
 func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error) {
+
 	newIno, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		dirStatFut := fs.txStat(tx, dirIno)
+		dirStatFut := fs.txGetStat(tx, dirIno)
 		getDirEntFut := fs.txGetDirEnt(tx, dirIno, name)
 
-		newIno, err := fs.txNextIno(tx)
-		if err != nil {
-			return 0, err
-		}
+		newIno := fs.txNextIno(tx)
 
 		dirStat, err := dirStatFut.Get()
 		if err != nil {
 			return 0, err
+		}
+
+		if dirStat.Mode&S_IFMT != S_IFDIR {
+			return nil, ErrNotDir
 		}
 
 		_, err = getDirEntFut.Get()
@@ -367,24 +368,13 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error
 			Rdev:      opts.Rdev,
 		}
 
-		err = fs.txSetStat(tx, newStat)
-		if err != nil {
-			return 0, err
-		}
-
+		fs.txSetStat(tx, newStat)
 		dirStat.Nchild += 1
-		err = fs.txSetStat(tx, dirStat)
-		if err != nil {
-			return 0, err
-		}
-
-		err = fs.txSetDirEnt(tx, dirIno, name, DirEnt{
+		fs.txSetStat(tx, dirStat)
+		fs.txSetDirEnt(tx, dirIno, name, DirEnt{
 			Mode: opts.Mode & S_IFMT,
 			Ino:  newIno,
 		})
-		if err != nil {
-			return 0, err
-		}
 
 		return newIno, nil
 	})
@@ -394,57 +384,53 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error
 	return newIno.(uint64), nil
 }
 
+func (fs *Fs) txUnlink(tx fdb.Transaction, dirIno uint64, name string) error {
+	dirStatFut := fs.txGetStat(tx, dirIno)
+
+	dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
+	if err != nil {
+		return err
+	}
+	stat, err := fs.txGetStat(tx, dirEnt.Ino).Get()
+	if err != nil {
+		return err
+	}
+
+	dirStat, err := dirStatFut.Get()
+	if err != nil {
+		return err
+	}
+
+	if dirEnt.Mode&S_IFMT == S_IFDIR {
+		if stat.Nchild != 0 {
+			return ErrNotEmpty
+		}
+	}
+
+	dirStat.Nchild -= 1
+	fs.txSetStat(tx, dirStat)
+
+	if stat.Nlink == 1 {
+		tx.ClearRange(tuple.Tuple{"fs", "ino", dirEnt.Ino})
+	} else {
+		stat.Nlink -= 1
+		fs.txSetStat(tx, stat)
+	}
+
+	tx.Clear(tuple.Tuple{"fs", "ino", dirIno, "child", name})
+	return nil
+}
+
 func (fs *Fs) Unlink(dirIno uint64, name string) error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-
-		dirStatFut := fs.txStat(tx, dirIno)
-
-		dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
-		if err != nil {
-			return nil, err
-		}
-		stat, err := fs.txStat(tx, dirEnt.Ino).Get()
-		if err != nil {
-			return nil, err
-		}
-
-		dirStat, err := dirStatFut.Get()
-		if err != nil {
-			return nil, err
-		}
-
-		if dirEnt.Mode&S_IFMT == S_IFDIR {
-			if stat.Nchild != 0 {
-				return nil, ErrNotEmpty
-			}
-		}
-
-		dirStat.Nchild -= 1
-		err = fs.txSetStat(tx, dirStat)
-		if err != nil {
-			return nil, err
-		}
-
-		if stat.Nlink == 1 {
-			tx.ClearRange(tuple.Tuple{"fs", "ino", dirEnt.Ino})
-		} else {
-			stat.Nlink -= 1
-			err = fs.txSetStat(tx, stat)
-			if err != nil {
-				return nil, err
-			}
-		}
-
-		tx.Clear(tuple.Tuple{"fs", "ino", dirIno, "child", name})
-
-		return nil, nil
+		return nil, fs.txUnlink(tx, dirIno, name)
 	})
 	return err
 }
 
 func (fs *Fs) Stat(ino uint64) (Stat, error) {
 	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		stat, err := fs.txStat(tx, ino).Get()
+		stat, err := fs.txGetStat(tx, ino).Get()
 		return stat, err
 	})
 	return stat.(Stat), err
@@ -456,8 +442,90 @@ func (fs *Fs) Lookup(dirIno uint64, name string) (Stat, error) {
 		if err != nil {
 			return Stat{}, err
 		}
-		stat, err := fs.txStat(tx, dirEnt.Ino).Get()
+		stat, err := fs.txGetStat(tx, dirEnt.Ino).Get()
 		return stat, err
 	})
 	return stat.(Stat), err
+}
+
+func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error {
+
+	if fromName == toName && fromDirIno == toDirIno {
+		return nil
+	}
+
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+		fromDirStatFut := fs.txGetStat(tx, fromDirIno)
+		toDirStatFut := fromDirStatFut
+		if toDirIno != fromDirIno {
+			toDirStatFut = fs.txGetStat(tx, toDirIno)
+		}
+		fromDirEntFut := fs.txGetDirEnt(tx, fromDirIno, fromName)
+		toDirEntFut := fs.txGetDirEnt(tx, toDirIno, toName)
+
+		fromDirStat, fromDirStatErr := fromDirStatFut.Get()
+		toDirStat, toDirStatErr := toDirStatFut.Get()
+		fromDirEnt, fromDirEntErr := fromDirEntFut.Get()
+		toDirEnt, toDirEntErr := toDirEntFut.Get()
+
+		if toDirStatErr != nil {
+			return nil, toDirStatErr
+		}
+		if toDirStat.Mode&S_IFMT != S_IFDIR {
+			return nil, ErrNotDir
+		}
+
+		if fromDirStatErr != nil {
+			return nil, fromDirStatErr
+		}
+		if fromDirStat.Mode&S_IFMT != S_IFDIR {
+			return nil, ErrNotDir
+		}
+
+		if fromDirEntErr != nil {
+			return nil, fromDirEntErr
+		}
+
+		if errors.Is(toDirEntErr, ErrNotExist) {
+			/* Nothing to do. */
+		} else if toDirEntErr != nil {
+			return nil, toDirEntErr
+		} else {
+			toStat, err := fs.txGetStat(tx, toDirEnt.Ino).Get()
+			if err != nil {
+				return nil, err
+			}
+			// We can't move over a directory with children.
+			if toStat.Nchild != 0 {
+				return nil, ErrNotEmpty
+			}
+
+			if toStat.Nlink == 1 {
+				tx.ClearRange(tuple.Tuple{"fs", "ino", toStat.Ino})
+			} else {
+				toStat.Nlink -= 1
+				fs.txSetStat(tx, toStat)
+			}
+		}
+
+		if toDirIno != fromDirIno {
+			if errors.Is(toDirEntErr, ErrNotExist) {
+				toDirStat.Nchild += 1
+			}
+			fs.txSetStat(tx, toDirStat)
+			fromDirStat.Nchild -= 1
+			fs.txSetStat(tx, fromDirStat)
+		} else {
+			if toDirEntErr == nil {
+				toDirStat.Nchild -= 1
+			}
+			fs.txSetStat(tx, toDirStat)
+		}
+
+		tx.Clear(tuple.Tuple{"fs", "ino", fromDirIno, "child", fromName})
+		fs.txSetDirEnt(tx, toDirIno, toName, fromDirEnt)
+		return nil, nil
+	})
+	return err
 }
