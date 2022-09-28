@@ -19,27 +19,49 @@ import (
 
 var (
 	ErrNotExist  = gofs.ErrNotExist
+	ErrExist     = gofs.ErrExist
 	ErrNotEmpty  = errors.New("directory is not empty")
 	ErrUnmounted = errors.New("filesystem unmounted")
-)
-
-var (
-	ZeroI64Bytes     = []byte{0, 0, 0, 0, 0, 0, 0, 0}
-	OneI64Bytes      = []byte{1, 0, 0, 0, 0, 0, 0, 0}
-	MinusOneI64Bytes = []byte{0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff}
 )
 
 const (
 	CURRENT_FDB_API_VERSION = 600
 	CURRENT_SCHEMA_VERSION  = 1
-	ROOT_INODE              = 1
+	ROOT_INO                = 1
 )
 
-type Inode uint64
+const (
+	S_IFIFO  uint32 = 4096
+	S_IFCHR  uint32 = 8192
+	S_IFBLK  uint32 = 24576
+	S_IFDIR  uint32 = 16384
+	S_IFREG  uint32 = 32768
+	S_IFLNK  uint32 = 40960
+	S_IFSOCK uint32 = 49152
+	S_IFMT   uint32 = 61440
+)
 
-type LookupResult struct {
-	Ino  Inode
-	Mode uint64
+type DirEnt struct {
+	// Mode & S_IFMT
+	Mode uint32
+	Ino  uint64
+}
+
+type Stat struct {
+	Ino       uint64 `json:"-"`
+	Size      uint64
+	Atime     uint64
+	Mtime     uint64
+	Ctime     uint64
+	Atimensec uint32
+	Mtimensec uint32
+	Ctimensec uint32
+	Mode      uint32
+	Nlink     uint32
+	Nchild    uint64
+	Uid       uint32
+	Gid       uint32
+	Rdev      uint32
 }
 
 type Fs struct {
@@ -55,7 +77,35 @@ func init() {
 
 func Mkfs(db fdb.Database) error {
 	_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		now := time.Now()
+		unixNow := uint64(now.Unix())
+		unixNowNSec := uint32(unixNow*1_000_000_000 - uint64(now.UnixNano()))
+
+		rootStat := Stat{
+			Ino:       ROOT_INO,
+			Size:      0,
+			Atime:     unixNow,
+			Mtime:     unixNow,
+			Ctime:     unixNow,
+			Atimensec: unixNowNSec,
+			Mtimensec: unixNowNSec,
+			Ctimensec: unixNowNSec,
+			Mode:      S_IFDIR | 0o755,
+			Nlink:     1,
+			Nchild:    0,
+			Uid:       0,
+			Gid:       0,
+			Rdev:      0,
+		}
+
+		rootStatBytes, err := json.Marshal(rootStat)
+		if err != nil {
+			return nil, err
+		}
+
 		tx.Set(tuple.Tuple{"fs", "version"}, []byte{CURRENT_SCHEMA_VERSION})
+		tx.Set(tuple.Tuple{"fs", "nextino"}, []byte{'2'})
+		tx.Set(tuple.Tuple{"fs", rootStat.Ino, "stat"}, rootStatBytes)
 		return nil, nil
 	})
 	return err
@@ -176,59 +226,231 @@ func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interfa
 	})
 }
 
-func (fs *Fs) txLookup(tx fdb.ReadTransaction, ino Inode, name string) (LookupResult, error) {
-	lookupBytes := tx.Get(tuple.Tuple{"fs", ino, "child", name}).MustGet()
-	if lookupBytes == nil {
-		return LookupResult{}, ErrNotExist
-	}
-	lookup := LookupResult{}
-	err := json.Unmarshal(lookupBytes, &lookup)
-	if err != nil {
-		return LookupResult{}, err
-	}
-	return lookup, nil
+type futureStat struct {
+	ino   uint64
+	bytes fdb.FutureByteSlice
 }
 
-func (fs *Fs) Lookup(ino Inode, name string) (LookupResult, error) {
-	lookup, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		lookup, err := fs.txLookup(tx, ino, name)
-		return lookup, err
+func (fut futureStat) Get() (Stat, error) {
+	statBytes := fut.bytes.MustGet()
+	if statBytes == nil {
+		return Stat{}, ErrNotExist
+	}
+	stat := Stat{}
+	err := json.Unmarshal(statBytes, &stat)
+	if err != nil {
+		return Stat{}, err
+	}
+	stat.Ino = fut.ino
+	return stat, nil
+}
+
+func (fs *Fs) txStat(tx fdb.ReadTransaction, ino uint64) futureStat {
+	return futureStat{
+		ino:   ino,
+		bytes: tx.Get(tuple.Tuple{"fs", ino, "stat"}),
+	}
+}
+
+func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) error {
+	statBytes, err := json.Marshal(stat)
+	if err != nil {
+		return err
+	}
+	tx.Set(tuple.Tuple{"fs", stat.Ino, "stat"}, statBytes)
+	return nil
+}
+
+func (fs *Fs) txNextIno(tx fdb.Transaction) (uint64, error) {
+	// XXX If we avoid json for this we can use fdb native increment.
+	// XXX Lots of contention, we could use an array of counters and choose one.
+	var ino uint64
+	nextInoBytes := tx.Get(tuple.Tuple{"fs", "nextino"}).MustGet()
+	err := json.Unmarshal(nextInoBytes, &ino)
+	if err != nil {
+		return 0, err
+	}
+	nextInoBytes, err = json.Marshal(ino + 1)
+	if err != nil {
+		return 0, err
+	}
+	tx.Set(tuple.Tuple{"fs", "nextino"}, nextInoBytes)
+	return ino, nil
+}
+
+type futureGetDirEnt struct {
+	bytes fdb.FutureByteSlice
+}
+
+func (fut futureGetDirEnt) Get() (DirEnt, error) {
+	dirEntBytes := fut.bytes.MustGet()
+	if dirEntBytes == nil {
+		return DirEnt{}, ErrNotExist
+	}
+	dirEnt := DirEnt{}
+	err := json.Unmarshal(dirEntBytes, &dirEnt)
+	return dirEnt, err
+}
+
+func (fs *Fs) txGetDirEnt(tx fdb.ReadTransaction, dirIno uint64, name string) futureGetDirEnt {
+	return futureGetDirEnt{
+		bytes: tx.Get(tuple.Tuple{"fs", dirIno, "child", name}),
+	}
+}
+
+func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, name string, ent DirEnt) error {
+	dirEntBytes, err := json.Marshal(ent)
+	if err != nil {
+		return err
+	}
+	tx.Set(tuple.Tuple{"fs", dirIno, "child", name}, dirEntBytes)
+	return nil
+}
+
+func (fs *Fs) txClearDirEnt(tx fdb.Transaction, dirIno uint64, name string) {
+	tx.Clear(tuple.Tuple{"fs", dirIno, "child", name})
+}
+
+func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
+	dirEnt, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
+		return dirEnt, err
 	})
-	if err != nil {
-		return LookupResult{}, err
-	}
-	return lookup.(LookupResult), nil
+	return dirEnt.(DirEnt), err
 }
 
-func (fs *Fs) Unlink(ino Inode, name string) error {
+type CreateOpts struct {
+	Mode uint32
+	Uid  uint32
+	Gid  uint32
+	Rdev uint32
+}
+
+func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) error {
+
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		lookup, err := fs.txLookup(tx, ino, name)
+		dirStatFut := fs.txStat(tx, dirIno)
+		getDirEntFut := fs.txGetDirEnt(tx, dirIno, name)
+
+		newIno, err := fs.txNextIno(tx)
 		if err != nil {
 			return nil, err
 		}
 
-		childNLinkKey := tuple.Tuple{"fs", "ino", lookup.Ino, "nlink"}
-		childNChildKey := tuple.Tuple{"fs", "ino", lookup.Ino, "nchild"}
-
-		childNLink := tx.Get(childNLinkKey)
-		childNChild := tx.Get(childNChildKey)
-
-		childNChildBytes := childNChild.MustGet()
-		if childNChildBytes != nil && !bytes.Equal(childNChildBytes, ZeroI64Bytes) {
-			return nil, ErrNotEmpty
+		dirStat, err := dirStatFut.Get()
+		if err != nil {
+			return nil, err
 		}
 
-		tx.Add(tuple.Tuple{"fs", "ino", ino, "nchild"}, MinusOneI64Bytes)
-		tx.Clear(tuple.Tuple{"fs", "ino", ino, "child", name})
-
-		childNLinkBytes := childNLink.MustGet()
-		if bytes.Equal(childNLinkBytes, OneI64Bytes) {
-			tx.ClearRange(tuple.Tuple{"fs", "ino", lookup.Ino})
+		_, err = getDirEntFut.Get()
+		if err == nil {
+			return nil, ErrExist
 		} else {
-			tx.Add(childNLinkKey, MinusOneI64Bytes)
+			if err != ErrNotExist {
+				return nil, err
+			}
+		}
+
+		now := time.Now()
+		unixNow := uint64(now.Unix())
+		unixNowNSec := uint32(unixNow*1_000_000_000 - uint64(now.UnixNano()))
+
+		newStat := Stat{
+			Ino:       newIno,
+			Size:      0,
+			Atime:     unixNow,
+			Mtime:     unixNow,
+			Ctime:     unixNow,
+			Atimensec: unixNowNSec,
+			Mtimensec: unixNowNSec,
+			Ctimensec: unixNowNSec,
+			Mode:      opts.Mode,
+			Nlink:     1,
+			Nchild:    0,
+			Uid:       opts.Uid,
+			Gid:       opts.Gid,
+			Rdev:      opts.Rdev,
+		}
+
+		err = fs.txSetStat(tx, newStat)
+		if err != nil {
+			return nil, err
+		}
+
+		dirStat.Nchild += 1
+		err = fs.txSetStat(tx, dirStat)
+		if err != nil {
+			return nil, err
+		}
+
+		err = fs.txSetDirEnt(tx, dirIno, name, DirEnt{
+			Mode: opts.Mode & S_IFMT,
+			Ino:  newIno,
+		})
+		if err != nil {
+			return nil, err
 		}
 
 		return nil, nil
 	})
 	return err
+}
+
+func (fs *Fs) Unlink(dirIno uint64, name string) error {
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+		dirStatFut := fs.txStat(tx, dirIno)
+
+		dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
+		if err != nil {
+			return nil, err
+		}
+		stat, err := fs.txStat(tx, dirEnt.Ino).Get()
+		if err != nil {
+			return nil, err
+		}
+
+		dirStat, err := dirStatFut.Get()
+		if err != nil {
+			return nil, err
+		}
+
+		if dirEnt.Mode&S_IFMT == S_IFDIR {
+			if stat.Nchild != 0 {
+				return nil, ErrNotEmpty
+			}
+		}
+
+		dirStat.Nchild -= 1
+		err = fs.txSetStat(tx, dirStat)
+		if err != nil {
+			return nil, err
+		}
+
+		if stat.Nlink == 1 {
+			tx.ClearRange(tuple.Tuple{"fs", "ino", dirEnt.Ino})
+		} else {
+			stat.Nlink -= 1
+			err = fs.txSetStat(tx, stat)
+			if err != nil {
+				return nil, err
+			}
+			fs.txClearDirEnt(tx, dirIno, name)
+		}
+
+		return nil, nil
+	})
+	return err
+}
+
+func (fs *Fs) Lookup(dirIno uint64, name string) (Stat, error) {
+	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
+		if err != nil {
+			return Stat{}, err
+		}
+		stat, err := fs.txStat(tx, dirEnt.Ino).Get()
+		return stat, err
+	})
+	return stat.(Stat), err
 }
