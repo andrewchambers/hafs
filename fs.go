@@ -95,8 +95,19 @@ func init() {
 	fdb.MustAPIVersion(CURRENT_FDB_API_VERSION)
 }
 
-func Mkfs(db fdb.Database) error {
+type MkfsOpts struct {
+	Overwrite bool
+}
+
+func Mkfs(db fdb.Database, opts MkfsOpts) error {
 	_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+		if tx.Get(tuple.Tuple{"fs", "version"}).MustGet() != nil {
+			if !opts.Overwrite {
+				return nil, errors.New("filesystem already present")
+			}
+		}
+
 		now := time.Now()
 
 		rootStat := Stat{
@@ -574,6 +585,7 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 }
 
 type DirIter struct {
+	lock      sync.Mutex
 	fs        *Fs
 	iterRange fdb.KeyRange
 	ents      []DirEnt
@@ -584,6 +596,8 @@ func (di *DirIter) fill() error {
 	const BATCH_SIZE = 128
 
 	v, err := di.fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+
+		// XXX should we confirm the directory still exists?
 		kvs := tx.GetRange(di.iterRange, fdb.RangeOptions{
 			Limit:   BATCH_SIZE,
 			Mode:    fdb.StreamingModeIterator, // XXX do we want StreamingModeWantAll ?
@@ -639,6 +653,9 @@ func (di *DirIter) fill() error {
 }
 
 func (di *DirIter) Next() (DirEnt, error) {
+	di.lock.Lock()
+	defer di.lock.Unlock()
+
 	if len(di.ents) == 0 && di.done {
 		return DirEnt{}, io.EOF
 	}
@@ -660,6 +677,8 @@ func (di *DirIter) Next() (DirEnt, error) {
 }
 
 func (di *DirIter) Unget(ent DirEnt) {
+	di.lock.Lock()
+	defer di.lock.Unlock()
 	di.ents = append(di.ents, ent)
 	di.done = false
 }

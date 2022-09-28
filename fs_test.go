@@ -11,7 +11,7 @@ import (
 
 func tmpFs(t *testing.T) *Fs {
 	db := testutil.NewFDBTestServer(t).Dial()
-	err := Mkfs(db)
+	err := Mkfs(db, MkfsOpts{Overwrite: false})
 	if err != nil {
 		t.Fatal(err)
 	}
