@@ -15,6 +15,7 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"golang.org/x/sys/unix"
 )
 
 var (
@@ -31,14 +32,14 @@ const (
 )
 
 const (
-	S_IFIFO  uint32 = 4096
-	S_IFCHR  uint32 = 8192
-	S_IFBLK  uint32 = 24576
-	S_IFDIR  uint32 = 16384
-	S_IFREG  uint32 = 32768
-	S_IFLNK  uint32 = 40960
-	S_IFSOCK uint32 = 49152
-	S_IFMT   uint32 = 61440
+	S_IFIFO  uint32 = unix.S_IFIFO
+	S_IFCHR  uint32 = unix.S_IFCHR
+	S_IFBLK  uint32 = unix.S_IFBLK
+	S_IFDIR  uint32 = unix.S_IFDIR
+	S_IFREG  uint32 = unix.S_IFREG
+	S_IFLNK  uint32 = unix.S_IFLNK
+	S_IFSOCK uint32 = unix.S_IFSOCK
+	S_IFMT   uint32 = unix.S_IFMT
 )
 
 type DirEnt struct {
@@ -105,7 +106,7 @@ func Mkfs(db fdb.Database) error {
 
 		tx.Set(tuple.Tuple{"fs", "version"}, []byte{CURRENT_SCHEMA_VERSION})
 		tx.Set(tuple.Tuple{"fs", "nextino"}, []byte{'2'})
-		tx.Set(tuple.Tuple{"fs", rootStat.Ino, "stat"}, rootStatBytes)
+		tx.Set(tuple.Tuple{"fs", "ino", ROOT_INO, "stat"}, rootStatBytes)
 		return nil, nil
 	})
 	return err
@@ -193,7 +194,7 @@ func (fs *Fs) Close() error {
 	fs.workerWg.Wait()
 
 	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		tx.ClearRange(tuple.Tuple{"fs", "mounts", fs.mountId})
+		tx.ClearRange(tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"})
 		return nil, nil
 	})
 	if err != nil {
@@ -204,11 +205,10 @@ func (fs *Fs) Close() error {
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
 	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		mountKey := tuple.Tuple{"fs", "mounts", fs.mountId}
-		mountCheck := tx.Get(mountKey)
+		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"})
 		v, err := f(tx)
 		if mountCheck.MustGet() == nil {
-			return nil, ErrUnmounted
+			return v, ErrUnmounted
 		}
 		return v, err
 	})
@@ -216,11 +216,10 @@ func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) 
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
 	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		mountKey := tuple.Tuple{"fs", "mounts", fs.mountId}
-		mountCheck := tx.Get(mountKey)
+		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"})
 		v, err := f(tx)
 		if mountCheck.MustGet() == nil {
-			return nil, ErrUnmounted
+			return v, ErrUnmounted
 		}
 		return v, err
 	})
@@ -232,14 +231,15 @@ type futureStat struct {
 }
 
 func (fut futureStat) Get() (Stat, error) {
+	stat := Stat{}
 	statBytes := fut.bytes.MustGet()
 	if statBytes == nil {
-		return Stat{}, ErrNotExist
+		return stat, ErrNotExist
 	}
-	stat := Stat{}
+
 	err := json.Unmarshal(statBytes, &stat)
 	if err != nil {
-		return Stat{}, err
+		return stat, err
 	}
 	stat.Ino = fut.ino
 	return stat, nil
@@ -248,7 +248,7 @@ func (fut futureStat) Get() (Stat, error) {
 func (fs *Fs) txStat(tx fdb.ReadTransaction, ino uint64) futureStat {
 	return futureStat{
 		ino:   ino,
-		bytes: tx.Get(tuple.Tuple{"fs", ino, "stat"}),
+		bytes: tx.Get(tuple.Tuple{"fs", "ino", ino, "stat"}),
 	}
 }
 
@@ -257,7 +257,7 @@ func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) error {
 	if err != nil {
 		return err
 	}
-	tx.Set(tuple.Tuple{"fs", stat.Ino, "stat"}, statBytes)
+	tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "stat"}, statBytes)
 	return nil
 }
 
@@ -294,7 +294,7 @@ func (fut futureGetDirEnt) Get() (DirEnt, error) {
 
 func (fs *Fs) txGetDirEnt(tx fdb.ReadTransaction, dirIno uint64, name string) futureGetDirEnt {
 	return futureGetDirEnt{
-		bytes: tx.Get(tuple.Tuple{"fs", dirIno, "child", name}),
+		bytes: tx.Get(tuple.Tuple{"fs", "ino", dirIno, "child", name}),
 	}
 }
 
@@ -303,12 +303,8 @@ func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, name string, ent Di
 	if err != nil {
 		return err
 	}
-	tx.Set(tuple.Tuple{"fs", dirIno, "child", name}, dirEntBytes)
+	tx.Set(tuple.Tuple{"fs", "ino", dirIno, "child", name}, dirEntBytes)
 	return nil
-}
-
-func (fs *Fs) txClearDirEnt(tx fdb.Transaction, dirIno uint64, name string) {
-	tx.Clear(tuple.Tuple{"fs", dirIno, "child", name})
 }
 
 func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
@@ -326,28 +322,27 @@ type CreateOpts struct {
 	Rdev uint32
 }
 
-func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) error {
-
-	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error) {
+	newIno, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		dirStatFut := fs.txStat(tx, dirIno)
 		getDirEntFut := fs.txGetDirEnt(tx, dirIno, name)
 
 		newIno, err := fs.txNextIno(tx)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
 		dirStat, err := dirStatFut.Get()
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
 		_, err = getDirEntFut.Get()
 		if err == nil {
-			return nil, ErrExist
+			return 0, ErrExist
 		} else {
 			if err != ErrNotExist {
-				return nil, err
+				return 0, err
 			}
 		}
 
@@ -374,13 +369,13 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) error {
 
 		err = fs.txSetStat(tx, newStat)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
 		dirStat.Nchild += 1
 		err = fs.txSetStat(tx, dirStat)
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
 		err = fs.txSetDirEnt(tx, dirIno, name, DirEnt{
@@ -388,12 +383,15 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) error {
 			Ino:  newIno,
 		})
 		if err != nil {
-			return nil, err
+			return 0, err
 		}
 
-		return nil, nil
+		return newIno, nil
 	})
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return newIno.(uint64), nil
 }
 
 func (fs *Fs) Unlink(dirIno uint64, name string) error {
@@ -435,12 +433,21 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 			if err != nil {
 				return nil, err
 			}
-			fs.txClearDirEnt(tx, dirIno, name)
 		}
+
+		tx.Clear(tuple.Tuple{"fs", "ino", dirIno, "child", name})
 
 		return nil, nil
 	})
 	return err
+}
+
+func (fs *Fs) Stat(ino uint64) (Stat, error) {
+	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		stat, err := fs.txStat(tx, ino).Get()
+		return stat, err
+	})
+	return stat.(Stat), err
 }
 
 func (fs *Fs) Lookup(dirIno uint64, name string) (Stat, error) {
