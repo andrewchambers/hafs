@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	gofs "io/fs"
 	"os"
 	"sync"
@@ -44,8 +45,8 @@ const (
 )
 
 type DirEnt struct {
-	// Mode & S_IFMT
-	Mode uint32
+	Name string `json:"-"`
+	Mode uint32 // Mode & S_IFMT
 	Ino  uint64
 }
 
@@ -124,6 +125,7 @@ func Mkfs(db fdb.Database) error {
 			return nil, err
 		}
 
+		tx.ClearRange(tuple.Tuple{"fs"})
 		tx.Set(tuple.Tuple{"fs", "version"}, []byte{CURRENT_SCHEMA_VERSION})
 		tx.Set(tuple.Tuple{"fs", "nextino"}, []byte{'2'})
 		tx.Set(tuple.Tuple{"fs", "ino", ROOT_INO, "stat"}, rootStatBytes)
@@ -298,6 +300,7 @@ func (fs *Fs) txNextIno(tx fdb.Transaction) uint64 {
 }
 
 type futureGetDirEnt struct {
+	name  string
 	bytes fdb.FutureByteSlice
 }
 
@@ -308,21 +311,23 @@ func (fut futureGetDirEnt) Get() (DirEnt, error) {
 	}
 	dirEnt := DirEnt{}
 	err := json.Unmarshal(dirEntBytes, &dirEnt)
+	dirEnt.Name = fut.name
 	return dirEnt, err
 }
 
 func (fs *Fs) txGetDirEnt(tx fdb.ReadTransaction, dirIno uint64, name string) futureGetDirEnt {
 	return futureGetDirEnt{
+		name:  name,
 		bytes: tx.Get(tuple.Tuple{"fs", "ino", dirIno, "child", name}),
 	}
 }
 
-func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, name string, ent DirEnt) {
+func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, ent DirEnt) {
 	dirEntBytes, err := json.Marshal(ent)
 	if err != nil {
 		panic(err)
 	}
-	tx.Set(tuple.Tuple{"fs", "ino", dirIno, "child", name}, dirEntBytes)
+	tx.Set(tuple.Tuple{"fs", "ino", dirIno, "child", ent.Name}, dirEntBytes)
 }
 
 func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
@@ -333,14 +338,14 @@ func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
 	return dirEnt.(DirEnt), err
 }
 
-type CreateOpts struct {
+type MknodOpts struct {
 	Mode uint32
 	Uid  uint32
 	Gid  uint32
 	Rdev uint32
 }
 
-func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error) {
+func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (uint64, error) {
 
 	newIno, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		dirStatFut := fs.txGetStat(tx, dirIno)
@@ -391,7 +396,8 @@ func (fs *Fs) Create(dirIno uint64, name string, opts CreateOpts) (uint64, error
 		fs.txSetStat(tx, newStat)
 		dirStat.Nchild += 1
 		fs.txSetStat(tx, dirStat)
-		fs.txSetDirEnt(tx, dirIno, name, DirEnt{
+		fs.txSetDirEnt(tx, dirIno, DirEnt{
+			Name: name,
 			Mode: opts.Mode & S_IFMT,
 			Ino:  newIno,
 		})
@@ -449,7 +455,7 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 	return err
 }
 
-func (fs *Fs) Stat(ino uint64) (Stat, error) {
+func (fs *Fs) GetStat(ino uint64) (Stat, error) {
 	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		stat, err := fs.txGetStat(tx, ino).Get()
 		return stat, err
@@ -494,12 +500,12 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 			return nil, toDirStatErr
 		}
 
-		if fromDirStatErr != nil {
-			return nil, fromDirStatErr
-		}
-
 		if toDirStat.Mode&S_IFMT != S_IFDIR {
 			return nil, ErrNotDir
+		}
+
+		if fromDirStatErr != nil {
+			return nil, fromDirStatErr
 		}
 
 		if fromDirStat.Mode&S_IFMT != S_IFDIR {
@@ -557,8 +563,118 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 		}
 
 		tx.Clear(tuple.Tuple{"fs", "ino", fromDirIno, "child", fromName})
-		fs.txSetDirEnt(tx, toDirIno, toName, fromDirEnt)
+		fs.txSetDirEnt(tx, toDirIno, DirEnt{
+			Name: toName,
+			Mode: fromDirEnt.Mode,
+			Ino:  fromDirEnt.Ino,
+		})
 		return nil, nil
 	})
 	return err
+}
+
+type DirIter struct {
+	fs        *Fs
+	iterRange fdb.KeyRange
+	ents      []DirEnt
+	done      bool
+}
+
+func (di *DirIter) fill() error {
+	const BATCH_SIZE = 128
+
+	v, err := di.fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		kvs := tx.GetRange(di.iterRange, fdb.RangeOptions{
+			Limit:   BATCH_SIZE,
+			Mode:    fdb.StreamingModeIterator, // XXX do we want StreamingModeWantAll ?
+			Reverse: false,
+		}).GetSliceOrPanic()
+		return kvs, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	kvs := v.([]fdb.KeyValue)
+
+	if len(kvs) != 0 {
+		nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+		if err != nil {
+			return err
+		}
+		di.iterRange.Begin = fdb.Key(nextBegin)
+	} else {
+		di.iterRange.Begin = di.iterRange.End
+	}
+
+	ents := make([]DirEnt, 0, len(kvs))
+
+	for _, kv := range kvs {
+		keyTuple, err := tuple.Unpack(kv.Key)
+		if err != nil {
+			return err
+		}
+		name := keyTuple[len(keyTuple)-1].(string)
+		dirEnt := DirEnt{}
+		err = json.Unmarshal(kv.Value, &dirEnt)
+		if err != nil {
+			return err
+		}
+		dirEnt.Name = name
+		ents = append(ents, dirEnt)
+	}
+
+	// Reverse entries so we can pop them off in the right order.
+	for i, j := 0, len(ents)-1; i < j; i, j = i+1, j-1 {
+		ents[i], ents[j] = ents[j], ents[i]
+	}
+
+	if len(ents) < BATCH_SIZE {
+		di.done = true
+	}
+
+	di.ents = ents
+
+	return nil
+}
+
+func (di *DirIter) Next() (DirEnt, error) {
+	if len(di.ents) == 0 && di.done {
+		return DirEnt{}, io.EOF
+	}
+
+	// Fill initial listing, otherwise we should always have something.
+	if len(di.ents) == 0 {
+		err := di.fill()
+		if err != nil {
+			return DirEnt{}, err
+		}
+		if len(di.ents) == 0 && di.done {
+			return DirEnt{}, io.EOF
+		}
+	}
+
+	nextEnt := di.ents[len(di.ents)-1]
+	di.ents = di.ents[:len(di.ents)-1]
+	return nextEnt, nil
+}
+
+func (di *DirIter) Unget(ent DirEnt) {
+	di.ents = append(di.ents, ent)
+	di.done = false
+}
+
+func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
+	iterBegin, iterEnd := tuple.Tuple{"fs", "ino", dirIno, "child"}.FDBRangeKeys()
+	di := &DirIter{
+		fs: fs,
+		iterRange: fdb.KeyRange{
+			Begin: iterBegin,
+			End:   iterEnd,
+		},
+		ents: []DirEnt{},
+		done: false,
+	}
+	err := di.fill()
+	return di, err
 }

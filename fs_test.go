@@ -2,6 +2,8 @@ package fs
 
 import (
 	"errors"
+	"fmt"
+	"io"
 	"testing"
 
 	"github.com/andrewchambers/foundation-fs/testutil"
@@ -28,7 +30,7 @@ func tmpFs(t *testing.T) *Fs {
 
 func TestMkfsAndMount(t *testing.T) {
 	fs := tmpFs(t)
-	stat, err := fs.Stat(ROOT_INO)
+	stat, err := fs.GetStat(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -41,10 +43,10 @@ func TestMkfsAndMount(t *testing.T) {
 	}
 }
 
-func TestCreate(t *testing.T) {
+func TestMknod(t *testing.T) {
 	fs := tmpFs(t)
 
-	ino, err := fs.Create(ROOT_INO, "foo", CreateOpts{
+	ino, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -53,7 +55,7 @@ func TestCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = fs.Create(ROOT_INO, "foo", CreateOpts{
+	_, err = fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -62,7 +64,7 @@ func TestCreate(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	directStat, err := fs.Stat(ino)
+	directStat, err := fs.GetStat(ino)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -90,7 +92,7 @@ func TestUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ino, err := fs.Create(ROOT_INO, "foo", CreateOpts{
+	ino, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -104,7 +106,7 @@ func TestUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = fs.Stat(ino)
+	_, err = fs.GetStat(ino)
 	if !errors.Is(err, ErrNotExist) {
 		t.Fatal(err)
 	}
@@ -113,7 +115,7 @@ func TestUnlink(t *testing.T) {
 func TestRenameSameDir(t *testing.T) {
 	fs := tmpFs(t)
 
-	foo1Ino, err := fs.Create(ROOT_INO, "foo1", CreateOpts{
+	foo1Ino, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -122,7 +124,7 @@ func TestRenameSameDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = fs.Create(ROOT_INO, "foo2", CreateOpts{
+	_, err = fs.Mknod(ROOT_INO, "foo2", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -150,7 +152,7 @@ func TestRenameSameDir(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
 	}
 
-	rootStat, err := fs.Stat(ROOT_INO)
+	rootStat, err := fs.GetStat(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -163,7 +165,7 @@ func TestRenameSameDir(t *testing.T) {
 func TestRenameSameDirOverwrite(t *testing.T) {
 	fs := tmpFs(t)
 
-	foo1Ino, err := fs.Create(ROOT_INO, "foo1", CreateOpts{
+	foo1Ino, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -172,7 +174,7 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = fs.Create(ROOT_INO, "bar1", CreateOpts{
+	_, err = fs.Mknod(ROOT_INO, "bar1", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -200,7 +202,7 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
 	}
 
-	rootStat, err := fs.Stat(ROOT_INO)
+	rootStat, err := fs.GetStat(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -213,7 +215,7 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 func TestRenameDifferentDir(t *testing.T) {
 	fs := tmpFs(t)
 
-	dIno, err := fs.Create(ROOT_INO, "d", CreateOpts{
+	dIno, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -222,7 +224,7 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fooIno, err := fs.Create(ROOT_INO, "foo", CreateOpts{
+	fooIno, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -250,7 +252,7 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", barStat)
 	}
 
-	rootStat, err := fs.Stat(ROOT_INO)
+	rootStat, err := fs.GetStat(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -258,7 +260,7 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
 	}
 
-	dStat, err := fs.Stat(ROOT_INO)
+	dStat, err := fs.GetStat(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -271,7 +273,7 @@ func TestRenameDifferentDir(t *testing.T) {
 func TestRenameDifferentDirOverwrite(t *testing.T) {
 	fs := tmpFs(t)
 
-	dIno, err := fs.Create(ROOT_INO, "d", CreateOpts{
+	dIno, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -280,7 +282,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	barIno, err := fs.Create(dIno, "bar", CreateOpts{
+	barIno, err := fs.Mknod(dIno, "bar", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -289,7 +291,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fooIno, err := fs.Create(ROOT_INO, "foo", CreateOpts{
+	fooIno, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -317,7 +319,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", barStat)
 	}
 
-	rootStat, err := fs.Stat(ROOT_INO)
+	rootStat, err := fs.GetStat(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -325,7 +327,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
 	}
 
-	dStat, err := fs.Stat(dIno)
+	dStat, err := fs.GetStat(dIno)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -333,9 +335,42 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatalf("unexpected number of children: %d", dStat.Nchild)
 	}
 
-	_, err = fs.Stat(barIno)
+	_, err = fs.GetStat(barIno)
 	if !errors.Is(err, ErrNotExist) {
 		t.Fatal(err)
 	}
 
+}
+
+func TestDirIter(t *testing.T) {
+	fs := tmpFs(t)
+
+	for i := 0; i < 500; i += 1 {
+		_, err := fs.Mknod(ROOT_INO, fmt.Sprintf("a%d", i), MknodOpts{
+			Mode: S_IFDIR | 0o777,
+			Uid:  0,
+			Gid:  0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	di, err := fs.IterDirEnts(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := 0
+	for {
+		_, err := di.Next()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		count += 1
+	}
+
+	if count != 500 {
+		t.Fatalf("unexpected count: %d", count)
+	}
 }
