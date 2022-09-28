@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"testing"
+	"time"
 
 	"github.com/andrewchambers/foundation-fs/testutil"
 )
@@ -106,9 +107,31 @@ func TestUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = fs.GetStat(ino)
-	if !errors.Is(err, ErrNotExist) {
+	stat, err := fs.GetStat(ino)
+	if err != nil {
 		t.Fatal(err)
+	}
+
+	if stat.Nlink != 0 {
+		t.Fatal("expected unlinked")
+	}
+
+	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nRemoved != 1 {
+		t.Fatal("expected file to be removed")
+	}
+
+	nRemoved, err = fs.RemoveExpiredUnlinked(time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nRemoved != 0 {
+		t.Fatal("nothing to be removed")
 	}
 }
 
@@ -208,6 +231,15 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 	}
 	if rootStat.Nchild != 1 {
 		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
+	}
+
+	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nRemoved != 1 {
+		t.Fatal("expected file to be removed")
 	}
 
 }
@@ -335,9 +367,22 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatalf("unexpected number of children: %d", dStat.Nchild)
 	}
 
-	_, err = fs.GetStat(barIno)
-	if !errors.Is(err, ErrNotExist) {
+	barStat, err = fs.GetStat(barIno)
+	if err != nil {
 		t.Fatal(err)
+	}
+
+	if barStat.Nlink != 0 {
+		t.Fatal("expected unlinked")
+	}
+
+	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nRemoved != 1 {
+		t.Fatal("expected file to be removed")
 	}
 
 }

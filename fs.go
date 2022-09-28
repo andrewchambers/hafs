@@ -53,9 +53,9 @@ type DirEnt struct {
 type Stat struct {
 	Ino       uint64 `json:"-"`
 	Size      uint64
-	Atime     uint64
-	Mtime     uint64
-	Ctime     uint64
+	Atimesec  uint64
+	Mtimesec  uint64
+	Ctimesec  uint64
 	Atimensec uint32
 	Mtimensec uint32
 	Ctimensec uint32
@@ -68,20 +68,32 @@ type Stat struct {
 }
 
 func (stat *Stat) setTime(t time.Time, secs *uint64, nsecs *uint32) {
-	*secs = uint64(t.Unix())
-	*nsecs = uint32((*secs)*1_000_000_000 - uint64(t.UnixNano()))
+	*secs = uint64(t.UnixNano() / 1_000_000_000)
+	*nsecs = uint32(t.UnixNano() % 1_000_000_000)
 }
 
 func (stat *Stat) SetMtime(t time.Time) {
-	stat.setTime(t, &stat.Mtime, &stat.Mtimensec)
+	stat.setTime(t, &stat.Mtimesec, &stat.Mtimensec)
 }
 
 func (stat *Stat) SetAtime(t time.Time) {
-	stat.setTime(t, &stat.Atime, &stat.Atimensec)
+	stat.setTime(t, &stat.Atimesec, &stat.Atimensec)
 }
 
 func (stat *Stat) SetCtime(t time.Time) {
-	stat.setTime(t, &stat.Ctime, &stat.Ctimensec)
+	stat.setTime(t, &stat.Ctimesec, &stat.Ctimensec)
+}
+
+func (stat *Stat) Mtime() time.Time {
+	return time.Unix(int64(stat.Mtimesec), int64(stat.Mtimensec))
+}
+
+func (stat *Stat) Atime() time.Time {
+	return time.Unix(int64(stat.Atimesec), int64(stat.Atimensec))
+}
+
+func (stat *Stat) Ctime() time.Time {
+	return time.Unix(int64(stat.Ctimesec), int64(stat.Ctimensec))
 }
 
 type Fs struct {
@@ -113,9 +125,9 @@ func Mkfs(db fdb.Database, opts MkfsOpts) error {
 		rootStat := Stat{
 			Ino:       ROOT_INO,
 			Size:      0,
-			Atime:     0,
-			Mtime:     0,
-			Ctime:     0,
+			Atimesec:  0,
+			Mtimesec:  0,
+			Ctimesec:  0,
 			Atimensec: 0,
 			Mtimensec: 0,
 			Ctimensec: 0,
@@ -385,9 +397,9 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (uint64, error) 
 		newStat := Stat{
 			Ino:       newIno,
 			Size:      0,
-			Atime:     0,
-			Mtime:     0,
-			Ctime:     0,
+			Atimesec:  0,
+			Mtimesec:  0,
+			Ctimesec:  0,
 			Atimensec: 0,
 			Mtimensec: 0,
 			Ctimensec: 0,
@@ -450,16 +462,13 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		dirStat.SetMtime(now)
 		dirStat.SetCtime(now)
 		fs.txSetStat(tx, dirStat)
-
-		if stat.Nlink == 1 {
-			tx.ClearRange(tuple.Tuple{"fs", "ino", dirEnt.Ino})
-		} else {
-			stat.Nlink -= 1
-			stat.SetMtime(now)
-			stat.SetCtime(now)
-			fs.txSetStat(tx, stat)
+		stat.Nlink -= 1
+		stat.SetMtime(now)
+		stat.SetCtime(now)
+		fs.txSetStat(tx, stat)
+		if stat.Nlink == 0 {
+			tx.Set(tuple.Tuple{"fs", "unlinked", dirEnt.Ino}, []byte{})
 		}
-
 		tx.Clear(tuple.Tuple{"fs", "ino", dirIno, "child", name})
 		return nil, nil
 	})
@@ -543,13 +552,13 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 				return nil, ErrNotEmpty
 			}
 
-			if toStat.Nlink == 1 {
-				tx.ClearRange(tuple.Tuple{"fs", "ino", toStat.Ino})
-			} else {
-				toStat.Nlink -= 1
-				toStat.SetMtime(now)
-				toStat.SetCtime(now)
-				fs.txSetStat(tx, toStat)
+			toStat.Nlink -= 1
+			toStat.SetMtime(now)
+			toStat.SetCtime(now)
+			fs.txSetStat(tx, toStat)
+
+			if toStat.Nlink == 0 {
+				tx.Set(tuple.Tuple{"fs", "unlinked", toStat.Ino}, []byte{})
 			}
 		}
 
@@ -696,4 +705,104 @@ func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
 	}
 	err := di.fill()
 	return di, err
+}
+
+func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) {
+
+	iterBegin, iterEnd := tuple.Tuple{"fs", "unlinked"}.FDBRangeKeys()
+
+	iterRange := fdb.KeyRange{
+		Begin: iterBegin,
+		End:   iterEnd,
+	}
+
+	nRemoved := uint64(0)
+	done := false
+
+	for !done {
+
+		nRemovedThisBatch := uint64(0)
+		nextIterBegin := fdb.Key([]byte{})
+
+		_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+			// Reset for retries.
+			nRemovedThisBatch = 0
+			done = false
+
+			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
+				Limit:   128,
+				Mode:    fdb.StreamingModeIterator, // XXX do we want StreamingModeWantAll ?
+				Reverse: false,
+			}).GetSliceOrPanic()
+
+			if len(kvs) != 0 {
+				next, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+				if err != nil {
+					return nil, err
+				}
+				nextIterBegin = fdb.Key(next)
+			} else {
+				done = true
+			}
+
+			futureStats := make([]futureStat, 0, len(kvs))
+			for _, kv := range kvs {
+				keyTuple, err := tuple.Unpack(kv.Key)
+				if err != nil {
+					return nil, err
+				}
+				ino := uint64(keyTuple[len(keyTuple)-1].(int64))
+				futureStats = append(futureStats, fs.txGetStat(tx, ino))
+			}
+
+			now := time.Now()
+			for _, futureStat := range futureStats {
+				stat, err := futureStat.Get()
+				if err != nil {
+					return nil, err
+				}
+				if now.After(stat.Ctime().Add(removalDelay)) {
+					tx.Clear(tuple.Tuple{"fs", "unlinked", stat.Ino})
+					tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino})
+					nRemovedThisBatch += 1
+				}
+			}
+
+			return nil, nil
+
+		})
+		if err != nil {
+			return nRemoved, err
+		}
+
+		iterRange.Begin = nextIterBegin
+		nRemoved += nRemovedThisBatch
+	}
+
+	return nRemoved, nil
+}
+
+type CollectGarbageOpts struct {
+	UnlinkedRemovalDelay time.Duration
+	ClientTimeout        time.Duration
+}
+
+type CollectGarbageStats struct {
+	UnlinkedRemovalCount uint64
+	ClientEvictionCount  uint64
+}
+
+func (fs *Fs) CollectGarbage(opts CollectGarbageOpts) (CollectGarbageStats, error) {
+	var err error
+	stats := CollectGarbageStats{}
+
+	stats.UnlinkedRemovalCount, err = fs.RemoveExpiredUnlinked(opts.UnlinkedRemovalDelay)
+	if err != nil {
+		return stats, err
+	}
+
+	// TODO client eviction in parallel with RemoveExpired
+
+	return stats, nil
 }
