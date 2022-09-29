@@ -1,4 +1,4 @@
-module github.com/andrewchambers/foundation-fs
+module github.com/andrewchambers/hafs
 
 go 1.17
 

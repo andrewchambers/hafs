@@ -1,4 +1,4 @@
-# foundation-fs
+# High Availability Filesystem
 
 An experimental and vapourware distributed filesystem library and fuse filesystem built on FoundationDB.
 

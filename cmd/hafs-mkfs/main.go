@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/andrewchambers/foundation-fs"
-	"github.com/andrewchambers/foundation-fs/cli"
+	"github.com/andrewchambers/hafs"
+	"github.com/andrewchambers/hafs/cli"
 )
 
 func main() {

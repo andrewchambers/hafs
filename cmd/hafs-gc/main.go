@@ -6,8 +6,8 @@ import (
 	"os"
 	"time"
 
-	fdbfs "github.com/andrewchambers/foundation-fs"
-	"github.com/andrewchambers/foundation-fs/cli"
+	"github.com/andrewchambers/hafs"
+	"github.com/andrewchambers/hafs/cli"
 )
 
 func main() {
@@ -16,7 +16,7 @@ func main() {
 	flag.Parse()
 	fs := cli.MustAttach()
 
-	stats, err := fs.CollectGarbage(fdbfs.CollectGarbageOpts{
+	stats, err := fs.CollectGarbage(hafs.CollectGarbageOpts{
 		UnlinkedRemovalDelay: *unlinkRemovalDelay,
 		ClientTimeout:        *clientTimeout,
 	})

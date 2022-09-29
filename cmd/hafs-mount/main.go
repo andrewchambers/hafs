@@ -5,13 +5,13 @@ import (
 	"fmt"
 	"os"
 
-	fdbfs "github.com/andrewchambers/foundation-fs"
-	"github.com/andrewchambers/foundation-fs/cli"
+	"github.com/andrewchambers/hafs"
+	"github.com/andrewchambers/hafs/cli"
 	"github.com/hanwen/go-fuse/v2/fuse"
 )
 
 func usage() {
-	fmt.Printf("fdbfs-mount [OPTS] MOUNTPOINT\n")
+	fmt.Printf("hafs-mount [OPTS] MOUNTPOINT\n")
 	os.Exit(1)
 }
 
@@ -26,10 +26,10 @@ func main() {
 	mntDir := flag.Args()[0]
 
 	server, err := fuse.NewServer(
-		fdbfs.NewFuseFs(cli.MustAttach()),
+		hafs.NewFuseFs(cli.MustAttach()),
 		mntDir,
 		&fuse.MountOptions{
-			Name:    "fdbfs",
+			Name:    "hafs",
 			Options: []string{
 				// XXX why are these not working?
 				// "direct_io",

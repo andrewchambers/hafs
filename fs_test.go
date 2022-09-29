@@ -1,4 +1,4 @@
-package fs
+package hafs
 
 import (
 	"errors"
@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/andrewchambers/foundation-fs/testutil"
+	"github.com/andrewchambers/hafs/testutil"
 )
 
 func tmpFs(t *testing.T) *Fs {

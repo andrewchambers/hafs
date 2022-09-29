@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"os"
 
-	"github.com/andrewchambers/foundation-fs"
+	"github.com/andrewchambers/hafs"
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 )
 
