@@ -2,8 +2,8 @@ package cli
 
 import (
 	"flag"
-	"os"
 	"fmt"
+	"os"
 
 	"github.com/andrewchambers/foundation-fs"
 	"github.com/apple/foundationdb/bindings/go/src/fdb"

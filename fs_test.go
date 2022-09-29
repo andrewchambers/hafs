@@ -47,7 +47,7 @@ func TestMkfsAndMount(t *testing.T) {
 func TestMknod(t *testing.T) {
 	fs := tmpFs(t)
 
-	ino, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
+	fooStat, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -65,7 +65,7 @@ func TestMknod(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	directStat, err := fs.GetStat(ino)
+	directStat, err := fs.GetStat(fooStat.Ino)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -93,7 +93,7 @@ func TestUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	ino, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
+	fooStat, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -107,7 +107,7 @@ func TestUnlink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	stat, err := fs.GetStat(ino)
+	stat, err := fs.GetStat(fooStat.Ino)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func TestUnlink(t *testing.T) {
 func TestRenameSameDir(t *testing.T) {
 	fs := tmpFs(t)
 
-	foo1Ino, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
+	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -171,7 +171,7 @@ func TestRenameSameDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if bar1Stat.Ino != foo1Ino {
+	if bar1Stat.Ino != foo1Stat.Ino {
 		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
 	}
 
@@ -188,7 +188,7 @@ func TestRenameSameDir(t *testing.T) {
 func TestRenameSameDirOverwrite(t *testing.T) {
 	fs := tmpFs(t)
 
-	foo1Ino, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
+	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -221,7 +221,7 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if bar1Stat.Ino != foo1Ino {
+	if bar1Stat.Ino != foo1Stat.Ino {
 		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
 	}
 
@@ -247,7 +247,7 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 func TestRenameDifferentDir(t *testing.T) {
 	fs := tmpFs(t)
 
-	dIno, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
+	dStat, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -256,7 +256,7 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fooIno, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
+	fooStat, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -265,7 +265,7 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = fs.Rename(ROOT_INO, dIno, "foo", "bar")
+	err = fs.Rename(ROOT_INO, dStat.Ino, "foo", "bar")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,12 +275,12 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	barStat, err := fs.Lookup(dIno, "bar")
+	barStat, err := fs.Lookup(dStat.Ino, "bar")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if barStat.Ino != fooIno {
+	if barStat.Ino != fooStat.Ino {
 		t.Fatalf("bar1 stat is bad: %#v", barStat)
 	}
 
@@ -292,7 +292,7 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
 	}
 
-	dStat, err := fs.GetStat(ROOT_INO)
+	dStat, err = fs.GetStat(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +305,7 @@ func TestRenameDifferentDir(t *testing.T) {
 func TestRenameDifferentDirOverwrite(t *testing.T) {
 	fs := tmpFs(t)
 
-	dIno, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
+	dStat, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
 		Mode: S_IFDIR | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -314,7 +314,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	barIno, err := fs.Mknod(dIno, "bar", MknodOpts{
+	origBarStat, err := fs.Mknod(dStat.Ino, "bar", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -323,7 +323,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	fooIno, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
+	fooStat, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -332,7 +332,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	err = fs.Rename(ROOT_INO, dIno, "foo", "bar")
+	err = fs.Rename(ROOT_INO, dStat.Ino, "foo", "bar")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -342,12 +342,12 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	barStat, err := fs.Lookup(dIno, "bar")
+	barStat, err := fs.Lookup(dStat.Ino, "bar")
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	if barStat.Ino != fooIno {
+	if barStat.Ino != fooStat.Ino {
 		t.Fatalf("bar1 stat is bad: %#v", barStat)
 	}
 
@@ -359,7 +359,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
 	}
 
-	dStat, err := fs.GetStat(dIno)
+	dStat, err = fs.GetStat(dStat.Ino)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -367,7 +367,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatalf("unexpected number of children: %d", dStat.Nchild)
 	}
 
-	barStat, err = fs.GetStat(barIno)
+	barStat, err = fs.GetStat(origBarStat.Ino)
 	if err != nil {
 		t.Fatal(err)
 	}

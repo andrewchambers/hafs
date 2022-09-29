@@ -368,7 +368,7 @@ type MknodOpts struct {
 	Rdev uint32
 }
 
-func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (uint64, error) {
+func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 
 	newIno, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		dirStatFut := fs.txGetStat(tx, dirIno)
@@ -425,12 +425,12 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (uint64, error) 
 			Ino:  newIno,
 		})
 
-		return newIno, nil
+		return newStat, nil
 	})
 	if err != nil {
-		return 0, err
+		return Stat{}, err
 	}
-	return newIno.(uint64), nil
+	return newIno.(Stat), nil
 }
 
 func (fs *Fs) Unlink(dirIno uint64, name string) error {
