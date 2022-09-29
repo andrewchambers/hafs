@@ -5,6 +5,7 @@ import (
 	"os"
 	"fmt"
 
+	"github.com/andrewchambers/foundation-fs"
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 )
 
@@ -35,4 +36,13 @@ func MustOpenDatabase() fdb.Database {
 		os.Exit(1)
 	}
 	return db
+}
+
+func MustAttach() *fs.Fs {
+	fs, err := fs.Mount(MustOpenDatabase())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "unable to connect to filesystem: %s\n", err)
+		os.Exit(1)
+	}
+	return fs
 }
