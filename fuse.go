@@ -32,7 +32,7 @@ func fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
 	out.Ino = stat.Ino
 	out.Size = stat.Size
 	out.Blocks = stat.Size / 512
-	out.Blksize = 4096
+	out.Blksize = PAGE_SIZE
 	out.Atime = stat.Atimesec
 	out.Atimensec = stat.Atimensec
 	out.Mtime = stat.Mtimesec
