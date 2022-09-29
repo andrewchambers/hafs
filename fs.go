@@ -31,6 +31,7 @@ const (
 	CURRENT_FDB_API_VERSION = 600
 	CURRENT_SCHEMA_VERSION  = 1
 	ROOT_INO                = 1
+	PAGE_SIZE               = 4096
 )
 
 const (
@@ -362,75 +363,90 @@ func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
 }
 
 type MknodOpts struct {
-	Mode uint32
-	Uid  uint32
-	Gid  uint32
-	Rdev uint32
+	Truncate bool
+	Mode     uint32
+	Uid      uint32
+	Gid      uint32
+	Rdev     uint32
 }
 
 func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 
-	newIno, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		dirStatFut := fs.txGetStat(tx, dirIno)
 		getDirEntFut := fs.txGetDirEnt(tx, dirIno, name)
 
-		newIno := fs.txNextIno(tx)
-
 		dirStat, err := dirStatFut.Get()
 		if err != nil {
-			return 0, err
+			return nil, err
 		}
 
 		if dirStat.Mode&S_IFMT != S_IFDIR {
 			return nil, ErrNotDir
 		}
 
-		_, err = getDirEntFut.Get()
+		var stat Stat
+
+		existingDirEnt, err := getDirEntFut.Get()
 		if err == nil {
-			return 0, ErrExist
+			if !opts.Truncate {
+				return nil, ErrExist
+			}
+
+			stat, err = fs.txGetStat(tx, existingDirEnt.Ino).Get()
+			if err != nil {
+				return nil, err
+			}
+
+			if stat.Mode&S_IFMT != S_IFREG {
+				return nil, errors.New("unable to truncate invalid file type")
+			}
+
+			stat.Size = 0
+			tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino, "page"})
 		} else {
+			newIno := fs.txNextIno(tx)
 			if err != ErrNotExist {
 				return 0, err
 			}
-		}
-
-		newStat := Stat{
-			Ino:       newIno,
-			Size:      0,
-			Atimesec:  0,
-			Mtimesec:  0,
-			Ctimesec:  0,
-			Atimensec: 0,
-			Mtimensec: 0,
-			Ctimensec: 0,
-			Mode:      opts.Mode,
-			Nlink:     1,
-			Nchild:    0,
-			Uid:       opts.Uid,
-			Gid:       opts.Gid,
-			Rdev:      opts.Rdev,
+			stat = Stat{
+				Ino:       newIno,
+				Size:      0,
+				Atimesec:  0,
+				Mtimesec:  0,
+				Ctimesec:  0,
+				Atimensec: 0,
+				Mtimensec: 0,
+				Ctimensec: 0,
+				Mode:      opts.Mode,
+				Nlink:     1,
+				Nchild:    0,
+				Uid:       opts.Uid,
+				Gid:       opts.Gid,
+				Rdev:      opts.Rdev,
+			}
+			dirStat.Nchild += 1
+			fs.txSetStat(tx, dirStat)
 		}
 
 		now := time.Now()
-		newStat.SetMtime(now)
-		newStat.SetCtime(now)
-		newStat.SetAtime(now)
+		stat.SetMtime(now)
+		stat.SetCtime(now)
+		stat.SetAtime(now)
+		fs.txSetStat(tx, stat)
 
-		fs.txSetStat(tx, newStat)
-		dirStat.Nchild += 1
-		fs.txSetStat(tx, dirStat)
 		fs.txSetDirEnt(tx, dirIno, DirEnt{
 			Name: name,
-			Mode: opts.Mode & S_IFMT,
-			Ino:  newIno,
+			Mode: stat.Mode & S_IFMT,
+			Ino:  stat.Ino,
 		})
 
-		return newStat, nil
+		return stat, nil
 	})
 	if err != nil {
 		return Stat{}, err
 	}
-	return newIno.(Stat), nil
+	return stat.(Stat), nil
 }
 
 func (fs *Fs) Unlink(dirIno uint64, name string) error {
@@ -592,6 +608,54 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 	})
 	return err
 }
+
+/*
+func (fs *Fs) Read(ino uint64, buf []byte, off uint64) (uint32, error) {
+
+	const MAX_READ = 128*PAGE_SIZE
+
+	if len(buf) > MAX_READ {
+		buf = buf[:MAX_READ]
+	}
+
+	for nRead != uint32(len(buf)) {
+
+		pagev, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+			var err error
+			stat, err = fs.txGetStat().Get()
+			if err != nil {
+				return nil, err
+			}
+
+			if off > stat.Size {
+				return nil, io.EOF
+			}
+
+			if stat.Size < off + uint64(len(buf)) {
+				buf = buf[:stat.Size-off]
+			}
+
+			page = tx.Get(tuple.Tuple{"fs", "ino", "page", pageIdx}).MustGet()
+			if page == nil {
+				return nil, io.EOF
+			}
+			return nil, nil
+		})
+		if err != nil {
+			return nRead, err
+		}
+
+		firstPage := nRead == 0
+		pageStart := uint64(0)
+		if firstPage {
+			pageStart = off%PAGE_SIZE
+		}
+
+		len(page)
+
+	}
+}
+*/
 
 type DirIter struct {
 	lock      sync.Mutex

@@ -167,140 +167,42 @@ func (fs *Proto9FS) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fus
 	return fuse.OK
 }
 
-func openFlagsTo9(flags uint32) (uint32, bool) {
-	var flags9 uint32
-
-	if flags&syscall.O_RDWR == syscall.O_RDWR {
-		flags9 |= proto9.L_O_RDWR
-	} else if flags&syscall.O_WRONLY == syscall.O_WRONLY {
-		flags9 |= proto9.L_O_WRONLY
-	} else if flags&syscall.O_RDONLY == syscall.O_RDONLY {
-		flags9 |= proto9.L_O_RDONLY
-	}
-
-	if flags&syscall.O_TRUNC == syscall.O_TRUNC {
-		flags9 |= proto9.L_O_TRUNC
-	}
-
-	if flags&syscall.O_EXCL == syscall.O_TRUNC {
-		flags9 |= proto9.L_O_EXCL
-	}
-
-	// XXX more flags or errors for unsupported
-
-	return flags, true
-}
-
-func (fs *Proto9FS) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-
-	fs.lock.Lock()
-	inode := fs.n2Inode[in.NodeId]
-	fs.lock.Unlock()
-
-	f, ok := inode.GetFile()
-	if !ok {
-		return fuse.EIO
-	}
-
-	f, _, err := f.Walk([]string{})
-	if err != nil {
-		return ErrToStatus(err)
-	}
-
-	defer func() {
-		if f != nil {
-			_ = f.Clunk()
-		}
-	}()
-
-	flags9, ok := openFlagsTo9(in.Flags)
-	if !ok {
-		return fuse.ENOTSUP
-	}
-
-	err = f.Open(flags9)
-	if err != nil {
-		return ErrToStatus(err)
-	}
-
-	out.Fh = fs.nextFileHandle()
-	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
-
-	fs.lock.Lock()
-	fs.fh2OpenFile[out.Fh] = &OpenFile{
-		inode: inode,
-		f:     f,
-	}
-	f = nil
-	fs.lock.Unlock()
-
-	return fuse.OK
-}
-
-func (fs *Proto9FS) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
-
-	fs.lock.Lock()
-	inode := fs.n2Inode[in.NodeId]
-	fs.lock.Unlock()
-
-	f, ok := inode.GetFile()
-	if !ok {
-		return fuse.EIO
-	}
-
-	f, _, err := f.Walk([]string{})
-	if err != nil {
-		return ErrToStatus(err)
-	}
-	defer func() {
-		if f != nil {
-			_ = f.Clunk()
-		}
-	}()
-
-	flags9, ok := openFlagsTo9(in.Flags)
-	if !ok {
-		return fuse.ENOTSUP
-	}
-
-	qid, _, err := f.Create(name, flags9, in.Mode, in.Caller.Gid)
-	if err != nil {
-		return ErrToStatus(err)
-	}
-
-	inodef, _, err := f.Walk([]string{})
-	if err != nil {
-		return ErrToStatus(err)
-	}
-
-	newInode := &Inode9{
-		nodeId: fs.nextNodeId(),
-		qid:    qid,
-		refs:   1,
-	}
-	newInode.SwapFile(inodef)
-
-	out.NodeId = newInode.nodeId
-	out.Ino = newInode.qid.Path
-	out.Generation = uint64(newInode.qid.Version)
-	out.Mode = qidToMode(&newInode.qid)
-	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
-	out.Fh = fs.nextFileHandle()
-
-	fs.lock.Lock()
-	fs.n2Inode[newInode.nodeId] = newInode
-	fs.p2Inode[newInode.qid.Path] = newInode
-	fs.fh2OpenFile[out.Fh] = &OpenFile{
-		inode: inode,
-		f:     f,
-	}
-	f = nil
-	fs.lock.Unlock()
-
-	return fuse.OK
-}
-
 */
+
+func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
+	out.Fh = fs.nextFileHandle()
+	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
+	fs.lock.Lock()
+	fs.fh2OpenFile[out.Fh] = &openFile{
+		ino: in.NodeId,
+	}
+	fs.lock.Unlock()
+	return fuse.OK
+}
+
+func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
+	stat, err := fs.fs.Mknod(in.NodeId, name, MknodOpts{
+		Truncate: in.Flags&unix.O_TRUNC != 0,
+		Mode:     (^S_IFMT & in.Mode) | S_IFREG,
+		Uid:      in.Owner.Uid,
+		Gid:      in.Owner.Gid,
+	})
+	if err != nil {
+		return errToStatus(err)
+	}
+	fillFuseEntryOutFromStat(&stat, &out.EntryOut)
+
+	out.Fh = fs.nextFileHandle()
+	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
+
+	fs.lock.Lock()
+	fs.fh2OpenFile[out.Fh] = &openFile{
+		ino: stat.Ino,
+	}
+	fs.lock.Unlock()
+
+	return fuse.OK
+}
 
 func (fs *FuseFs) Rename(cancel <-chan struct{}, in *fuse.RenameIn, fromName string, toName string) fuse.Status {
 	fromDir := in.NodeId
@@ -313,13 +215,8 @@ func (fs *FuseFs) Rename(cancel <-chan struct{}, in *fuse.RenameIn, fromName str
 }
 
 /*
-
 func (fs *Proto9FS) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
-	fs.lock.Lock()
-	f := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
-
-	n, err := f.f.Read(uint64(in.Offset), buf)
+	n, err := fs.fs.ReadAt(in.NodeId, buf, uint64(in.Offset))
 	if err != nil {
 		return nil, ErrToStatus(err)
 	}
@@ -327,16 +224,15 @@ func (fs *Proto9FS) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (f
 }
 
 func (fs *Proto9FS) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (uint32, fuse.Status) {
-	fs.lock.Lock()
-	f := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
-
-	n, err := f.f.Write(uint64(in.Offset), buf)
+	n, err := fs.fs.WriteAt(in.NodeId, buf, uint64(in.Offset))
 	if err != nil {
-		return 0, ErrToStatus(err)
+		return n, ErrToStatus(err)
 	}
 	return n, fuse.OK
 }
+*/
+
+/*
 
 func (fs *Proto9FS) setLk(cancel <-chan struct{}, in *fuse.LkIn, wait bool) fuse.Status {
 
@@ -398,46 +294,23 @@ func (fs *Proto9FS) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 	return fs.setLk(cancel, in, true)
 }
 
-func (fs *Proto9FS) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
+*/
+
+func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 	fs.lock.Lock()
-	f := fs.fh2OpenFile[in.Fh]
 	delete(fs.fh2OpenFile, in.Fh)
 	fs.lock.Unlock()
-	_ = f.f.Clunk()
-	return
 }
 
-func (fs *Proto9FS) remove(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	fs.lock.Lock()
-	inode := fs.n2Inode[header.NodeId]
-	fs.lock.Unlock()
-
-	f, ok := inode.GetFile()
-	if !ok {
-		return fuse.EIO
-	}
-
-	f, _, err := f.Walk([]string{name})
-	if err != nil {
-		return ErrToStatus(err)
-	}
-
-	err = f.Remove()
-	if err != nil {
-		return ErrToStatus(err)
-	}
-	return fuse.OK
+func (fs *FuseFs) Unlink(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
+	err := fs.fs.Unlink(in.NodeId, name)
+	return errToStatus(err)
 }
 
-func (fs *Proto9FS) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	return fs.remove(cancel, header, name)
+func (fs *FuseFs) Rmdir(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
+	err := fs.fs.Unlink(in.NodeId, name)
+	return errToStatus(err)
 }
-
-func (fs *Proto9FS) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	return fs.remove(cancel, header, name)
-}
-
-*/
 
 func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
 	stat, err := fs.fs.Mknod(in.NodeId, name, MknodOpts{

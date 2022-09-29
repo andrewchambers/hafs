@@ -85,6 +85,33 @@ func TestMknod(t *testing.T) {
 
 }
 
+func TestMknodTruncate(t *testing.T) {
+	fs := tmpFs(t)
+
+	fooStat1, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fooStat2, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
+		Truncate: true,
+		Mode:     S_IFDIR | 0o777,
+		Uid:      0,
+		Gid:      0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if fooStat1.Ino != fooStat2.Ino {
+		t.Fatalf("inodes differ")
+	}
+}
+
 func TestUnlink(t *testing.T) {
 	fs := tmpFs(t)
 
