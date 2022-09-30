@@ -40,6 +40,7 @@ func main() {
 			EnableLocks:          true,
 			IgnoreSecurityLabels: true, // option?
 			Debug:                true,
+			// MaxWrite: XXX option?,
 		})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create fuse server: %s\n", err)

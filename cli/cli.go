@@ -38,8 +38,8 @@ func MustOpenDatabase() fdb.Database {
 	return db
 }
 
-func MustAttach() *fs.Fs {
-	fs, err := fs.Mount(MustOpenDatabase())
+func MustAttach() *hafs.Fs {
+	fs, err := hafs.Attach(MustOpenDatabase())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to connect to filesystem: %s\n", err)
 		os.Exit(1)

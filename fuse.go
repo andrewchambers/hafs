@@ -3,6 +3,7 @@ package hafs
 import (
 	"errors"
 	"io"
+	iofs "io/fs"
 	"sync"
 	"sync/atomic"
 
@@ -10,19 +11,23 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func errToStatus(err error) fuse.Status {
+func errToFuseStatus(err error) fuse.Status {
 	if err == nil {
 		return fuse.OK
 	}
 
-	if errors.Is(err, ErrNotExist) {
+	if errno, ok := err.(unix.Errno); ok {
+		return fuse.Status(errno)
+	}
+
+	if errors.Is(err, iofs.ErrNotExist) {
 		return fuse.Status(unix.ENOENT)
-	} else if errors.Is(err, ErrExist) {
+	} else if errors.Is(err, iofs.ErrPermission) {
+		return fuse.Status(unix.EPERM)
+	} else if errors.Is(err, iofs.ErrExist) {
 		return fuse.Status(unix.EEXIST)
-	} else if errors.Is(err, ErrNotEmpty) {
-		return fuse.Status(unix.ENOTEMPTY)
-	} else if errors.Is(err, ErrNotDir) {
-		return fuse.Status(unix.ENOTDIR)
+	} else if errors.Is(err, iofs.ErrInvalid) {
+		return fuse.Status(unix.EINVAL)
 	}
 
 	return fuse.Status(fuse.EIO)
@@ -32,7 +37,7 @@ func fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
 	out.Ino = stat.Ino
 	out.Size = stat.Size
 	out.Blocks = stat.Size / 512
-	out.Blksize = PAGE_SIZE
+	out.Blksize = CHUNK_SIZE
 	out.Atime = stat.Atimesec
 	out.Atimensec = stat.Atimensec
 	out.Mtime = stat.Mtimesec
@@ -89,7 +94,7 @@ func (fs *FuseFs) Init(server *fuse.Server) {
 func (fs *FuseFs) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
 	stat, err := fs.fs.Lookup(header.NodeId, name)
 	if err != nil {
-		return errToStatus(err)
+		return errToFuseStatus(err)
 	}
 	fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
@@ -97,7 +102,6 @@ func (fs *FuseFs) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name str
 
 // A forget request is sent by the kernel when it is no longer interested in an inode.
 func (fs *FuseFs) Forget(nodeId, nlookup uint64) {
-	// log.Printf("XXX forget %d nlookup=%d", nodeId, nlookup)
 	if nodeId == ^uint64(0) {
 		// go-fuse uses this inode for its own purposes (epoll bug fix).
 		return
@@ -107,67 +111,51 @@ func (fs *FuseFs) Forget(nodeId, nlookup uint64) {
 func (fs *FuseFs) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
 	stat, err := fs.fs.GetStat(in.NodeId)
 	if err != nil {
-		return errToStatus(err)
+		return errToFuseStatus(err)
 	}
 	fillFuseAttrFromStat(&stat, &out.Attr)
 	return fuse.OK
 }
 
-/*
+func (fs *FuseFs) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
 
-func (fs *Proto9FS) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
-
-	fs.lock.Lock()
-	inode := fs.n2Inode[in.NodeId]
-	fs.lock.Unlock()
-
-	setAttr := proto9.LSetAttr{}
+	setStat := SetStatOpts{}
 
 	if mtime, ok := in.GetMTime(); ok {
-		setAttr.MtimeSec = uint64(mtime.Unix())
-		setAttr.MtimeNsec = uint64(mtime.UnixNano() % 1000_000_000)
-		setAttr.Valid |= proto9.L_SETATTR_MTIME
+		setStat.SetMtime(mtime)
 	}
 	if atime, ok := in.GetATime(); ok {
-		setAttr.AtimeSec = uint64(atime.Unix())
-		setAttr.AtimeNsec = uint64(atime.UnixNano() % 1000_000_000)
-		setAttr.Valid |= proto9.L_SETATTR_ATIME
+		setStat.SetAtime(atime)
 	}
+	if ctime, ok := in.GetCTime(); ok {
+		setStat.SetCtime(ctime)
+	}
+
 	if size, ok := in.GetSize(); ok {
-		setAttr.Size = size
-		setAttr.Valid |= proto9.L_SETATTR_SIZE
+		setStat.Valid |= SETSTAT_SIZE
+		setStat.SetSize(size)
 	}
+
 	if mode, ok := in.GetMode(); ok {
-		setAttr.Mode = mode
-		setAttr.Valid |= proto9.L_SETATTR_MODE
+		setStat.SetMode(mode)
 	}
 
-	// TODO
-	// in.GetCTime()
-	// in.GetGID()
-	// in.GetUID()
-
-	f, ok := inode.GetFile()
-	if !ok {
-		return fuse.EIO
+	if uid, ok := in.GetUID(); ok {
+		setStat.SetUid(uid)
 	}
 
-	err := f.SetAttr(setAttr)
+	if gid, ok := in.GetGID(); ok {
+		setStat.SetGid(gid)
+	}
+
+	stat, err := fs.fs.SetStat(in.NodeId, setStat)
 	if err != nil {
-		return ErrToStatus(err)
+		return errToFuseStatus(err)
 	}
 
-	// XXX a full getattr might not be necessary.
-	attr, err := f.GetAttr(proto9.L_GETATTR_ALL)
-	if err != nil {
-		return ErrToStatus(err)
-	}
-	FillFuseAttrFromAttr(&attr, &out.Attr)
-
+	fillFuseAttrFromStat(&stat, &out.Attr)
 	return fuse.OK
 }
-
-*/
 
 func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 	out.Fh = fs.nextFileHandle()
@@ -188,7 +176,7 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 		Gid:      in.Owner.Gid,
 	})
 	if err != nil {
-		return errToStatus(err)
+		return errToFuseStatus(err)
 	}
 	fillFuseEntryOutFromStat(&stat, &out.EntryOut)
 
@@ -209,7 +197,7 @@ func (fs *FuseFs) Rename(cancel <-chan struct{}, in *fuse.RenameIn, fromName str
 	toDir := in.Newdir
 	err := fs.fs.Rename(fromDir, toDir, fromName, toName)
 	if err != nil {
-		return errToStatus(err)
+		return errToFuseStatus(err)
 	}
 	return fuse.OK
 }
@@ -222,15 +210,15 @@ func (fs *Proto9FS) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (f
 	}
 	return fuse.ReadResultData(buf[:n]), fuse.OK
 }
+*/
 
-func (fs *Proto9FS) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (uint32, fuse.Status) {
-	n, err := fs.fs.WriteAt(in.NodeId, buf, uint64(in.Offset))
+func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (uint32, fuse.Status) {
+	n, err := fs.fs.WriteData(in.NodeId, buf, uint64(in.Offset))
 	if err != nil {
-		return n, ErrToStatus(err)
+		return n, errToFuseStatus(err)
 	}
 	return n, fuse.OK
 }
-*/
 
 /*
 
@@ -304,12 +292,12 @@ func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 
 func (fs *FuseFs) Unlink(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
 	err := fs.fs.Unlink(in.NodeId, name)
-	return errToStatus(err)
+	return errToFuseStatus(err)
 }
 
 func (fs *FuseFs) Rmdir(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
 	err := fs.fs.Unlink(in.NodeId, name)
-	return errToStatus(err)
+	return errToFuseStatus(err)
 }
 
 func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
@@ -319,7 +307,7 @@ func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, o
 		Gid:  in.Owner.Gid,
 	})
 	if err != nil {
-		return errToStatus(err)
+		return errToFuseStatus(err)
 	}
 	fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
@@ -328,7 +316,7 @@ func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, o
 func (fs *FuseFs) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 	dirIter, err := fs.fs.IterDirEnts(in.NodeId)
 	if err != nil {
-		return errToStatus(err)
+		return errToFuseStatus(err)
 	}
 
 	out.Fh = fs.nextFileHandle()
@@ -361,7 +349,7 @@ func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return errToStatus(err)
+			return errToFuseStatus(err)
 		}
 		fuseDirEnt := fuse.DirEntry{
 			Name: ent.Name,
@@ -374,7 +362,7 @@ func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 			if entryOut != nil {
 				stat, err := fs.fs.GetStat(ent.Ino)
 				if err != nil {
-					return errToStatus(err)
+					return errToFuseStatus(err)
 				}
 				fillFuseEntryOutFromStat(&stat, entryOut)
 			} else {

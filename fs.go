@@ -9,7 +9,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	gofs "io/fs"
 	"os"
 	"sync"
 	"time"
@@ -20,10 +19,11 @@ import (
 )
 
 var (
-	ErrNotExist  = gofs.ErrNotExist
-	ErrExist     = gofs.ErrExist
-	ErrNotEmpty  = errors.New("directory is not empty")
-	ErrNotDir    = errors.New("not a directory")
+	ErrNotExist  = unix.ENOENT
+	ErrExist     = unix.EEXIST
+	ErrNotEmpty  = unix.ENOTEMPTY
+	ErrNotDir    = unix.ENOTDIR
+	ErrInvalid   = unix.EINVAL
 	ErrUnmounted = errors.New("filesystem unmounted")
 )
 
@@ -31,7 +31,7 @@ const (
 	CURRENT_FDB_API_VERSION = 600
 	CURRENT_SCHEMA_VERSION  = 1
 	ROOT_INO                = 1
-	PAGE_SIZE               = 4096
+	CHUNK_SIZE              = 4096
 )
 
 const (
@@ -158,7 +158,7 @@ func Mkfs(db fdb.Database, opts MkfsOpts) error {
 	return err
 }
 
-func Mount(db fdb.Database) (*Fs, error) {
+func Attach(db fdb.Database) (*Fs, error) {
 	hostname, _ := os.Hostname()
 	if hostname == "" {
 		hostname = "unknown"
@@ -359,7 +359,10 @@ func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
 		dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
 		return dirEnt, err
 	})
-	return dirEnt.(DirEnt), err
+	if err != nil {
+		return DirEnt{}, err
+	}
+	return dirEnt.(DirEnt), nil
 }
 
 type MknodOpts struct {
@@ -496,7 +499,149 @@ func (fs *Fs) GetStat(ino uint64) (Stat, error) {
 		stat, err := fs.txGetStat(tx, ino).Get()
 		return stat, err
 	})
-	return stat.(Stat), err
+	if err != nil {
+		return Stat{}, err
+	}
+	return stat.(Stat), nil
+}
+
+const (
+	SETSTAT_MODE = 1 << iota
+	SETSTAT_UID
+	SETSTAT_GID
+	SETSTAT_SIZE
+	SETSTAT_ATIME
+	SETSTAT_MTIME
+	SETSTAT_CTIME
+)
+
+type SetStatOpts struct {
+	Valid     uint32
+	Size      uint64
+	Atimesec  uint64
+	Mtimesec  uint64
+	Ctimesec  uint64
+	Atimensec uint32
+	Mtimensec uint32
+	Ctimensec uint32
+	Mode      uint32
+	Uid       uint32
+	Gid       uint32
+}
+
+func (opts *SetStatOpts) setTime(t time.Time, secs *uint64, nsecs *uint32) {
+	*secs = uint64(t.UnixNano() / 1_000_000_000)
+	*nsecs = uint32(t.UnixNano() % 1_000_000_000)
+}
+
+func (opts *SetStatOpts) SetMtime(t time.Time) {
+	opts.Valid |= SETSTAT_MTIME
+	opts.setTime(t, &opts.Mtimesec, &opts.Mtimensec)
+}
+
+func (opts *SetStatOpts) SetAtime(t time.Time) {
+	opts.Valid |= SETSTAT_ATIME
+	opts.setTime(t, &opts.Atimesec, &opts.Atimensec)
+}
+
+func (opts *SetStatOpts) SetCtime(t time.Time) {
+	opts.Valid |= SETSTAT_CTIME
+	opts.setTime(t, &opts.Ctimesec, &opts.Ctimensec)
+}
+
+func (opts *SetStatOpts) SetSize(size uint64) {
+	opts.Valid |= SETSTAT_SIZE
+	opts.Size = size
+}
+
+func (opts *SetStatOpts) SetMode(mode uint32) {
+	opts.Valid |= SETSTAT_MODE
+	opts.Mode = mode
+}
+
+func (opts *SetStatOpts) SetUid(uid uint32) {
+	opts.Valid |= SETSTAT_UID
+	opts.Uid = uid
+}
+
+func (opts *SetStatOpts) SetGid(gid uint32) {
+	opts.Valid |= SETSTAT_GID
+	opts.Gid = gid
+}
+
+func (fs *Fs) SetStat(ino uint64, opts SetStatOpts) (Stat, error) {
+	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+		stat, err := fs.txGetStat(tx, ino).Get()
+		if err != nil {
+			return nil, err
+		}
+
+		if opts.Valid&SETSTAT_MODE != 0 {
+			stat.Mode = (stat.Mode & S_IFMT) | (opts.Mode & ^S_IFMT)
+		}
+
+		if opts.Valid&SETSTAT_UID != 0 {
+			stat.Uid = opts.Uid
+		}
+
+		if opts.Valid&SETSTAT_GID != 0 {
+			stat.Gid = opts.Gid
+		}
+
+		if opts.Valid&SETSTAT_ATIME != 0 {
+			stat.Atimesec = opts.Atimesec
+			stat.Atimensec = opts.Atimensec
+		}
+
+		now := time.Now()
+
+		if opts.Valid&SETSTAT_MTIME != 0 {
+			stat.Mtimesec = opts.Mtimesec
+			stat.Mtimensec = opts.Mtimensec
+		} else if opts.Valid&SETSTAT_SIZE != 0 {
+			stat.SetMtime(now)
+		}
+
+		if opts.Valid&SETSTAT_CTIME != 0 {
+			stat.Ctimesec = opts.Ctimesec
+			stat.Ctimensec = opts.Ctimensec
+		} else {
+			stat.SetCtime(now)
+		}
+
+		if opts.Valid&SETSTAT_SIZE != 0 {
+			stat.Size = opts.Size
+
+			if stat.Size == 0 {
+				tx.ClearRange(tuple.Tuple{"fs", "ino", ino, "data"})
+			} else {
+				clearBegin := (stat.Size + (CHUNK_SIZE - stat.Size%4096)) / CHUNK_SIZE
+				_, clearEnd := tuple.Tuple{"fs", "ino", ino, "data"}.FDBRangeKeys()
+				tx.ClearRange(fdb.KeyRange{
+					Begin: tuple.Tuple{"fs", "ino", ino, "data", clearBegin},
+					End:   clearEnd,
+				})
+				lastChunkIdx := stat.Size / CHUNK_SIZE
+				lastChunkSize := stat.Size % CHUNK_SIZE
+				lastChunkKey := tuple.Tuple{"fs", "ino", ino, "data", lastChunkIdx}
+				if lastChunkSize == 0 {
+					tx.Clear(lastChunkKey)
+				} else {
+					lastChunk := tx.Get(lastChunkKey).MustGet()
+					lastChunk = lastChunk[:lastChunkSize]
+					tx.Set(lastChunkKey, lastChunk)
+				}
+			}
+		}
+
+		fs.txSetStat(tx, stat)
+		return stat, nil
+	})
+	if err != nil {
+		return Stat{}, err
+	}
+	return stat.(Stat), nil
 }
 
 func (fs *Fs) Lookup(dirIno uint64, name string) (Stat, error) {
@@ -508,7 +653,10 @@ func (fs *Fs) Lookup(dirIno uint64, name string) (Stat, error) {
 		stat, err := fs.txGetStat(tx, dirEnt.Ino).Get()
 		return stat, err
 	})
-	return stat.(Stat), err
+	if err != nil {
+		return Stat{}, err
+	}
+	return stat.(Stat), nil
 }
 
 func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error {
@@ -609,10 +757,93 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 	return err
 }
 
+func (fs *Fs) WriteData(ino uint64, buf []byte, off uint64) (uint32, error) {
+
+	const MAX_WRITE = 128 * CHUNK_SIZE
+
+	// FoundationDB has a transaction time limit and a transaction size limit,
+	// limit the write to something that can fit.
+	if len(buf) > MAX_WRITE {
+		buf = buf[:MAX_WRITE]
+	}
+
+	nWritten, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+		futureStat := fs.txGetStat(tx, ino)
+		currentOffset := off
+		remainingBuf := buf
+
+		// Deal with the first unaligned and undersized chunks,
+		// we must read it, then write it back updated.
+		if currentOffset%CHUNK_SIZE != 0 || len(remainingBuf) < CHUNK_SIZE {
+			firstChunkNo := currentOffset / CHUNK_SIZE
+			firstChunkOffset := currentOffset % CHUNK_SIZE
+			firstWriteCount := CHUNK_SIZE - firstChunkOffset
+			if firstWriteCount > uint64(len(buf)) {
+				firstWriteCount = uint64(len(buf))
+			}
+			firstChunkKey := tuple.Tuple{"fs", "ino", ino, "data", firstChunkNo}
+			chunk := tx.Get(firstChunkKey).MustGet()
+
+			finalChunkSize := firstChunkOffset + firstWriteCount
+			if uint64(len(chunk)) < finalChunkSize {
+				nZeros := finalChunkSize - uint64(len(chunk))
+				for i := uint64(0); i < nZeros; i += 1 {
+					chunk = append(chunk, 0)
+				}
+			}
+
+			copy(chunk[firstChunkOffset:firstChunkOffset+firstWriteCount], remainingBuf)
+			currentOffset += firstWriteCount
+			remainingBuf = remainingBuf[firstWriteCount:]
+			tx.Set(firstChunkKey, chunk)
+		}
+
+		if len(remainingBuf) > 0 {
+			unalignedTrailingBytes := (currentOffset + uint64(len(remainingBuf))) % CHUNK_SIZE
+			if unalignedTrailingBytes != 0 {
+				// For simplicity, truncate the remaining amount to a multiple of CHUNK_SIZE
+				// so we only need to deal with writing full chunks.
+				remainingBuf = remainingBuf[:uint64(len(remainingBuf))-unalignedTrailingBytes]
+			}
+		}
+
+		for i := 0; i < len(remainingBuf); {
+			key := tuple.Tuple{"fs", "ino", ino, "data", currentOffset / CHUNK_SIZE}
+			chunk := remainingBuf[i : i+CHUNK_SIZE]
+			tx.Set(key, chunk)
+			i += CHUNK_SIZE
+			currentOffset += CHUNK_SIZE
+		}
+
+		stat, err := futureStat.Get()
+		if err != nil {
+			return nil, err
+		}
+
+		if stat.Mode&S_IFMT != S_IFREG {
+			return nil, ErrInvalid
+		}
+
+		nWritten := currentOffset - off
+
+		if stat.Size < off+nWritten {
+			stat.Size = off + nWritten
+			fs.txSetStat(tx, stat)
+		}
+		return uint32(nWritten), nil
+	})
+	if err != nil {
+		return 0, err
+	}
+
+	return nWritten.(uint32), nil
+}
+
 /*
 func (fs *Fs) Read(ino uint64, buf []byte, off uint64) (uint32, error) {
 
-	const MAX_READ = 128*PAGE_SIZE
+	const MAX_READ = 128*CHUNK_SIZE
 
 	if len(buf) > MAX_READ {
 		buf = buf[:MAX_READ]
@@ -648,7 +879,7 @@ func (fs *Fs) Read(ino uint64, buf []byte, off uint64) (uint32, error) {
 		firstPage := nRead == 0
 		pageStart := uint64(0)
 		if firstPage {
-			pageStart = off%PAGE_SIZE
+			pageStart = off%CHUNK_SIZE
 		}
 
 		len(page)
