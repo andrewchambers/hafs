@@ -406,7 +406,7 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 			}
 
 			stat.Size = 0
-			tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino, "page"})
+			tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino, "data"})
 		} else {
 			newIno := fs.txNextIno(tx)
 			if err != ErrNotExist {
@@ -627,10 +627,6 @@ func (fs *Fs) SetStat(ino uint64, opts SetStatOpts) (Stat, error) {
 				lastChunkKey := tuple.Tuple{"fs", "ino", ino, "data", lastChunkIdx}
 				if lastChunkSize == 0 {
 					tx.Clear(lastChunkKey)
-				} else {
-					lastChunk := tx.Get(lastChunkKey).MustGet()
-					lastChunk = lastChunk[:lastChunkSize]
-					tx.Set(lastChunkKey, lastChunk)
 				}
 			}
 		}
@@ -757,7 +753,7 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 	return err
 }
 
-func (fs *Fs) WriteData(ino uint64, buf []byte, off uint64) (uint32, error) {
+func (fs *Fs) WriteData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 
 	const MAX_WRITE = 128 * CHUNK_SIZE
 
@@ -770,11 +766,10 @@ func (fs *Fs) WriteData(ino uint64, buf []byte, off uint64) (uint32, error) {
 	nWritten, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 
 		futureStat := fs.txGetStat(tx, ino)
-		currentOffset := off
+		currentOffset := offset
 		remainingBuf := buf
 
-		// Deal with the first unaligned and undersized chunks,
-		// we must read it, then write it back updated.
+		// Deal with the first unaligned and undersized chunks.
 		if currentOffset%CHUNK_SIZE != 0 || len(remainingBuf) < CHUNK_SIZE {
 			firstChunkNo := currentOffset / CHUNK_SIZE
 			firstChunkOffset := currentOffset % CHUNK_SIZE
@@ -784,13 +779,8 @@ func (fs *Fs) WriteData(ino uint64, buf []byte, off uint64) (uint32, error) {
 			}
 			firstChunkKey := tuple.Tuple{"fs", "ino", ino, "data", firstChunkNo}
 			chunk := tx.Get(firstChunkKey).MustGet()
-
-			finalChunkSize := firstChunkOffset + firstWriteCount
-			if uint64(len(chunk)) < finalChunkSize {
-				nZeros := finalChunkSize - uint64(len(chunk))
-				for i := uint64(0); i < nZeros; i += 1 {
-					chunk = append(chunk, 0)
-				}
+			if chunk == nil {
+				chunk = make([]byte, CHUNK_SIZE, CHUNK_SIZE)
 			}
 
 			copy(chunk[firstChunkOffset:firstChunkOffset+firstWriteCount], remainingBuf)
@@ -802,18 +792,16 @@ func (fs *Fs) WriteData(ino uint64, buf []byte, off uint64) (uint32, error) {
 		if len(remainingBuf) > 0 {
 			unalignedTrailingBytes := (currentOffset + uint64(len(remainingBuf))) % CHUNK_SIZE
 			if unalignedTrailingBytes != 0 {
-				// For simplicity, truncate the remaining amount to a multiple of CHUNK_SIZE
-				// so we only need to deal with writing full chunks.
+				// Do trailing unaligned bytes next write.
 				remainingBuf = remainingBuf[:uint64(len(remainingBuf))-unalignedTrailingBytes]
 			}
 		}
 
-		for i := 0; i < len(remainingBuf); {
+		for len(remainingBuf) != 0 {
 			key := tuple.Tuple{"fs", "ino", ino, "data", currentOffset / CHUNK_SIZE}
-			chunk := remainingBuf[i : i+CHUNK_SIZE]
-			tx.Set(key, chunk)
-			i += CHUNK_SIZE
+			tx.Set(key, remainingBuf[:CHUNK_SIZE])
 			currentOffset += CHUNK_SIZE
+			remainingBuf = remainingBuf[CHUNK_SIZE:]
 		}
 
 		stat, err := futureStat.Get()
@@ -825,12 +813,13 @@ func (fs *Fs) WriteData(ino uint64, buf []byte, off uint64) (uint32, error) {
 			return nil, ErrInvalid
 		}
 
-		nWritten := currentOffset - off
+		nWritten := currentOffset - offset
 
-		if stat.Size < off+nWritten {
-			stat.Size = off + nWritten
-			fs.txSetStat(tx, stat)
+		if stat.Size < offset+nWritten {
+			stat.Size = offset + nWritten
 		}
+		stat.SetMtime(time.Now())
+		fs.txSetStat(tx, stat)
 		return uint32(nWritten), nil
 	})
 	if err != nil {
@@ -840,53 +829,101 @@ func (fs *Fs) WriteData(ino uint64, buf []byte, off uint64) (uint32, error) {
 	return nWritten.(uint32), nil
 }
 
-/*
-func (fs *Fs) Read(ino uint64, buf []byte, off uint64) (uint32, error) {
+func (fs *Fs) ReadData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 
-	const MAX_READ = 128*CHUNK_SIZE
+	const MAX_READ = 128 * CHUNK_SIZE
 
 	if len(buf) > MAX_READ {
 		buf = buf[:MAX_READ]
 	}
 
-	for nRead != uint32(len(buf)) {
+	nRead, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		currentOffset := offset
+		remainingBuf := buf
 
-		pagev, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			var err error
-			stat, err = fs.txGetStat().Get()
-			if err != nil {
-				return nil, err
-			}
-
-			if off > stat.Size {
-				return nil, io.EOF
-			}
-
-			if stat.Size < off + uint64(len(buf)) {
-				buf = buf[:stat.Size-off]
-			}
-
-			page = tx.Get(tuple.Tuple{"fs", "ino", "page", pageIdx}).MustGet()
-			if page == nil {
-				return nil, io.EOF
-			}
-			return nil, nil
-		})
+		stat, err := fs.txGetStat(tx, ino).Get()
 		if err != nil {
-			return nRead, err
+			return nil, err
 		}
 
-		firstPage := nRead == 0
-		pageStart := uint64(0)
-		if firstPage {
-			pageStart = off%CHUNK_SIZE
+		if stat.Mode&S_IFMT != S_IFREG {
+			return nil, ErrInvalid
 		}
 
-		len(page)
+		// Don't read past the end of the file.
+		if stat.Size < currentOffset+uint64(len(remainingBuf)) {
+			overshoot := (currentOffset + uint64(len(remainingBuf))) - stat.Size
+			remainingBuf = remainingBuf[:uint64(len(remainingBuf))-overshoot]
+			if len(remainingBuf) == 0 {
+				return 0, io.EOF
+			}
+		}
 
+		// Deal with the first unaligned and undersized chunk.
+		if currentOffset%CHUNK_SIZE != 0 || len(remainingBuf) < CHUNK_SIZE {
+
+			firstChunkNo := currentOffset / CHUNK_SIZE
+			firstChunkOffset := currentOffset % CHUNK_SIZE
+			firstReadCount := CHUNK_SIZE - firstChunkOffset
+			if firstReadCount > uint64(len(remainingBuf)) {
+				firstReadCount = uint64(len(remainingBuf))
+			}
+
+			firstChunkKey := tuple.Tuple{"fs", "ino", ino, "data", firstChunkNo}
+			chunk := tx.Get(firstChunkKey).MustGet()
+
+			if chunk != nil {
+				copy(remainingBuf[:firstReadCount], chunk[firstChunkOffset:firstChunkOffset+firstReadCount])
+			} else {
+				// Sparse read.
+				for i := uint64(0); i < firstReadCount; i += 1 {
+					remainingBuf[i] = 0
+				}
+			}
+			remainingBuf = remainingBuf[firstReadCount:]
+			currentOffset += firstReadCount
+		}
+
+		if len(remainingBuf) > 0 {
+			unalignedTrailingBytes := (currentOffset + uint64(len(remainingBuf))) % CHUNK_SIZE
+			if unalignedTrailingBytes != 0 {
+				// Do trailing unaligned bytes next read.
+				remainingBuf = remainingBuf[:uint64(len(remainingBuf))-unalignedTrailingBytes]
+			}
+		}
+
+		// TODO read all these chunks in parallel.
+		for len(remainingBuf) != 0 {
+			key := tuple.Tuple{"fs", "ino", ino, "data", currentOffset / CHUNK_SIZE}
+			chunk := tx.Get(key).MustGet()
+			if chunk != nil {
+				copy(remainingBuf[:CHUNK_SIZE], chunk)
+			} else {
+				// Sparse read.
+				for i := 0; i < CHUNK_SIZE; i++ {
+					remainingBuf[i] = 0
+				}
+			}
+			remainingBuf = remainingBuf[CHUNK_SIZE:]
+			currentOffset += CHUNK_SIZE
+		}
+
+		nRead := currentOffset - offset
+
+		if (offset + nRead) == stat.Size {
+			return uint32(nRead), io.EOF
+		}
+
+		return uint32(nRead), nil
+	})
+
+	nReadInt, ok := nRead.(uint32)
+	if ok {
+		return nReadInt, err
+	} else {
+		return 0, err
 	}
 }
-*/
 
 type DirIter struct {
 	lock      sync.Mutex

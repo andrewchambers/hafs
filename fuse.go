@@ -202,15 +202,13 @@ func (fs *FuseFs) Rename(cancel <-chan struct{}, in *fuse.RenameIn, fromName str
 	return fuse.OK
 }
 
-/*
-func (fs *Proto9FS) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
-	n, err := fs.fs.ReadAt(in.NodeId, buf, uint64(in.Offset))
-	if err != nil {
-		return nil, ErrToStatus(err)
+func (fs *FuseFs) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
+	n, err := fs.fs.ReadData(in.NodeId, buf, uint64(in.Offset))
+	if err != nil && err != io.EOF {
+		return nil, errToFuseStatus(err)
 	}
 	return fuse.ReadResultData(buf[:n]), fuse.OK
 }
-*/
 
 func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (uint32, fuse.Status) {
 	n, err := fs.fs.WriteData(in.NodeId, buf, uint64(in.Offset))
@@ -342,7 +340,6 @@ func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 	}
 
 	// XXX TODO verify offset is correct.
-
 	for {
 		ent, err := d.di.Next()
 		if err != nil {

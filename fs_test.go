@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	mathrand "math/rand"
+	"os"
 	"testing"
 	"time"
 
@@ -488,7 +490,11 @@ func TestWriteDataOneChunk(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if !bytes.Equal(data, fetchedData.([]byte)) {
+		if len(fetchedData.([]byte)) != CHUNK_SIZE {
+			t.Fatalf("unexpected chunk size: %d", fetchedData)
+		}
+
+		if !bytes.Equal(data, fetchedData.([]byte)[:len(data)]) {
 			t.Fatalf("%v != %v", data, fetchedData)
 		}
 
@@ -545,19 +551,11 @@ func TestWriteDataTwoChunks(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		if len(data1) != len(fetchedData1.([]byte)) {
-			t.Fatalf("%v != %v", len(data1), len(fetchedData1.([]byte)))
-		}
-
-		if !bytes.Equal(data1, fetchedData1.([]byte)) {
+		if !bytes.Equal(data1, fetchedData1.([]byte)[:len(data1)]) {
 			t.Fatalf("%v != %v", data, fetchedData1)
 		}
 
-		if len(data2) != len(fetchedData2.([]byte)) {
-			t.Fatalf("%v != %v", len(data2), len(fetchedData2.([]byte)))
-		}
-
-		if !bytes.Equal(data2, fetchedData2.([]byte)) {
+		if !bytes.Equal(data2, fetchedData2.([]byte)[:len(data2)]) {
 			t.Fatalf("%v != %v", data, fetchedData2)
 		}
 
@@ -624,7 +622,10 @@ func TestTruncate(t *testing.T) {
 				t.Fatalf("bad number of data chunks: %d", len(kvs))
 			}
 			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 0}).MustGet()
-			if !bytes.Equal(data, []byte{0, 1, 2, 3, 4}) {
+			if len(data) != CHUNK_SIZE {
+				t.Fatalf("bad data size: %d", len(data))
+			}
+			if !bytes.Equal(data[:5], []byte{0, 1, 2, 3, 4}) {
 				t.Fatalf("bad data: %v", data)
 			}
 			return nil, nil
@@ -634,4 +635,97 @@ func TestTruncate(t *testing.T) {
 		}
 
 	}
+}
+
+func TestReadWriteData(t *testing.T) {
+	fs := tmpFs(t)
+
+	// Random writes at different offsets to exercise the sparse code paths.
+	for i := 0; i < 100; i++ {
+		stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
+			Mode: S_IFREG | 0o777,
+			Uid:  0,
+			Gid:  0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		referenceFile, err := os.CreateTemp("", "")
+		if err != nil {
+			t.Fatal(err)
+		}
+		size := mathrand.Int()%(CHUNK_SIZE*3) + CHUNK_SIZE/2
+		nwrites := mathrand.Int() % 5
+		for i := 0; i < nwrites; i++ {
+			writeOffset := mathrand.Int() % size
+			writeSize := mathrand.Int() % (size - writeOffset)
+			writeData := make([]byte, writeSize, writeSize)
+			n, err := mathrand.Read(writeData)
+			if err != nil || n != len(writeData) {
+				t.Fatalf("%s %d", err, n)
+			}
+			n, err = referenceFile.WriteAt(writeData, int64(writeOffset))
+			if err != nil || n != len(writeData) {
+				t.Fatalf("%s %d", err, n)
+			}
+			nWritten := 0
+			for nWritten != len(writeData) {
+				n, err := fs.WriteData(stat.Ino, writeData[nWritten:], uint64(writeOffset)+uint64(nWritten))
+				if err != nil {
+					t.Fatal(err)
+				}
+				nWritten += int(n)
+			}
+		}
+
+		referenceData, err := io.ReadAll(referenceFile)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		stat, err = fs.Lookup(ROOT_INO, "f")
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if stat.Size != uint64(len(referenceData)) {
+			t.Fatalf("read lengths differ:\n%v\n!=%v\n", stat.Size, len(referenceData))
+		}
+
+		actualData := &bytes.Buffer{}
+		nRead := uint64(0)
+		readSize := (mathrand.Int() % 2 * CHUNK_SIZE) + 100
+		readBuf := make([]byte, readSize, readSize)
+		for {
+			n, err := fs.ReadData(stat.Ino, readBuf, nRead)
+			nRead += uint64(n)
+			_, _ = actualData.Write(readBuf[:n])
+			if err == io.EOF {
+				break
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if nRead > uint64(len(referenceData)) {
+				t.Fatalf("file too large - expected %d bytes, but read %d ", len(referenceData), nRead)
+			}
+		}
+
+		if len(referenceData) != actualData.Len() {
+			t.Fatalf("read lengths differ:\n%v\n!=%v\n", len(referenceData), actualData.Len())
+		}
+
+		if !bytes.Equal(referenceData, actualData.Bytes()) {
+			t.Fatalf("read corrupt:\n%v\n!=%v\n", referenceData, actualData.Bytes())
+		}
+
+		_ = referenceFile.Close()
+
+		err = fs.Unlink(ROOT_INO, "f")
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
 }
