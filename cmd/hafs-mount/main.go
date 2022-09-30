@@ -34,6 +34,7 @@ func main() {
 				// XXX why are these not working?
 				// "direct_io",
 				// "hard_remove",
+				// "big_writes",
 			},
 			AllowOther:           false, // XXX option?
 			DisableXAttrs:        false, // TODO implement

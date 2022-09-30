@@ -608,7 +608,7 @@ func TestTruncate(t *testing.T) {
 			nWritten += int(n)
 		}
 
-		_, err = fs.SetStat(stat.Ino, SetStatOpts{
+		_, err = fs.ModStat(stat.Ino, ModStatOpts{
 			Valid: SETSTAT_SIZE,
 			Size:  5,
 		})

@@ -892,10 +892,17 @@ func (fs *Fs) ReadData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 			}
 		}
 
-		// TODO read all these chunks in parallel.
-		for len(remainingBuf) != 0 {
-			key := tuple.Tuple{"fs", "ino", ino, "data", currentOffset / CHUNK_SIZE}
-			chunk := tx.Get(key).MustGet()
+		nChunks := uint64(len(remainingBuf)) / CHUNK_SIZE
+		chunkFutures := make([]fdb.FutureByteSlice, 0, nChunks)
+
+		// Read all chunks in parallel using futures.
+		for i := uint64(0); i < nChunks; i++ {
+			key := tuple.Tuple{"fs", "ino", ino, "data", (currentOffset / CHUNK_SIZE) + i}
+			chunkFutures = append(chunkFutures, tx.Get(key))
+		}
+
+		for i := uint64(0); i < nChunks; i++ {
+			chunk := chunkFutures[i].MustGet()
 			if chunk != nil {
 				copy(remainingBuf[:CHUNK_SIZE], chunk)
 			} else {
