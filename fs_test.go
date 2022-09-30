@@ -484,6 +484,7 @@ func TestWriteDataOneChunk(t *testing.T) {
 
 		fetchedData, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 0}).MustGet()
+			zeroExpandChunk(&data)
 			return data, nil
 		})
 		if err != nil {
@@ -537,6 +538,7 @@ func TestWriteDataTwoChunks(t *testing.T) {
 
 		fetchedData1, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 0}).MustGet()
+			zeroExpandChunk(&data)
 			return data, nil
 		})
 		if err != nil {
@@ -545,6 +547,7 @@ func TestWriteDataTwoChunks(t *testing.T) {
 
 		fetchedData2, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 1}).MustGet()
+			zeroExpandChunk(&data)
 			return data, nil
 		})
 		if err != nil {
@@ -622,6 +625,7 @@ func TestTruncate(t *testing.T) {
 				t.Fatalf("bad number of data chunks: %d", len(kvs))
 			}
 			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 0}).MustGet()
+			zeroExpandChunk(&data)
 			if len(data) != CHUNK_SIZE {
 				t.Fatalf("bad data size: %d", len(data))
 			}

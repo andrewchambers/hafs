@@ -753,6 +753,22 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 	return err
 }
 
+func zeroTrimChunk(chunk []byte) []byte {
+	i := len(chunk) - 1
+	for ; i >= 0; i-- {
+		if chunk[i] != 0 {
+			break
+		}
+	}
+	return chunk[:i+1]
+}
+
+var _zeroChunk [CHUNK_SIZE]byte
+
+func zeroExpandChunk(chunk *[]byte) {
+	*chunk = append(*chunk, _zeroChunk[len(*chunk):CHUNK_SIZE]...)
+}
+
 func (fs *Fs) WriteData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 
 	const MAX_WRITE = 128 * CHUNK_SIZE
@@ -781,12 +797,13 @@ func (fs *Fs) WriteData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 			chunk := tx.Get(firstChunkKey).MustGet()
 			if chunk == nil {
 				chunk = make([]byte, CHUNK_SIZE, CHUNK_SIZE)
+			} else {
+				zeroExpandChunk(&chunk)
 			}
-
 			copy(chunk[firstChunkOffset:firstChunkOffset+firstWriteCount], remainingBuf)
 			currentOffset += firstWriteCount
 			remainingBuf = remainingBuf[firstWriteCount:]
-			tx.Set(firstChunkKey, chunk)
+			tx.Set(firstChunkKey, zeroTrimChunk(chunk))
 		}
 
 		if len(remainingBuf) > 0 {
@@ -799,7 +816,7 @@ func (fs *Fs) WriteData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 
 		for len(remainingBuf) != 0 {
 			key := tuple.Tuple{"fs", "ino", ino, "data", currentOffset / CHUNK_SIZE}
-			tx.Set(key, remainingBuf[:CHUNK_SIZE])
+			tx.Set(key, zeroTrimChunk(remainingBuf[:CHUNK_SIZE]))
 			currentOffset += CHUNK_SIZE
 			remainingBuf = remainingBuf[CHUNK_SIZE:]
 		}
@@ -871,8 +888,8 @@ func (fs *Fs) ReadData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 
 			firstChunkKey := tuple.Tuple{"fs", "ino", ino, "data", firstChunkNo}
 			chunk := tx.Get(firstChunkKey).MustGet()
-
 			if chunk != nil {
+				zeroExpandChunk(&chunk)
 				copy(remainingBuf[:firstReadCount], chunk[firstChunkOffset:firstChunkOffset+firstReadCount])
 			} else {
 				// Sparse read.
@@ -904,6 +921,7 @@ func (fs *Fs) ReadData(ino uint64, buf []byte, offset uint64) (uint32, error) {
 		for i := uint64(0); i < nChunks; i++ {
 			chunk := chunkFutures[i].MustGet()
 			if chunk != nil {
+				zeroExpandChunk(&chunk)
 				copy(remainingBuf[:CHUNK_SIZE], chunk)
 			} else {
 				// Sparse read.
