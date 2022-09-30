@@ -515,7 +515,7 @@ const (
 	SETSTAT_CTIME
 )
 
-type SetStatOpts struct {
+type ModStatOpts struct {
 	Valid     uint32
 	Size      uint64
 	Atimesec  uint64
@@ -529,47 +529,47 @@ type SetStatOpts struct {
 	Gid       uint32
 }
 
-func (opts *SetStatOpts) setTime(t time.Time, secs *uint64, nsecs *uint32) {
+func (opts *ModStatOpts) setTime(t time.Time, secs *uint64, nsecs *uint32) {
 	*secs = uint64(t.UnixNano() / 1_000_000_000)
 	*nsecs = uint32(t.UnixNano() % 1_000_000_000)
 }
 
-func (opts *SetStatOpts) SetMtime(t time.Time) {
+func (opts *ModStatOpts) SetMtime(t time.Time) {
 	opts.Valid |= SETSTAT_MTIME
 	opts.setTime(t, &opts.Mtimesec, &opts.Mtimensec)
 }
 
-func (opts *SetStatOpts) SetAtime(t time.Time) {
+func (opts *ModStatOpts) SetAtime(t time.Time) {
 	opts.Valid |= SETSTAT_ATIME
 	opts.setTime(t, &opts.Atimesec, &opts.Atimensec)
 }
 
-func (opts *SetStatOpts) SetCtime(t time.Time) {
+func (opts *ModStatOpts) SetCtime(t time.Time) {
 	opts.Valid |= SETSTAT_CTIME
 	opts.setTime(t, &opts.Ctimesec, &opts.Ctimensec)
 }
 
-func (opts *SetStatOpts) SetSize(size uint64) {
+func (opts *ModStatOpts) SetSize(size uint64) {
 	opts.Valid |= SETSTAT_SIZE
 	opts.Size = size
 }
 
-func (opts *SetStatOpts) SetMode(mode uint32) {
+func (opts *ModStatOpts) SetMode(mode uint32) {
 	opts.Valid |= SETSTAT_MODE
 	opts.Mode = mode
 }
 
-func (opts *SetStatOpts) SetUid(uid uint32) {
+func (opts *ModStatOpts) SetUid(uid uint32) {
 	opts.Valid |= SETSTAT_UID
 	opts.Uid = uid
 }
 
-func (opts *SetStatOpts) SetGid(gid uint32) {
+func (opts *ModStatOpts) SetGid(gid uint32) {
 	opts.Valid |= SETSTAT_GID
 	opts.Gid = gid
 }
 
-func (fs *Fs) SetStat(ino uint64, opts SetStatOpts) (Stat, error) {
+func (fs *Fs) ModStat(ino uint64, opts ModStatOpts) (Stat, error) {
 	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 
 		stat, err := fs.txGetStat(tx, ino).Get()

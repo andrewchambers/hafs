@@ -37,8 +37,8 @@ func main() {
 			},
 			AllowOther:           false, // XXX option?
 			DisableXAttrs:        false, // TODO implement
-			EnableLocks:          true,
-			IgnoreSecurityLabels: true, // option?
+			EnableLocks:          false, // TODO
+			IgnoreSecurityLabels: true,  // option?
 			Debug:                true,
 			// MaxWrite: XXX option?,
 		})

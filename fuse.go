@@ -119,36 +119,36 @@ func (fs *FuseFs) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.
 
 func (fs *FuseFs) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
 
-	setStat := SetStatOpts{}
+	modStat := ModStatOpts{}
 
 	if mtime, ok := in.GetMTime(); ok {
-		setStat.SetMtime(mtime)
+		modStat.SetMtime(mtime)
 	}
 	if atime, ok := in.GetATime(); ok {
-		setStat.SetAtime(atime)
+		modStat.SetAtime(atime)
 	}
 	if ctime, ok := in.GetCTime(); ok {
-		setStat.SetCtime(ctime)
+		modStat.SetCtime(ctime)
 	}
 
 	if size, ok := in.GetSize(); ok {
-		setStat.Valid |= SETSTAT_SIZE
-		setStat.SetSize(size)
+		modStat.Valid |= SETSTAT_SIZE
+		modStat.SetSize(size)
 	}
 
 	if mode, ok := in.GetMode(); ok {
-		setStat.SetMode(mode)
+		modStat.SetMode(mode)
 	}
 
 	if uid, ok := in.GetUID(); ok {
-		setStat.SetUid(uid)
+		modStat.SetUid(uid)
 	}
 
 	if gid, ok := in.GetGID(); ok {
-		setStat.SetGid(gid)
+		modStat.SetGid(gid)
 	}
 
-	stat, err := fs.fs.SetStat(in.NodeId, setStat)
+	stat, err := fs.fs.ModStat(in.NodeId, modStat)
 	if err != nil {
 		return errToFuseStatus(err)
 	}

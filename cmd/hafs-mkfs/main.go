@@ -13,7 +13,7 @@ func main() {
 	overwrite := flag.Bool("overwrite", false, "Overwrite any existing filesystem.")
 	flag.Parse()
 	db := cli.MustOpenDatabase()
-	err := fs.Mkfs(db, fs.MkfsOpts{
+	err := hafs.Mkfs(db, hafs.MkfsOpts{
 		Overwrite: *overwrite,
 	})
 	if err != nil {
