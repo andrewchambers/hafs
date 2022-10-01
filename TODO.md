@@ -48,6 +48,10 @@ Should be easy.
 
 Should be easy.
 
+## Way to disable mtime on directories
+
+This might help remove contention on huge directories.
+
 ## Full test coverage
 
 100 percent test coverage.
