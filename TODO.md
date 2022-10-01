@@ -31,10 +31,6 @@ files will probably only be writable in sequential runs.
 
 Currently there is only a single large filesystem - we could support multiple mount points with a simple mount name prefix.
 
-## Posix Locks
-
-We want posix lock support with safe client eviction.
-
 ## Quotas
 
 Quotas using FoundationDB commutative counters might be nice.
@@ -54,3 +50,7 @@ This might help remove contention on huge directories. Maybe we want relmtime?
 ## Review code for TODO
 
 There are various XXX and TODO in the code that need to be addressed or decided upon.
+
+## Options for fuse dir and file cache timeout.
+
+dent and file caching control is very important for a ditributed client.

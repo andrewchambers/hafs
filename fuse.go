@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	iofs "io/fs"
-	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -192,7 +191,6 @@ func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 	fs.lock.Unlock()
 
 	if f.releaseLocks.Load() {
-		log.Printf("XXX %#v", in)
 		for {
 			_, err := fs.fs.TrySetLock(in.NodeId, SetLockOpts{
 				Typ:   LOCK_NONE,
@@ -206,6 +204,7 @@ func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 				break
 			case <-time.After(1 * time.Second):
 				// XXX what can we do? abort on too many retries?
+				// XXX Increment an error counter + log?
 			}
 		}
 	}
