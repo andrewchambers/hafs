@@ -1258,6 +1258,53 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 	return ok.(bool), nil
 }
 
+func (fs *Fs) PollAwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) error {
+	for {
+		released, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+			exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+			return tx.Get(exclusiveLockKey).MustGet() == nil, nil
+		})
+		if err != nil {
+			return err
+		}
+		if released.(bool) == true {
+			return nil
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (fs *Fs) AwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) error {
+	w, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+		if tx.Get(exclusiveLockKey).MustGet() == nil {
+			return nil, nil
+		}
+		w := tx.Watch(exclusiveLockKey)
+		return w, nil
+	})
+	if err != nil {
+		return fs.PollAwaitExclusiveLockRelease(cancel, ino)
+	}
+	if w == nil {
+		return nil
+	}
+
+	watch := w.(fdb.FutureNil)
+	result := make(chan error, 1)
+	go func() {
+		result <- watch.Get()
+	}()
+
+	select {
+	case <-cancel:
+		watch.Cancel()
+		return errors.New("lock wait cancelled")
+	case err := <-result:
+		return err
+	}
+}
+
 func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) {
 
 	iterBegin, iterEnd := tuple.Tuple{"fs", "unlinked"}.FDBRangeKeys()

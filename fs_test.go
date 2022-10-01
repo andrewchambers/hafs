@@ -797,3 +797,117 @@ func TestSetLock(t *testing.T) {
 	}
 
 }
+
+func TestWaitForLockWithWatch(t *testing.T) {
+	fs := tmpFs(t)
+
+	stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+
+	ok, err := fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	waitStart := time.Now()
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		ok, err := fs.TrySetLock(stat.Ino, SetLockOpts{
+			Typ:   LOCK_NONE,
+			Owner: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal()
+		}
+	}()
+
+	err = fs.AwaitExclusiveLockRelease(make(chan struct{}, 1), stat.Ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	if time.Since(waitStart) > 200*time.Millisecond {
+		t.Fatal("wait took too long")
+	}
+}
+
+func TestWaitForLockWithPoll(t *testing.T) {
+	fs := tmpFs(t)
+
+	stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+
+	ok, err := fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	waitStart := time.Now()
+
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		ok, err := fs.TrySetLock(stat.Ino, SetLockOpts{
+			Typ:   LOCK_NONE,
+			Owner: 1,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !ok {
+			t.Fatal()
+		}
+	}()
+
+	err = fs.PollAwaitExclusiveLockRelease(make(chan struct{}, 1), stat.Ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	if time.Since(waitStart) > 1200*time.Millisecond {
+		t.Fatal("wait took too long")
+	}
+}

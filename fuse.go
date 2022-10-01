@@ -455,23 +455,14 @@ func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 }
 
 func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
-	// XXX we could use FoundationDB watches to be more timely.
-	MAX_DELAY := 2 * time.Second
-	delay := 100 * time.Millisecond
 	for {
 		status := fs.SetLk(cancel, in)
 		if status != fuse.EAGAIN {
 			return status
 		}
-		select {
-		case <-time.After(delay):
-			break
-		case <-cancel:
-			return fuse.EINTR
-		}
-		delay *= 2
-		if delay > MAX_DELAY {
-			delay = MAX_DELAY
+		err := fs.fs.AwaitExclusiveLockRelease(cancel, in.NodeId)
+		if err != nil {
+			return errToFuseStatus(err)
 		}
 	}
 }
