@@ -1,6 +1,6 @@
 # TODO
 
-There are things we need to address before we are production ready.
+There are things we need to address before we are production ready (if this meets our suitability criteria).
 
 ## Inode counter contention
 
