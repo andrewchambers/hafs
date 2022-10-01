@@ -4,8 +4,10 @@ import (
 	"errors"
 	"io"
 	iofs "io/fs"
+	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sys/unix"
@@ -58,8 +60,8 @@ func fillFuseEntryOutFromStat(stat *Stat, out *fuse.EntryOut) {
 }
 
 type openFile struct {
-	ino uint64
-	di  *DirIter
+	releaseLocks atomicBool
+	di           *DirIter
 }
 
 type FuseFs struct {
@@ -90,7 +92,6 @@ func (fs *FuseFs) Init(server *fuse.Server) {
 	fs.server = server
 }
 
-// Lookup is called by the kernel to refresh an inode in the inode and dent caches.
 func (fs *FuseFs) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
 	stat, err := fs.fs.Lookup(header.NodeId, name)
 	if err != nil {
@@ -100,12 +101,8 @@ func (fs *FuseFs) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name str
 	return fuse.OK
 }
 
-// A forget request is sent by the kernel when it is no longer interested in an inode.
 func (fs *FuseFs) Forget(nodeId, nlookup uint64) {
-	if nodeId == ^uint64(0) {
-		// go-fuse uses this inode for its own purposes (epoll bug fix).
-		return
-	}
+
 }
 
 func (fs *FuseFs) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
@@ -161,9 +158,7 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 	out.Fh = fs.nextFileHandle()
 	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 	fs.lock.Lock()
-	fs.fh2OpenFile[out.Fh] = &openFile{
-		ino: in.NodeId,
-	}
+	fs.fh2OpenFile[out.Fh] = &openFile{}
 	fs.lock.Unlock()
 	return fuse.OK
 }
@@ -184,12 +179,36 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 
 	fs.lock.Lock()
-	fs.fh2OpenFile[out.Fh] = &openFile{
-		ino: stat.Ino,
-	}
+	fs.fh2OpenFile[out.Fh] = &openFile{}
 	fs.lock.Unlock()
 
 	return fuse.OK
+}
+
+func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
+	fs.lock.Lock()
+	f := fs.fh2OpenFile[in.Fh]
+	delete(fs.fh2OpenFile, in.Fh)
+	fs.lock.Unlock()
+
+	if f.releaseLocks.Load() {
+		log.Printf("XXX %#v", in)
+		for {
+			_, err := fs.fs.TrySetLock(in.NodeId, SetLockOpts{
+				Typ:   LOCK_NONE,
+				Owner: in.LockOwner,
+			})
+			if err == nil {
+				break
+			}
+			select {
+			case <-cancel:
+				break
+			case <-time.After(1 * time.Second):
+				// XXX what can we do? abort on too many retries?
+			}
+		}
+	}
 }
 
 func (fs *FuseFs) Rename(cancel <-chan struct{}, in *fuse.RenameIn, fromName string, toName string) fuse.Status {
@@ -216,76 +235,6 @@ func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (u
 		return n, errToFuseStatus(err)
 	}
 	return n, fuse.OK
-}
-
-/*
-
-func (fs *Proto9FS) setLk(cancel <-chan struct{}, in *fuse.LkIn, wait bool) fuse.Status {
-
-	fs.lock.Lock()
-	f := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
-
-	typ9 := uint8(0)
-
-	switch in.Lk.Typ {
-	case syscall.F_RDLCK:
-		typ9 = proto9.L_LOCK_TYPE_RDLCK
-	case syscall.F_WRLCK:
-		typ9 = proto9.L_LOCK_TYPE_WRLCK
-	case syscall.F_UNLCK:
-		typ9 = proto9.L_LOCK_TYPE_UNLCK
-	default:
-		return fuse.ENOTSUP
-	}
-
-	flags9 := uint32(0)
-	if wait {
-		flags9 |= proto9.L_LOCK_FLAGS_BLOCK
-	}
-
-	for {
-		status, err := f.f.Lock(proto9.LSetLock{
-			Typ:    typ9,
-			Flags:  flags9,
-			Start:  in.Lk.Start,
-			Length: in.Lk.End - in.Lk.Start,
-			ProcId: in.Lk.Pid,
-		})
-		if err != nil {
-			return ErrToStatus(err)
-		}
-
-		switch status {
-		case proto9.L_LOCK_SUCCESS:
-			return 0
-		case proto9.L_LOCK_BLOCKED:
-			if wait {
-				// Server doesn't seem to support blocking.
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			return fuse.EAGAIN
-		default:
-			return fuse.EIO
-		}
-	}
-}
-
-func (fs *Proto9FS) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
-	return fs.setLk(cancel, in, true)
-}
-
-func (fs *Proto9FS) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
-	return fs.setLk(cancel, in, true)
-}
-
-*/
-
-func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
-	fs.lock.Lock()
-	delete(fs.fh2OpenFile, in.Fh)
-	fs.lock.Unlock()
 }
 
 func (fs *FuseFs) Unlink(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
@@ -343,10 +292,7 @@ func (fs *FuseFs) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Ope
 	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 
 	fs.lock.Lock()
-	fs.fh2OpenFile[out.Fh] = &openFile{
-		ino: in.NodeId,
-		di:  dirIter,
-	}
+	fs.fh2OpenFile[out.Fh] = &openFile{di: dirIter}
 	fs.lock.Unlock()
 
 	return fuse.OK
@@ -446,8 +392,6 @@ func (fs *FuseFs) ListXAttr(cancel <-chan struct{}, in *fuse.InHeader, dest []by
 		return nNeeded, fuse.ERANGE
 	}
 
-	// fmt.Printf("XXX %v", xattrs)
-
 	for _, x := range xattrs {
 		copy(dest[:len(x)], x)
 		dest[len(x)] = 0
@@ -466,3 +410,132 @@ func (fs *FuseFs) RemoveXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr st
 	err := fs.fs.RemoveXAttr(in.NodeId, attr)
 	return errToFuseStatus(err)
 }
+
+func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+
+	var lockType LockType
+
+	switch in.Lk.Typ {
+	case unix.F_RDLCK:
+		lockType = LOCK_SHARED
+	case unix.F_WRLCK:
+		lockType = LOCK_EXCLUSIVE
+	case unix.F_UNLCK:
+		lockType = LOCK_NONE
+	default:
+		return fuse.ENOTSUP
+	}
+
+	if in.Lk.Start != 0 {
+		return fuse.ENOTSUP
+	}
+	if in.Lk.End != 0x7fffffffffffffff {
+		return fuse.ENOTSUP
+	}
+
+	ok, err := fs.fs.TrySetLock(in.NodeId, SetLockOpts{
+		Typ:   lockType,
+		Owner: in.Owner,
+	})
+	if err != nil {
+		return errToFuseStatus(err)
+	}
+
+	if !ok {
+		return fuse.EAGAIN
+	}
+
+	fs.lock.Lock()
+	f := fs.fh2OpenFile[in.Fh]
+	// The file has been used for locking, cleanup on release.
+	f.releaseLocks.Store(true)
+	fs.lock.Unlock()
+
+	return fuse.OK
+}
+
+func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	// XXX we could use FoundationDB watches to be more timely.
+	MAX_DELAY := 15 * time.Second
+	delay := 100 * time.Millisecond
+	for {
+		status := fs.SetLk(cancel, in)
+		if status != fuse.EAGAIN {
+			return status
+		}
+		select {
+		case <-time.After(delay):
+			break
+		case <-cancel:
+			return fuse.EINTR
+		}
+		delay *= 2
+		if delay > MAX_DELAY {
+			delay = MAX_DELAY
+		}
+	}
+}
+
+/*
+
+func (fs *Proto9FS) setLk(cancel <-chan struct{}, in *fuse.LkIn, wait bool) fuse.Status {
+
+	fs.lock.Lock()
+	f := fs.fh2OpenFile[in.Fh]
+	fs.lock.Unlock()
+
+	typ9 := uint8(0)
+
+	switch in.Lk.Typ {
+	case syscall.F_RDLCK:
+		typ9 = proto9.L_LOCK_TYPE_RDLCK
+	case syscall.F_WRLCK:
+		typ9 = proto9.L_LOCK_TYPE_WRLCK
+	case syscall.F_UNLCK:
+		typ9 = proto9.L_LOCK_TYPE_UNLCK
+	default:
+		return fuse.ENOTSUP
+	}
+
+	flags9 := uint32(0)
+	if wait {
+		flags9 |= proto9.L_LOCK_FLAGS_BLOCK
+	}
+
+	for {
+		status, err := f.f.Lock(proto9.LSetLock{
+			Typ:    typ9,
+			Flags:  flags9,
+			Start:  in.Lk.Start,
+			Length: in.Lk.End - in.Lk.Start,
+			ProcId: in.Lk.Pid,
+		})
+		if err != nil {
+			return ErrToStatus(err)
+		}
+
+		switch status {
+		case proto9.L_LOCK_SUCCESS:
+			return 0
+		case proto9.L_LOCK_BLOCKED:
+			if wait {
+				// Server doesn't seem to support blocking.
+				time.Sleep(1 * time.Second)
+				continue
+			}
+			return fuse.EAGAIN
+		default:
+			return fuse.EIO
+		}
+	}
+}
+
+func (fs *Proto9FS) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	return fs.setLk(cancel, in, true)
+}
+
+func (fs *Proto9FS) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	return fs.setLk(cancel, in, true)
+}
+
+*/

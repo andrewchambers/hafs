@@ -1162,6 +1162,100 @@ func (fs *Fs) ListXAttr(ino uint64) ([]string, error) {
 	return xattrs, nil
 }
 
+const (
+	LOCK_NONE = iota
+	LOCK_SHARED
+	LOCK_EXCLUSIVE
+)
+
+type LockType uint32
+
+type SetLockOpts struct {
+	Typ   LockType
+	Owner uint64
+}
+
+type exclusiveLockRecord struct {
+	ClientId string
+	Owner    uint64
+}
+
+func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
+	ok, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		stat, err := fs.txGetStat(tx, ino).Get()
+		if err != nil {
+			return false, err
+		}
+
+		if stat.Mode&S_IFMT != S_IFREG {
+			return false, ErrInvalid
+		}
+
+		exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+
+		switch opts.Typ {
+		case LOCK_NONE:
+			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
+			if exclusiveLockBytes != nil {
+				exclusiveLock := exclusiveLockRecord{}
+				err := json.Unmarshal(exclusiveLockBytes, &exclusiveLock)
+				if err != nil {
+					return false, err
+				}
+				// The lock isn't owned by this client.
+				if exclusiveLock.ClientId != fs.mountId {
+					return false, nil
+				}
+				// The request isn't for this owner.
+				if exclusiveLock.Owner != opts.Owner {
+					return false, nil
+				}
+				tx.Clear(exclusiveLockKey)
+			} else {
+				sharedLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "shared", fs.mountId, opts.Owner}
+				tx.Clear(sharedLockKey)
+			}
+			tx.Clear(tuple.Tuple{"fs", "mount", fs.mountId, "lock", ino, opts.Owner})
+			return true, nil
+		case LOCK_SHARED:
+			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
+			if exclusiveLockBytes != nil {
+				return false, nil
+			}
+			tx.Set(tuple.Tuple{"fs", "ino", ino, "lock", "shared", fs.mountId, opts.Owner}, []byte{})
+			tx.Set(tuple.Tuple{"fs", "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
+			return true, nil
+		case LOCK_EXCLUSIVE:
+			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
+			if exclusiveLockBytes != nil {
+				return false, nil
+			}
+			sharedLocks := tx.GetRange(tuple.Tuple{"fs", "ino", ino, "lock", "shared"}, fdb.RangeOptions{
+				Limit: 1,
+			}).GetSliceOrPanic()
+			if len(sharedLocks) > 0 {
+				return false, nil
+			}
+			exclusiveLockBytes, err := json.Marshal(exclusiveLockRecord{
+				ClientId: fs.mountId,
+				Owner:    opts.Owner,
+			})
+			if err != nil {
+				return false, err
+			}
+			tx.Set(exclusiveLockKey, exclusiveLockBytes)
+			tx.Set(tuple.Tuple{"fs", "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
+			return true, nil
+		default:
+			panic("api misuse")
+		}
+	})
+	if err != nil {
+		return false, nil
+	}
+	return ok.(bool), nil
+}
+
 func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) {
 
 	iterBegin, iterEnd := tuple.Tuple{"fs", "unlinked"}.FDBRangeKeys()

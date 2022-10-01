@@ -37,9 +37,8 @@ func main() {
 				// "big_writes",
 			},
 			AllowOther:           false, // XXX option?
-			DisableXAttrs:        false, // TODO implement
-			EnableLocks:          false, // TODO
-			IgnoreSecurityLabels: true,  // option?
+			EnableLocks:          true,
+			IgnoreSecurityLabels: true, // option?
 			Debug:                true,
 			// MaxWrite: XXX option?,
 		})

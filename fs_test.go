@@ -698,3 +698,102 @@ func TestReadWriteData(t *testing.T) {
 	}
 
 }
+
+func TestSetLock(t *testing.T) {
+	fs := tmpFs(t)
+
+	stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+
+	ok, err := fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_NONE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal()
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_SHARED,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_SHARED,
+		Owner: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal()
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_NONE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_NONE,
+		Owner: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 3,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	ok, err = fs.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 4,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatal()
+	}
+
+}
