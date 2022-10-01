@@ -90,6 +90,28 @@ func TestMknod(t *testing.T) {
 
 }
 
+func TestSymlink(t *testing.T) {
+	fs := tmpFs(t)
+	fooStat, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
+		Mode:       S_IFLNK | 0o777,
+		Uid:        0,
+		Gid:        0,
+		LinkTarget: []byte("abc"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	l, err := fs.ReadSymlink(fooStat.Ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if string(l) != "abc" {
+		t.Fatalf("unexpected link target: %v", l)
+	}
+}
+
 func TestMknodTruncate(t *testing.T) {
 	fs := tmpFs(t)
 

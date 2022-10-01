@@ -11,6 +11,9 @@ We currently use a single key for inodes number generation - this is a huge poin
 Permission checks are all done via fuse - however because HAFS is a distributed filesystem there
 are still TOCTOU races - we need to do our own permission checks within transactions to be sure.
 
+It should be noted these might not be worth fixing if the various cases are documented - For example
+to prevent users affecting eachother they could simple deny other users any access to their directories at all.
+
 ## Loop checks
 
 In certain situations it is possible to move a directory inside itself and it will become unreachable,
@@ -36,13 +39,13 @@ We want posix lock support with safe client eviction.
 
 Quotas using FoundationDB commutative counters might be nice.
 
-## Symlinks
-
-Should be easy.
-
 ## Xattrs
 
 Should be easy.
+
+## Respect relatime
+
+How can we properly respect atime and relatime? Is it a fuse flag we must respect?
 
 ## Way to disable mtime on directories
 

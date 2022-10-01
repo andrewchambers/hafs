@@ -313,7 +313,22 @@ func (fs *Fs) txNextIno(tx fdb.Transaction) uint64 {
 	if err != nil {
 		panic(err)
 	}
-	nextInoBytes, err = json.Marshal(ino + 1)
+
+	nextIno := ino
+	for {
+		nextIno += 1
+		// XXX Why is this 4 bytes?
+		const FUSE_UNKNOWN_INO = 0xFFFFFFFF
+		// XXX We currently reserve this inode too pending an answer to https://github.com/hanwen/go-fuse/issues/439.
+		const RESERVED_INO_1 = 0xFFFFFFFFFFFFFFFF
+		if nextIno != FUSE_UNKNOWN_INO && nextIno != RESERVED_INO_1 {
+			break
+		} else if nextIno <= ino {
+			panic("inodes exhausted")
+		}
+	}
+
+	nextInoBytes, err = json.Marshal(nextIno)
 	if err != nil {
 		panic(err)
 	}
@@ -371,11 +386,12 @@ func (fs *Fs) txDirHasChildren(tx fdb.ReadTransaction, dirIno uint64) bool {
 }
 
 type MknodOpts struct {
-	Truncate bool
-	Mode     uint32
-	Uid      uint32
-	Gid      uint32
-	Rdev     uint32
+	Truncate   bool
+	Mode       uint32
+	Uid        uint32
+	Gid        uint32
+	Rdev       uint32
+	LinkTarget []byte
 }
 
 func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
@@ -439,12 +455,15 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 		stat.SetCtime(now)
 		stat.SetAtime(now)
 		fs.txSetStat(tx, stat)
-
 		fs.txSetDirEnt(tx, dirIno, DirEnt{
 			Name: name,
 			Mode: stat.Mode & S_IFMT,
 			Ino:  stat.Ino,
 		})
+
+		if stat.Mode&S_IFMT == S_IFLNK {
+			tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "target"}, opts.LinkTarget)
+		}
 
 		return stat, nil
 	})
@@ -493,6 +512,25 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		return nil, nil
 	})
 	return err
+}
+
+func (fs *Fs) ReadSymlink(ino uint64) ([]byte, error) {
+	l, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		statFut := fs.txGetStat(tx, ino)
+		lFut := tx.Get(tuple.Tuple{"fs", "ino", ino, "target"})
+		stat, err := statFut.Get()
+		if err != nil {
+			return nil, err
+		}
+		if stat.Mode&S_IFMT != S_IFLNK {
+			return nil, ErrInvalid
+		}
+		return lFut.MustGet(), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return l.([]byte), nil
 }
 
 func (fs *Fs) GetStat(ino uint64) (Stat, error) {

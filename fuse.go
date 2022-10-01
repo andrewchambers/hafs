@@ -298,6 +298,28 @@ func (fs *FuseFs) Rmdir(cancel <-chan struct{}, in *fuse.InHeader, name string) 
 	return errToFuseStatus(err)
 }
 
+func (fs *FuseFs) Symlink(cancel <-chan struct{}, in *fuse.InHeader, pointedTo string, linkName string, out *fuse.EntryOut) fuse.Status {
+	stat, err := fs.fs.Mknod(in.NodeId, linkName, MknodOpts{
+		Mode:       S_IFLNK | 0o777,
+		Uid:        in.Owner.Uid,
+		Gid:        in.Owner.Gid,
+		LinkTarget: []byte(pointedTo),
+	})
+	if err != nil {
+		return errToFuseStatus(err)
+	}
+	fillFuseEntryOutFromStat(&stat, out)
+	return fuse.OK
+}
+
+func (fs *FuseFs) Readlink(cancel <-chan struct{}, in *fuse.InHeader) ([]byte, fuse.Status) {
+	l, err := fs.fs.ReadSymlink(in.NodeId)
+	if err != nil {
+		return nil, errToFuseStatus(err)
+	}
+	return l, fuse.OK
+}
+
 func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
 	stat, err := fs.fs.Mknod(in.NodeId, name, MknodOpts{
 		Mode: (^S_IFMT & in.Mode) | S_IFDIR,
