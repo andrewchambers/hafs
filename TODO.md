@@ -1,6 +1,6 @@
-# TODOs
+# TODO
 
-Although the filesystem works - there are things we need to address before we are production ready.
+There are things we need to address before we are production ready.
 
 ## Inode counter contention
 
@@ -47,3 +47,11 @@ Should be easy.
 ## Xattrs
 
 Should be easy.
+
+## Full test coverage
+
+100 percent test coverage.
+
+## Review code for TODO
+
+There are various XXX and TODO in the code that need to be addressed or decided upon.
