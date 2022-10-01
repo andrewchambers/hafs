@@ -1098,6 +1098,70 @@ func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
 	return di, err
 }
 
+func (fs *Fs) GetXAttr(ino uint64, name string) ([]byte, error) {
+	x, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		statFut := fs.txGetStat(tx, ino)
+		xFut := tx.Get(tuple.Tuple{"fs", "ino", ino, "xattr", name})
+		_, err := statFut.Get()
+		if err != nil {
+			return nil, err
+		}
+		return xFut.MustGet(), nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return x.([]byte), nil
+}
+
+func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		_, err := fs.txGetStat(tx, ino).Get()
+		if err != nil {
+			return nil, err
+		}
+		tx.Set(tuple.Tuple{"fs", "ino", ino, "xattr", name}, data)
+		return nil, nil
+	})
+	return err
+}
+
+func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		_, err := fs.txGetStat(tx, ino).Get()
+		if err != nil {
+			return nil, err
+		}
+		tx.Clear(tuple.Tuple{"fs", "ino", ino, "xattr", name})
+		return nil, nil
+	})
+	return err
+}
+
+func (fs *Fs) ListXAttr(ino uint64) ([]string, error) {
+	v, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		_, err := fs.txGetStat(tx, ino).Get()
+		if err != nil {
+			return nil, err
+		}
+		kvs := tx.GetRange(tuple.Tuple{"fs", "ino", ino, "xattr"}, fdb.RangeOptions{}).GetSliceOrPanic()
+		return kvs, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	kvs := v.([]fdb.KeyValue)
+	xattrs := make([]string, 0, len(kvs))
+	for _, kv := range kvs {
+		unpacked, err := tuple.Unpack(kv.Key)
+		if err != nil {
+			return nil, err
+		}
+		xattrs = append(xattrs, unpacked[len(unpacked)-1].(string))
+	}
+	return xattrs, nil
+}
+
 func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) {
 
 	iterBegin, iterEnd := tuple.Tuple{"fs", "unlinked"}.FDBRangeKeys()

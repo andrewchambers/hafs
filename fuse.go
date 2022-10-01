@@ -419,3 +419,50 @@ func (fs *FuseFs) ReleaseDir(in *fuse.ReleaseIn) {
 	delete(fs.fh2OpenFile, in.Fh)
 	fs.lock.Unlock()
 }
+
+func (fs *FuseFs) GetXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr string, dest []byte) (uint32, fuse.Status) {
+	x, err := fs.fs.GetXAttr(in.NodeId, attr)
+	if err != nil {
+		return 0, errToFuseStatus(err)
+	}
+	if len(dest) < len(x) {
+		return uint32(len(x)), fuse.ERANGE
+	}
+	copy(dest, x)
+	return uint32(len(x)), fuse.OK
+}
+
+func (fs *FuseFs) ListXAttr(cancel <-chan struct{}, in *fuse.InHeader, dest []byte) (uint32, fuse.Status) {
+	xattrs, err := fs.fs.ListXAttr(in.NodeId)
+	if err != nil {
+		return 0, errToFuseStatus(err)
+	}
+
+	nNeeded := uint32(0)
+	for _, x := range xattrs {
+		nNeeded += uint32(len(x)) + 1
+	}
+	if uint32(len(dest)) < nNeeded {
+		return nNeeded, fuse.ERANGE
+	}
+
+	// fmt.Printf("XXX %v", xattrs)
+
+	for _, x := range xattrs {
+		copy(dest[:len(x)], x)
+		dest[len(x)] = 0
+		dest = dest[len(x)+1:]
+	}
+
+	return nNeeded, fuse.OK
+}
+
+func (fs *FuseFs) SetXAttr(cancel <-chan struct{}, in *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
+	err := fs.fs.SetXAttr(in.NodeId, attr, data)
+	return errToFuseStatus(err)
+}
+
+func (fs *FuseFs) RemoveXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr string) fuse.Status {
+	err := fs.fs.RemoveXAttr(in.NodeId, attr)
+	return errToFuseStatus(err)
+}

@@ -39,10 +39,6 @@ We want posix lock support with safe client eviction.
 
 Quotas using FoundationDB commutative counters might be nice.
 
-## Xattrs
-
-Should be easy.
-
 ## Respect relatime
 
 How can we properly respect atime and relatime? Is it a fuse flag we must respect?
