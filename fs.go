@@ -178,6 +178,7 @@ func Attach(db fdb.Database) (*Fs, error) {
 		if !bytes.Equal(version, []byte{CURRENT_SCHEMA_VERSION}) {
 			return nil, fmt.Errorf("filesystem has different version - expected %d but got %d", CURRENT_SCHEMA_VERSION, version[0])
 		}
+		tx.Set(tuple.Tuple{"fs", "mounts", mountId, "attached"}, []byte{1})
 		return nil, nil
 	})
 	if err != nil {
@@ -213,8 +214,9 @@ func (fs *Fs) mountHeartBeat() error {
 	if err != nil {
 		return err
 	}
-	_, err = fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		tx.Set(tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"}, lastSeen)
+	_, err = fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		heartBeatKey := tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"}
+		tx.Set(heartBeatKey, lastSeen)
 		return nil, nil
 	})
 	return err
@@ -249,7 +251,7 @@ func (fs *Fs) Close() error {
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
 	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"})
+		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "attached"})
 		v, err := f(tx)
 		if mountCheck.MustGet() == nil {
 			return v, ErrUnmounted
@@ -260,7 +262,7 @@ func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) 
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
 	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"})
+		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "attached"})
 		v, err := f(tx)
 		if mountCheck.MustGet() == nil {
 			return v, ErrUnmounted
@@ -305,7 +307,7 @@ func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) {
 }
 
 func (fs *Fs) txNextIno(tx fdb.Transaction) uint64 {
-	// XXX If we avoid json for this we can use fdb native increment.
+	// XXX If we avoid json for this we could maybe use fdb native increment.
 	// XXX Lots of contention, we could use an array of counters and choose one.
 	var ino uint64
 	nextInoBytes := tx.Get(tuple.Tuple{"fs", "nextino"}).MustGet()

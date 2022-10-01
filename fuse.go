@@ -456,7 +456,7 @@ func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 
 func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 	// XXX we could use FoundationDB watches to be more timely.
-	MAX_DELAY := 15 * time.Second
+	MAX_DELAY := 2 * time.Second
 	delay := 100 * time.Millisecond
 	for {
 		status := fs.SetLk(cancel, in)
@@ -475,67 +475,3 @@ func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 		}
 	}
 }
-
-/*
-
-func (fs *Proto9FS) setLk(cancel <-chan struct{}, in *fuse.LkIn, wait bool) fuse.Status {
-
-	fs.lock.Lock()
-	f := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
-
-	typ9 := uint8(0)
-
-	switch in.Lk.Typ {
-	case syscall.F_RDLCK:
-		typ9 = proto9.L_LOCK_TYPE_RDLCK
-	case syscall.F_WRLCK:
-		typ9 = proto9.L_LOCK_TYPE_WRLCK
-	case syscall.F_UNLCK:
-		typ9 = proto9.L_LOCK_TYPE_UNLCK
-	default:
-		return fuse.ENOTSUP
-	}
-
-	flags9 := uint32(0)
-	if wait {
-		flags9 |= proto9.L_LOCK_FLAGS_BLOCK
-	}
-
-	for {
-		status, err := f.f.Lock(proto9.LSetLock{
-			Typ:    typ9,
-			Flags:  flags9,
-			Start:  in.Lk.Start,
-			Length: in.Lk.End - in.Lk.Start,
-			ProcId: in.Lk.Pid,
-		})
-		if err != nil {
-			return ErrToStatus(err)
-		}
-
-		switch status {
-		case proto9.L_LOCK_SUCCESS:
-			return 0
-		case proto9.L_LOCK_BLOCKED:
-			if wait {
-				// Server doesn't seem to support blocking.
-				time.Sleep(1 * time.Second)
-				continue
-			}
-			return fuse.EAGAIN
-		default:
-			return fuse.EIO
-		}
-	}
-}
-
-func (fs *Proto9FS) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
-	return fs.setLk(cancel, in, true)
-}
-
-func (fs *Proto9FS) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
-	return fs.setLk(cancel, in, true)
-}
-
-*/

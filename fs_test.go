@@ -715,7 +715,7 @@ func TestSetLock(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if ok {
+	if !ok {
 		t.Fatal()
 	}
 
