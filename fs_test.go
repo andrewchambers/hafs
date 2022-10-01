@@ -207,14 +207,6 @@ func TestRenameSameDir(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
 	}
 
-	rootStat, err := fs.GetStat(ROOT_INO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rootStat.Nchild != 2 {
-		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
-	}
-
 }
 
 func TestRenameSameDirOverwrite(t *testing.T) {
@@ -255,14 +247,6 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 
 	if bar1Stat.Ino != foo1Stat.Ino {
 		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
-	}
-
-	rootStat, err := fs.GetStat(ROOT_INO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rootStat.Nchild != 1 {
-		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
 	}
 
 	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
@@ -316,22 +300,6 @@ func TestRenameDifferentDir(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", barStat)
 	}
 
-	rootStat, err := fs.GetStat(ROOT_INO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rootStat.Nchild != 1 {
-		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
-	}
-
-	dStat, err = fs.GetStat(ROOT_INO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dStat.Nchild != 1 {
-		t.Fatalf("unexpected number of children: %d", dStat.Nchild)
-	}
-
 }
 
 func TestRenameDifferentDirOverwrite(t *testing.T) {
@@ -346,7 +314,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	origBarStat, err := fs.Mknod(dStat.Ino, "bar", MknodOpts{
+	_, err = fs.Mknod(dStat.Ino, "bar", MknodOpts{
 		Mode: S_IFREG | 0o777,
 		Uid:  0,
 		Gid:  0,
@@ -381,31 +349,6 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 
 	if barStat.Ino != fooStat.Ino {
 		t.Fatalf("bar1 stat is bad: %#v", barStat)
-	}
-
-	rootStat, err := fs.GetStat(ROOT_INO)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if rootStat.Nchild != 1 {
-		t.Fatalf("unexpected number of children: %d", rootStat.Nchild)
-	}
-
-	dStat, err = fs.GetStat(dStat.Ino)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if dStat.Nchild != 1 {
-		t.Fatalf("unexpected number of children: %d", dStat.Nchild)
-	}
-
-	barStat, err = fs.GetStat(origBarStat.Ino)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if barStat.Nlink != 0 {
-		t.Fatal("expected unlinked")
 	}
 
 	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))

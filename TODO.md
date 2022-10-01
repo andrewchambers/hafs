@@ -6,10 +6,6 @@ There are things we need to address before we are production ready (if this meet
 
 We currently use a single key for inodes number generation - this is a huge point of contention.
 
-## Nchild contention
-
-Directories currently keep a count of children - this count is a source of contention.
-
 ## Permission checks
 
 Permission checks are all done via fuse - however because HAFS is a distributed filesystem there
@@ -50,7 +46,7 @@ Should be easy.
 
 ## Way to disable mtime on directories
 
-This might help remove contention on huge directories.
+This might help remove contention on huge directories. Maybe we want relmtime?
 
 ## Full test coverage
 

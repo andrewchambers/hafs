@@ -62,7 +62,6 @@ type Stat struct {
 	Ctimensec uint32
 	Mode      uint32
 	Nlink     uint32
-	Nchild    uint64
 	Uid       uint32
 	Gid       uint32
 	Rdev      uint32
@@ -134,7 +133,6 @@ func Mkfs(db fdb.Database, opts MkfsOpts) error {
 			Ctimensec: 0,
 			Mode:      S_IFDIR | 0o755,
 			Nlink:     1,
-			Nchild:    0,
 			Uid:       0,
 			Gid:       0,
 			Rdev:      0,
@@ -365,6 +363,13 @@ func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
 	return dirEnt.(DirEnt), nil
 }
 
+func (fs *Fs) txDirHasChildren(tx fdb.ReadTransaction, dirIno uint64) bool {
+	kvs := tx.GetRange(tuple.Tuple{"fs", "ino", dirIno, "child"}, fdb.RangeOptions{
+		Limit: 1,
+	}).GetSliceOrPanic()
+	return len(kvs) != 0
+}
+
 type MknodOpts struct {
 	Truncate bool
 	Mode     uint32
@@ -407,11 +412,10 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 
 			stat.Size = 0
 			tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino, "data"})
+		} else if err != ErrNotExist {
+			return 0, err
 		} else {
 			newIno := fs.txNextIno(tx)
-			if err != ErrNotExist {
-				return 0, err
-			}
 			stat = Stat{
 				Ino:       newIno,
 				Size:      0,
@@ -423,12 +427,10 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 				Ctimensec: 0,
 				Mode:      opts.Mode,
 				Nlink:     1,
-				Nchild:    0,
 				Uid:       opts.Uid,
 				Gid:       opts.Gid,
 				Rdev:      opts.Rdev,
 			}
-			dirStat.Nchild += 1
 			fs.txSetStat(tx, dirStat)
 		}
 
@@ -471,12 +473,11 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		}
 
 		if dirEnt.Mode&S_IFMT == S_IFDIR {
-			if stat.Nchild != 0 {
+			if fs.txDirHasChildren(tx, stat.Ino) {
 				return nil, ErrNotEmpty
 			}
 		}
 
-		dirStat.Nchild -= 1
 		now := time.Now()
 		dirStat.SetMtime(now)
 		dirStat.SetCtime(now)
@@ -707,9 +708,11 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 			if err != nil {
 				return nil, err
 			}
-			// We can't move over a directory with children.
-			if toStat.Nchild != 0 {
-				return nil, ErrNotEmpty
+
+			if toStat.Mode&S_IFMT == S_IFDIR {
+				if fs.txDirHasChildren(tx, toStat.Ino) {
+					return nil, ErrNotEmpty
+				}
 			}
 
 			toStat.Nlink -= 1
@@ -723,20 +726,13 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 		}
 
 		if toDirIno != fromDirIno {
-			if errors.Is(toDirEntErr, ErrNotExist) {
-				toDirStat.Nchild += 1
-			}
 			toDirStat.SetMtime(now)
 			toDirStat.SetCtime(now)
 			fs.txSetStat(tx, toDirStat)
-			fromDirStat.Nchild -= 1
 			fromDirStat.SetMtime(now)
 			toDirStat.SetCtime(now)
 			fs.txSetStat(tx, fromDirStat)
 		} else {
-			if toDirEntErr == nil {
-				toDirStat.Nchild -= 1
-			}
 			toDirStat.SetMtime(now)
 			toDirStat.SetCtime(now)
 			fs.txSetStat(tx, toDirStat)
