@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	iofs "io/fs"
+	mathrand "math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -454,14 +455,20 @@ func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 }
 
 func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	nAttempts := uint64(0)
 	for {
 		status := fs.SetLk(cancel, in)
 		if status != fuse.EAGAIN {
 			return status
 		}
+		if nAttempts >= 2 {
+			// Random delay to partially mitigate thundering herd on contended lock.
+			time.Sleep(time.Duration(mathrand.Int()%5_000) * time.Millisecond)
+		}
 		err := fs.fs.AwaitExclusiveLockRelease(cancel, in.NodeId)
 		if err != nil {
 			return errToFuseStatus(err)
 		}
+		nAttempts += 1
 	}
 }
