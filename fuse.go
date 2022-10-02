@@ -4,7 +4,6 @@ import (
 	"errors"
 	"io"
 	iofs "io/fs"
-	"log"
 	mathrand "math/rand"
 	"sync"
 	"sync/atomic"
@@ -224,7 +223,6 @@ func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (u
 	f := fs.fh2OpenFile[in.Fh].f
 	fs.lock.Unlock()
 	n, err := f.WriteData(buf, uint64(in.Offset))
-	log.Printf("%#v %#v", f, err)
 	if err != nil {
 		return n, errToFuseStatus(err)
 	}
@@ -342,7 +340,7 @@ func (fs *FuseFs) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Ope
 	fs.lock.Lock()
 	fs.fh2OpenFile[out.Fh] = &openFile{
 		di: dirIter,
-		f:  &InvalidFile{},
+		f:  &invalidFile{},
 	}
 	fs.lock.Unlock()
 

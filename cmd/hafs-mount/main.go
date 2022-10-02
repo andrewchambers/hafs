@@ -36,8 +36,8 @@ func main() {
 				// "hard_remove",
 				// "big_writes",
 			},
-			AllowOther:           false, // XXX option?
-			EnableLocks:          true,
+			AllowOther: false, // XXX option?
+			// EnableLocks:          true, XXX
 			IgnoreSecurityLabels: true, // option?
 			Debug:                true,
 			// MaxWrite: XXX option?,

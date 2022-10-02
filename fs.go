@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -19,12 +20,14 @@ import (
 )
 
 var (
-	ErrNotExist  = unix.ENOENT
-	ErrExist     = unix.EEXIST
-	ErrNotEmpty  = unix.ENOTEMPTY
-	ErrNotDir    = unix.ENOTDIR
-	ErrInvalid   = unix.EINVAL
-	ErrUnmounted = errors.New("filesystem unmounted")
+	ErrNotExist     = unix.ENOENT
+	ErrExist        = unix.EEXIST
+	ErrNotEmpty     = unix.ENOTEMPTY
+	ErrNotDir       = unix.ENOTDIR
+	ErrInvalid      = unix.EINVAL
+	ErrNotSupported = unix.ENOTSUP
+	ErrPermission   = unix.EPERM
+	ErrUnmounted    = errors.New("filesystem unmounted")
 )
 
 const (
@@ -65,6 +68,7 @@ type Stat struct {
 	Uid       uint32
 	Gid       uint32
 	Rdev      uint32
+	Storage   string `json:",omitempty"`
 }
 
 func (stat *Stat) setTime(t time.Time, secs *uint64, nsecs *uint32) {
@@ -443,8 +447,12 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 			Uid:       opts.Uid,
 			Gid:       opts.Gid,
 			Rdev:      opts.Rdev,
+			Storage:   "",
 		}
-		fs.txSetStat(tx, dirStat)
+		if opts.Mode&S_IFMT == S_IFREG {
+			// Only files inherit storage from the parent directory.
+			stat.Storage = dirStat.Storage
+		}
 	}
 
 	now := time.Now()
@@ -531,7 +539,7 @@ type HafsFile interface {
 	Close() error
 }
 
-type FoundationDBFile struct {
+type foundationDBFile struct {
 	fs  *Fs
 	ino uint64
 }
@@ -552,7 +560,7 @@ func zeroExpandChunk(chunk *[]byte) {
 	*chunk = append(*chunk, _zeroChunk[len(*chunk):CHUNK_SIZE]...)
 }
 
-func (f *FoundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) {
 	const MAX_WRITE = 128 * CHUNK_SIZE
 
 	// FoundationDB has a transaction time limit and a transaction size limit,
@@ -627,7 +635,7 @@ func (f *FoundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 
 	return nWritten.(uint32), nil
 }
-func (f *FoundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 
 	const MAX_READ = 128 * CHUNK_SIZE
 
@@ -730,32 +738,116 @@ func (f *FoundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 		return 0, err
 	}
 }
-func (f *FoundationDBFile) Fsync() error { return nil }
-func (f *FoundationDBFile) Flush() error { return nil }
-func (f *FoundationDBFile) Close() error { return nil }
+func (f *foundationDBFile) Fsync() error { return nil }
+func (f *foundationDBFile) Flush() error { return nil }
+func (f *foundationDBFile) Close() error { return nil }
 
-type EmptyFile struct{}
+type invalidFile struct{}
 
-func (f *EmptyFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrInvalid }
-func (f *EmptyFile) ReadData() (uint32, error)                           { return 0, io.EOF }
-func (f *EmptyFile) Fsync() error                                        { return nil }
-func (f *EmptyFile) Flush() error                                        { return nil }
-func (f *EmptyFile) Close() error                                        { return nil }
+func (f *invalidFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrInvalid }
+func (f *invalidFile) ReadData(buf []byte, offset uint64) (uint32, error)  { return 0, ErrInvalid }
+func (f *invalidFile) Fsync() error                                        { return ErrInvalid }
+func (f *invalidFile) Flush() error                                        { return nil }
+func (f *invalidFile) Close() error                                        { return nil }
 
-type InvalidFile struct{}
+type externalStoreReadOnlyFile struct {
+	storageObject StorageObject
+}
 
-func (f *InvalidFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrInvalid }
-func (f *InvalidFile) ReadData(buf []byte, offset uint64) (uint32, error)  { return 0, ErrInvalid }
-func (f *InvalidFile) Fsync() error                                        { return nil }
-func (f *InvalidFile) Flush() error                                        { return ErrInvalid }
-func (f *InvalidFile) Close() error                                        { return nil }
+func (f *externalStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+	return 0, ErrNotSupported
+}
+
+func (f *externalStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+	n, err := f.storageObject.ReadAt(buf, int64(offset))
+	log.Printf("ZZZ %#v", err)
+	return uint32(n), err
+}
+
+func (f *externalStoreReadOnlyFile) Fsync() error {
+	return nil
+}
+
+func (f *externalStoreReadOnlyFile) Flush() error {
+	return nil
+}
+
+func (f *externalStoreReadOnlyFile) Close() error {
+	return f.storageObject.Close()
+}
+
+type externalStoreReadWriteFile struct {
+	fs        *Fs
+	ino       uint64
+	dirty     atomicBool
+	storage   string
+	flushLock sync.Mutex
+	tmpFile   *os.File
+}
+
+func (f *externalStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+	f.dirty.Store(true)
+	n, err := f.tmpFile.WriteAt(buf, int64(offset))
+	return uint32(n), err
+}
+
+func (f *externalStoreReadWriteFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+	n, err := f.tmpFile.ReadAt(buf, int64(offset))
+	return uint32(n), err
+}
+
+func (f *externalStoreReadWriteFile) Fsync() error {
+	dirty := f.dirty.Load()
+	if !dirty {
+		return nil
+	}
+
+	f.flushLock.Lock()
+	defer f.flushLock.Unlock()
+
+	_, err := f.tmpFile.Seek(0, 0)
+	if err != nil {
+		fmt.Printf("XXX1: %#v\n", err)
+		return err
+	}
+
+	size, err := StorageWrite(f.storage, f.ino, f.tmpFile)
+	if err != nil {
+		fmt.Printf("XXX2: %#v\n", err)
+		return err
+	}
+
+	_, err = f.fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		stat, err := f.fs.txGetStat(tx, f.ino).Get()
+		if err != nil {
+			return nil, err
+		}
+		stat.Size = uint64(size)
+		f.fs.txSetStat(tx, stat)
+		return nil, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	f.dirty.Store(false)
+	return nil
+}
+
+func (f *externalStoreReadWriteFile) Flush() error {
+	return f.Fsync()
+}
+
+func (f *externalStoreReadWriteFile) Close() error {
+	_ = f.tmpFile.Close()
+	return nil
+}
 
 type OpenFileOpts struct {
 	Truncate bool
 }
 
 func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
-	var f HafsFile
 	var stat Stat
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 
@@ -779,12 +871,43 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			}
 		}
 
-		f = &FoundationDBFile{
+		return nil, nil
+	})
+
+	var f HafsFile
+	if stat.Storage == "" {
+		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
 		}
-		return nil, nil
-	})
+	} else {
+		if opts.Truncate || stat.Size == 0 {
+			tmpFile, err := os.CreateTemp("", "")
+			if err != nil {
+				return nil, Stat{}, err
+			}
+			// XXX Make file anonymous, it would be nice to create it like this.
+			err = os.Remove(tmpFile.Name())
+			if err != nil {
+				return nil, Stat{}, err
+			}
+			f = &externalStoreReadWriteFile{
+				fs:      fs,
+				ino:     stat.Ino,
+				storage: stat.Storage,
+				tmpFile: tmpFile,
+			}
+		} else {
+			storageObject, err := StorageOpen(stat.Storage, stat.Ino)
+			if err != nil {
+				return nil, Stat{}, err
+			}
+			f = &externalStoreReadOnlyFile{
+				storageObject: storageObject,
+			}
+		}
+	}
+
 	return f, stat, err
 }
 
@@ -796,7 +919,6 @@ type CreateFileOpts struct {
 }
 
 func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsFile, Stat, error) {
-	var f HafsFile
 	var stat Stat
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		newStat, err := fs.Mknod(dirIno, name, MknodOpts{
@@ -809,12 +931,32 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 			return nil, err
 		}
 		stat = newStat
-		f = &FoundationDBFile{
+		return nil, nil
+	})
+
+	var f HafsFile
+	if stat.Storage == "" {
+		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
 		}
-		return nil, nil
-	})
+	} else {
+		tmpFile, err := os.CreateTemp("", "")
+		if err != nil {
+			return nil, Stat{}, err
+		}
+		// XXX Make file anonymous, it would be nice to create it like this.
+		err = os.Remove(tmpFile.Name())
+		if err != nil {
+			return nil, Stat{}, err
+		}
+		f = &externalStoreReadWriteFile{
+			fs:      fs,
+			ino:     stat.Ino,
+			storage: stat.Storage,
+			tmpFile: tmpFile,
+		}
+	}
 	return f, stat, err
 }
 
@@ -954,9 +1096,17 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 	if opts.Valid&MODSTAT_SIZE != 0 {
 		stat.Size = opts.Size
 
+		if stat.Mode&S_IFMT != S_IFREG {
+			return Stat{}, ErrInvalid
+		}
+
 		if stat.Size == 0 {
 			tx.ClearRange(tuple.Tuple{"fs", "ino", ino, "data"})
 		} else {
+			if stat.Storage != "" {
+				return Stat{}, ErrNotSupported
+			}
+
 			clearBegin := (stat.Size + (CHUNK_SIZE - stat.Size%4096)) / CHUNK_SIZE
 			_, clearEnd := tuple.Tuple{"fs", "ino", ino, "data"}.FDBRangeKeys()
 			tx.ClearRange(fdb.KeyRange{
@@ -1224,9 +1374,19 @@ func (fs *Fs) GetXAttr(ino uint64, name string) ([]byte, error) {
 
 func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		_, err := fs.txGetStat(tx, ino).Get()
+		stat, err := fs.txGetStat(tx, ino).Get()
 		if err != nil {
 			return nil, err
+		}
+		switch name {
+		case "hafs.storage":
+			// You can only set this attribute on directories.
+			if stat.Mode&S_IFMT != S_IFDIR {
+				return nil, ErrInvalid
+			}
+			stat.Storage = string(data)
+			fs.txSetStat(tx, stat)
+		default:
 		}
 		tx.Set(tuple.Tuple{"fs", "ino", ino, "xattr", name}, data)
 		return nil, nil
@@ -1236,9 +1396,19 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 
 func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		_, err := fs.txGetStat(tx, ino).Get()
+		stat, err := fs.txGetStat(tx, ino).Get()
 		if err != nil {
 			return nil, err
+		}
+		switch name {
+		case "hafs.storage":
+			// You cannot clear this attribute from files.
+			if stat.Mode&S_IFMT == S_IFREG {
+				return nil, ErrInvalid
+			}
+			stat.Storage = ""
+			fs.txSetStat(tx, stat)
+		default:
 		}
 		tx.Clear(tuple.Tuple{"fs", "ino", ino, "xattr", name})
 		return nil, nil
