@@ -424,10 +424,8 @@ func TestWriteDataOneChunk(t *testing.T) {
 
 	for i, n := range testSizes {
 		name := fmt.Sprintf("d%d", i)
-		stat, err := fs.Mknod(ROOT_INO, name, MknodOpts{
-			Mode: S_IFREG | 0o777,
-			Uid:  0,
-			Gid:  0,
+		f, stat, err := fs.CreateFile(ROOT_INO, name, CreateFileOpts{
+			Mode: 0o777,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -439,7 +437,7 @@ func TestWriteDataOneChunk(t *testing.T) {
 			data[j] = byte(j % 256)
 		}
 
-		nWritten, err := fs.WriteData(stat.Ino, data, 0)
+		nWritten, err := f.WriteData(data, 0)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -474,10 +472,8 @@ func TestWriteDataTwoChunks(t *testing.T) {
 
 	for i, n := range testSizes {
 		name := fmt.Sprintf("d%d", i)
-		stat, err := fs.Mknod(ROOT_INO, name, MknodOpts{
-			Mode: S_IFREG | 0o777,
-			Uid:  0,
-			Gid:  0,
+		f, stat, err := fs.CreateFile(ROOT_INO, name, CreateFileOpts{
+			Mode: 0o777,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -494,7 +490,7 @@ func TestWriteDataTwoChunks(t *testing.T) {
 
 		nWritten := 0
 		for nWritten != len(data) {
-			n, err := fs.WriteData(stat.Ino, data[nWritten:], uint64(nWritten))
+			n, err := f.WriteData(data[nWritten:], uint64(nWritten))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -552,8 +548,8 @@ func TestTruncate(t *testing.T) {
 
 	for i, n := range testSizes {
 		name := fmt.Sprintf("d%d", i)
-		stat, err := fs.Mknod(ROOT_INO, name, MknodOpts{
-			Mode: S_IFREG | 0o777,
+		f, stat, err := fs.CreateFile(ROOT_INO, name, CreateFileOpts{
+			Mode: 0o777,
 			Uid:  0,
 			Gid:  0,
 		})
@@ -569,7 +565,7 @@ func TestTruncate(t *testing.T) {
 
 		nWritten := 0
 		for nWritten != len(data) {
-			n, err := fs.WriteData(stat.Ino, data[nWritten:], uint64(nWritten))
+			n, err := f.WriteData(data[nWritten:], uint64(nWritten))
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -611,10 +607,8 @@ func TestReadWriteData(t *testing.T) {
 
 	// Random writes at different offsets to exercise the sparse code paths.
 	for i := 0; i < 100; i++ {
-		stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
-			Mode: S_IFREG | 0o777,
-			Uid:  0,
-			Gid:  0,
+		f, stat, err := fs.CreateFile(ROOT_INO, "f", CreateFileOpts{
+			Mode: 0o777,
 		})
 		if err != nil {
 			t.Fatal(err)
@@ -640,7 +634,7 @@ func TestReadWriteData(t *testing.T) {
 			}
 			nWritten := 0
 			for nWritten != len(writeData) {
-				n, err := fs.WriteData(stat.Ino, writeData[nWritten:], uint64(writeOffset)+uint64(nWritten))
+				n, err := f.WriteData(writeData[nWritten:], uint64(writeOffset)+uint64(nWritten))
 				if err != nil {
 					t.Fatal(err)
 				}
@@ -667,7 +661,7 @@ func TestReadWriteData(t *testing.T) {
 		readSize := (mathrand.Int() % 2 * CHUNK_SIZE) + 100
 		readBuf := make([]byte, readSize, readSize)
 		for {
-			n, err := fs.ReadData(stat.Ino, readBuf, nRead)
+			n, err := f.ReadData(readBuf, nRead)
 			nRead += uint64(n)
 			_, _ = actualData.Write(readBuf[:n])
 			if err == io.EOF {
