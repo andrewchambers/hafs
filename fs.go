@@ -97,10 +97,11 @@ func (stat *Stat) Ctime() time.Time {
 }
 
 type Fs struct {
-	db            fdb.Database
-	mountId       string
-	workerWg      *sync.WaitGroup
-	cancelWorkers func()
+	db                  fdb.Database
+	mountId             string
+	dirRelMtimeDuration time.Duration // TODO XXX make an option.
+	workerWg            *sync.WaitGroup
+	cancelWorkers       func()
 }
 
 func init() {
@@ -188,10 +189,11 @@ func Attach(db fdb.Database) (*Fs, error) {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 
 	fs := &Fs{
-		db:            db,
-		mountId:       mountId,
-		cancelWorkers: cancelWorkers,
-		workerWg:      &sync.WaitGroup{},
+		db:                  db,
+		dirRelMtimeDuration: 24 * time.Hour,
+		mountId:             mountId,
+		cancelWorkers:       cancelWorkers,
+		workerWg:            &sync.WaitGroup{},
 	}
 
 	err = fs.mountHeartBeat()
@@ -462,6 +464,12 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 			Mode: stat.Mode & S_IFMT,
 			Ino:  stat.Ino,
 		})
+
+		if dirStat.Mtime().Before(now.Sub(fs.dirRelMtimeDuration)) {
+			dirStat.SetMtime(now)
+			dirStat.SetAtime(now)
+			fs.txSetStat(tx, dirStat)
+		}
 
 		if stat.Mode&S_IFMT == S_IFLNK {
 			tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "target"}, opts.LinkTarget)
