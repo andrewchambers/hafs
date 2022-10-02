@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"log"
+	// "log"
 	"os"
 	"sync"
 	"time"
@@ -751,7 +751,7 @@ func (f *invalidFile) Flush() error                                        { ret
 func (f *invalidFile) Close() error                                        { return nil }
 
 type externalStoreReadOnlyFile struct {
-	storageObject StorageObject
+	storageObject readerAtCloser
 }
 
 func (f *externalStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
@@ -760,7 +760,6 @@ func (f *externalStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32
 
 func (f *externalStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 	n, err := f.storageObject.ReadAt(buf, int64(offset))
-	log.Printf("ZZZ %#v", err)
 	return uint32(n), err
 }
 
@@ -811,7 +810,7 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 		return err
 	}
 
-	size, err := StorageWrite(f.storage, f.ino, f.tmpFile)
+	size, err := storageWrite(f.storage, f.ino, f.tmpFile)
 	if err != nil {
 		fmt.Printf("XXX2: %#v\n", err)
 		return err
@@ -898,7 +897,7 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 				tmpFile: tmpFile,
 			}
 		} else {
-			storageObject, err := StorageOpen(stat.Storage, stat.Ino)
+			storageObject, err := storageOpen(stat.Storage, stat.Ino)
 			if err != nil {
 				return nil, Stat{}, err
 			}
