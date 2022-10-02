@@ -577,7 +577,7 @@ func TestTruncate(t *testing.T) {
 		}
 
 		_, err = fs.ModStat(stat.Ino, ModStatOpts{
-			Valid: SETSTAT_SIZE,
+			Valid: MODSTAT_SIZE,
 			Size:  5,
 		})
 		if err != nil {

@@ -398,84 +398,88 @@ type MknodOpts struct {
 	LinkTarget []byte
 }
 
-func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
+func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts MknodOpts) (Stat, error) {
+	dirStatFut := fs.txGetStat(tx, dirIno)
+	getDirEntFut := fs.txGetDirEnt(tx, dirIno, name)
 
-	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		dirStatFut := fs.txGetStat(tx, dirIno)
-		getDirEntFut := fs.txGetDirEnt(tx, dirIno, name)
+	dirStat, err := dirStatFut.Get()
+	if err != nil {
+		return Stat{}, err
+	}
 
-		dirStat, err := dirStatFut.Get()
+	if dirStat.Mode&S_IFMT != S_IFDIR {
+		return Stat{}, ErrNotDir
+	}
+
+	var stat Stat
+
+	existingDirEnt, err := getDirEntFut.Get()
+	if err == nil {
+		if !opts.Truncate {
+			return Stat{}, ErrExist
+		}
+
+		stat, err = fs.txGetStat(tx, existingDirEnt.Ino).Get()
 		if err != nil {
-			return nil, err
+			return Stat{}, err
 		}
 
-		if dirStat.Mode&S_IFMT != S_IFDIR {
-			return nil, ErrNotDir
+		if stat.Mode&S_IFMT != S_IFREG {
+			return Stat{}, errors.New("unable to truncate invalid file type")
 		}
 
-		var stat Stat
-
-		existingDirEnt, err := getDirEntFut.Get()
-		if err == nil {
-			if !opts.Truncate {
-				return nil, ErrExist
-			}
-
-			stat, err = fs.txGetStat(tx, existingDirEnt.Ino).Get()
-			if err != nil {
-				return nil, err
-			}
-
-			if stat.Mode&S_IFMT != S_IFREG {
-				return nil, errors.New("unable to truncate invalid file type")
-			}
-
-			stat.Size = 0
-			tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino, "data"})
-		} else if err != ErrNotExist {
-			return 0, err
-		} else {
-			newIno := fs.txNextIno(tx)
-			stat = Stat{
-				Ino:       newIno,
-				Size:      0,
-				Atimesec:  0,
-				Mtimesec:  0,
-				Ctimesec:  0,
-				Atimensec: 0,
-				Mtimensec: 0,
-				Ctimensec: 0,
-				Mode:      opts.Mode,
-				Nlink:     1,
-				Uid:       opts.Uid,
-				Gid:       opts.Gid,
-				Rdev:      opts.Rdev,
-			}
-			fs.txSetStat(tx, dirStat)
+		stat.Size = 0
+		tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino, "data"})
+	} else if err != ErrNotExist {
+		return Stat{}, err
+	} else {
+		newIno := fs.txNextIno(tx)
+		stat = Stat{
+			Ino:       newIno,
+			Size:      0,
+			Atimesec:  0,
+			Mtimesec:  0,
+			Ctimesec:  0,
+			Atimensec: 0,
+			Mtimensec: 0,
+			Ctimensec: 0,
+			Mode:      opts.Mode,
+			Nlink:     1,
+			Uid:       opts.Uid,
+			Gid:       opts.Gid,
+			Rdev:      opts.Rdev,
 		}
+		fs.txSetStat(tx, dirStat)
+	}
 
-		now := time.Now()
-		stat.SetMtime(now)
-		stat.SetCtime(now)
-		stat.SetAtime(now)
-		fs.txSetStat(tx, stat)
-		fs.txSetDirEnt(tx, dirIno, DirEnt{
-			Name: name,
-			Mode: stat.Mode & S_IFMT,
-			Ino:  stat.Ino,
-		})
+	now := time.Now()
+	stat.SetMtime(now)
+	stat.SetCtime(now)
+	stat.SetAtime(now)
+	fs.txSetStat(tx, stat)
+	fs.txSetDirEnt(tx, dirIno, DirEnt{
+		Name: name,
+		Mode: stat.Mode & S_IFMT,
+		Ino:  stat.Ino,
+	})
 
-		if dirStat.Mtime().Before(now.Sub(fs.dirRelMtimeDuration)) {
-			dirStat.SetMtime(now)
-			dirStat.SetAtime(now)
-			fs.txSetStat(tx, dirStat)
-		}
+	if dirStat.Mtime().Before(now.Add(-fs.dirRelMtimeDuration)) {
+		dirStat.SetMtime(now)
+		dirStat.SetAtime(now)
+		fs.txSetStat(tx, dirStat)
+	}
 
-		if stat.Mode&S_IFMT == S_IFLNK {
-			tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "target"}, opts.LinkTarget)
-		}
+	if stat.Mode&S_IFMT == S_IFLNK {
+		tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "target"}, opts.LinkTarget)
+	}
 
-		return stat, nil
+	return stat, nil
+}
+
+func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
+	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		stat, err := fs.txMknod(tx, dirIno, name, opts)
+		return stat, err
 	})
 	if err != nil {
 		return Stat{}, err
@@ -524,6 +528,113 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 	return err
 }
 
+type HafsFile interface {
+	WriteData([]byte, uint64) (uint32, error)
+	ReadData([]byte, uint64) (uint32, error)
+	Fsync() error
+	Flush() error
+	Close() error
+}
+
+type FoundationDBFile struct {
+	fs  *Fs
+	ino uint64
+}
+
+func (f *FoundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+	return f.fs.WriteData(f.ino, buf, offset)
+}
+func (f *FoundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+	return f.fs.ReadData(f.ino, buf, offset)
+}
+func (f *FoundationDBFile) Fsync() error { return nil }
+func (f *FoundationDBFile) Flush() error { return nil }
+func (f *FoundationDBFile) Close() error { return nil }
+
+type EmptyFile struct{}
+
+func (f *EmptyFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrInvalid }
+func (f *EmptyFile) ReadData() (uint32, error)                           { return 0, io.EOF }
+func (f *EmptyFile) Fsync() error                                        { return nil }
+func (f *EmptyFile) Flush() error                                        { return nil }
+func (f *EmptyFile) Close() error                                        { return nil }
+
+type InvalidFile struct{}
+
+func (f *InvalidFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrInvalid }
+func (f *InvalidFile) ReadData(buf []byte, offset uint64) (uint32, error)  { return 0, ErrInvalid }
+func (f *InvalidFile) Fsync() error                                        { return nil }
+func (f *InvalidFile) Flush() error                                        { return ErrInvalid }
+func (f *InvalidFile) Close() error                                        { return nil }
+
+type OpenFileOpts struct {
+	Truncate bool
+}
+
+func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
+	var f HafsFile
+	var stat Stat
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+		existingStat, err := fs.txGetStat(tx, ino).Get()
+		if err != nil {
+			return nil, err
+		}
+		stat = existingStat
+
+		if stat.Mode&S_IFMT != S_IFREG {
+			return nil, ErrInvalid
+		}
+
+		if opts.Truncate {
+			stat, err = fs.txModStat(tx, stat.Ino, ModStatOpts{
+				Valid: MODSTAT_SIZE,
+				Size:  0,
+			})
+			if err != nil {
+				return nil, err
+			}
+		}
+
+		f = &FoundationDBFile{
+			fs:  fs,
+			ino: stat.Ino,
+		}
+		return nil, nil
+	})
+	return f, stat, err
+}
+
+type CreateFileOpts struct {
+	Truncate bool
+	Mode     uint32
+	Uid      uint32
+	Gid      uint32
+}
+
+func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsFile, Stat, error) {
+	var f HafsFile
+	var stat Stat
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		newStat, err := fs.Mknod(dirIno, name, MknodOpts{
+			Truncate: opts.Truncate,
+			Mode:     (^S_IFMT & opts.Mode) | S_IFREG,
+			Uid:      opts.Uid,
+			Gid:      opts.Gid,
+		})
+		if err != nil {
+			return nil, err
+		}
+		stat = newStat
+		f = &FoundationDBFile{
+			fs:  fs,
+			ino: stat.Ino,
+		}
+		return nil, nil
+	})
+	return f, stat, err
+}
+
 func (fs *Fs) ReadSymlink(ino uint64) ([]byte, error) {
 	l, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		statFut := fs.txGetStat(tx, ino)
@@ -555,13 +666,13 @@ func (fs *Fs) GetStat(ino uint64) (Stat, error) {
 }
 
 const (
-	SETSTAT_MODE = 1 << iota
-	SETSTAT_UID
-	SETSTAT_GID
-	SETSTAT_SIZE
-	SETSTAT_ATIME
-	SETSTAT_MTIME
-	SETSTAT_CTIME
+	MODSTAT_MODE = 1 << iota
+	MODSTAT_UID
+	MODSTAT_GID
+	MODSTAT_SIZE
+	MODSTAT_ATIME
+	MODSTAT_MTIME
+	MODSTAT_CTIME
 )
 
 type ModStatOpts struct {
@@ -584,104 +695,108 @@ func (opts *ModStatOpts) setTime(t time.Time, secs *uint64, nsecs *uint32) {
 }
 
 func (opts *ModStatOpts) SetMtime(t time.Time) {
-	opts.Valid |= SETSTAT_MTIME
+	opts.Valid |= MODSTAT_MTIME
 	opts.setTime(t, &opts.Mtimesec, &opts.Mtimensec)
 }
 
 func (opts *ModStatOpts) SetAtime(t time.Time) {
-	opts.Valid |= SETSTAT_ATIME
+	opts.Valid |= MODSTAT_ATIME
 	opts.setTime(t, &opts.Atimesec, &opts.Atimensec)
 }
 
 func (opts *ModStatOpts) SetCtime(t time.Time) {
-	opts.Valid |= SETSTAT_CTIME
+	opts.Valid |= MODSTAT_CTIME
 	opts.setTime(t, &opts.Ctimesec, &opts.Ctimensec)
 }
 
 func (opts *ModStatOpts) SetSize(size uint64) {
-	opts.Valid |= SETSTAT_SIZE
+	opts.Valid |= MODSTAT_SIZE
 	opts.Size = size
 }
 
 func (opts *ModStatOpts) SetMode(mode uint32) {
-	opts.Valid |= SETSTAT_MODE
+	opts.Valid |= MODSTAT_MODE
 	opts.Mode = mode
 }
 
 func (opts *ModStatOpts) SetUid(uid uint32) {
-	opts.Valid |= SETSTAT_UID
+	opts.Valid |= MODSTAT_UID
 	opts.Uid = uid
 }
 
 func (opts *ModStatOpts) SetGid(gid uint32) {
-	opts.Valid |= SETSTAT_GID
+	opts.Valid |= MODSTAT_GID
 	opts.Gid = gid
+}
+
+func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat, error) {
+	stat, err := fs.txGetStat(tx, ino).Get()
+	if err != nil {
+		return Stat{}, err
+	}
+
+	if opts.Valid&MODSTAT_MODE != 0 {
+		stat.Mode = (stat.Mode & S_IFMT) | (opts.Mode & ^S_IFMT)
+	}
+
+	if opts.Valid&MODSTAT_UID != 0 {
+		stat.Uid = opts.Uid
+	}
+
+	if opts.Valid&MODSTAT_GID != 0 {
+		stat.Gid = opts.Gid
+	}
+
+	if opts.Valid&MODSTAT_ATIME != 0 {
+		stat.Atimesec = opts.Atimesec
+		stat.Atimensec = opts.Atimensec
+	}
+
+	now := time.Now()
+
+	if opts.Valid&MODSTAT_MTIME != 0 {
+		stat.Mtimesec = opts.Mtimesec
+		stat.Mtimensec = opts.Mtimensec
+	} else if opts.Valid&MODSTAT_SIZE != 0 {
+		stat.SetMtime(now)
+	}
+
+	if opts.Valid&MODSTAT_CTIME != 0 {
+		stat.Ctimesec = opts.Ctimesec
+		stat.Ctimensec = opts.Ctimensec
+	} else {
+		stat.SetCtime(now)
+	}
+
+	if opts.Valid&MODSTAT_SIZE != 0 {
+		stat.Size = opts.Size
+
+		if stat.Size == 0 {
+			tx.ClearRange(tuple.Tuple{"fs", "ino", ino, "data"})
+		} else {
+			clearBegin := (stat.Size + (CHUNK_SIZE - stat.Size%4096)) / CHUNK_SIZE
+			_, clearEnd := tuple.Tuple{"fs", "ino", ino, "data"}.FDBRangeKeys()
+			tx.ClearRange(fdb.KeyRange{
+				Begin: tuple.Tuple{"fs", "ino", ino, "data", clearBegin},
+				End:   clearEnd,
+			})
+			lastChunkIdx := stat.Size / CHUNK_SIZE
+			lastChunkSize := stat.Size % CHUNK_SIZE
+			lastChunkKey := tuple.Tuple{"fs", "ino", ino, "data", lastChunkIdx}
+			if lastChunkSize == 0 {
+				tx.Clear(lastChunkKey)
+			}
+		}
+	}
+
+	fs.txSetStat(tx, stat)
+	return stat, nil
 }
 
 func (fs *Fs) ModStat(ino uint64, opts ModStatOpts) (Stat, error) {
 	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-
-		stat, err := fs.txGetStat(tx, ino).Get()
-		if err != nil {
-			return nil, err
-		}
-
-		if opts.Valid&SETSTAT_MODE != 0 {
-			stat.Mode = (stat.Mode & S_IFMT) | (opts.Mode & ^S_IFMT)
-		}
-
-		if opts.Valid&SETSTAT_UID != 0 {
-			stat.Uid = opts.Uid
-		}
-
-		if opts.Valid&SETSTAT_GID != 0 {
-			stat.Gid = opts.Gid
-		}
-
-		if opts.Valid&SETSTAT_ATIME != 0 {
-			stat.Atimesec = opts.Atimesec
-			stat.Atimensec = opts.Atimensec
-		}
-
-		now := time.Now()
-
-		if opts.Valid&SETSTAT_MTIME != 0 {
-			stat.Mtimesec = opts.Mtimesec
-			stat.Mtimensec = opts.Mtimensec
-		} else if opts.Valid&SETSTAT_SIZE != 0 {
-			stat.SetMtime(now)
-		}
-
-		if opts.Valid&SETSTAT_CTIME != 0 {
-			stat.Ctimesec = opts.Ctimesec
-			stat.Ctimensec = opts.Ctimensec
-		} else {
-			stat.SetCtime(now)
-		}
-
-		if opts.Valid&SETSTAT_SIZE != 0 {
-			stat.Size = opts.Size
-
-			if stat.Size == 0 {
-				tx.ClearRange(tuple.Tuple{"fs", "ino", ino, "data"})
-			} else {
-				clearBegin := (stat.Size + (CHUNK_SIZE - stat.Size%4096)) / CHUNK_SIZE
-				_, clearEnd := tuple.Tuple{"fs", "ino", ino, "data"}.FDBRangeKeys()
-				tx.ClearRange(fdb.KeyRange{
-					Begin: tuple.Tuple{"fs", "ino", ino, "data", clearBegin},
-					End:   clearEnd,
-				})
-				lastChunkIdx := stat.Size / CHUNK_SIZE
-				lastChunkSize := stat.Size % CHUNK_SIZE
-				lastChunkKey := tuple.Tuple{"fs", "ino", ino, "data", lastChunkIdx}
-				if lastChunkSize == 0 {
-					tx.Clear(lastChunkKey)
-				}
-			}
-		}
-
-		fs.txSetStat(tx, stat)
-		return stat, nil
+		stat, err := fs.txModStat(tx, ino, opts)
+		return stat, err
 	})
 	if err != nil {
 		return Stat{}, err
@@ -1006,12 +1121,9 @@ func (di *DirIter) fill() error {
 	const BATCH_SIZE = 128
 
 	v, err := di.fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-
 		// XXX should we confirm the directory still exists?
 		kvs := tx.GetRange(di.iterRange, fdb.RangeOptions{
-			Limit:   BATCH_SIZE,
-			Mode:    fdb.StreamingModeIterator, // XXX do we want StreamingModeWantAll ?
-			Reverse: false,
+			Limit: BATCH_SIZE,
 		}).GetSliceOrPanic()
 		return kvs, nil
 	})
