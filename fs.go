@@ -9,7 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	// "log"
+	"log"
 	"os"
 	"sync"
 	"time"
@@ -35,6 +35,8 @@ const (
 	CURRENT_SCHEMA_VERSION  = 1
 	ROOT_INO                = 1
 	CHUNK_SIZE              = 4096
+	INO_BATCH_SIZE          = 65536
+	INO_CHAN_SIZE           = 16384
 )
 
 const (
@@ -103,6 +105,7 @@ func (stat *Stat) Ctime() time.Time {
 type Fs struct {
 	db                  fdb.Database
 	mountId             string
+	inoChan             chan uint64
 	dirRelMtimeDuration time.Duration // TODO XXX make an option.
 	workerWg            *sync.WaitGroup
 	cancelWorkers       func()
@@ -154,8 +157,8 @@ func Mkfs(db fdb.Database, opts MkfsOpts) error {
 
 		tx.ClearRange(tuple.Tuple{"fs"})
 		tx.Set(tuple.Tuple{"fs", "version"}, []byte{CURRENT_SCHEMA_VERSION})
-		tx.Set(tuple.Tuple{"fs", "nextino"}, []byte{'2'})
 		tx.Set(tuple.Tuple{"fs", "ino", ROOT_INO, "stat"}, rootStatBytes)
+		tx.Set(tuple.Tuple{"fs", "nextino"}, []byte("2"))
 		return nil, nil
 	})
 	return err
@@ -198,6 +201,7 @@ func Attach(db fdb.Database) (*Fs, error) {
 		mountId:             mountId,
 		cancelWorkers:       cancelWorkers,
 		workerWg:            &sync.WaitGroup{},
+		inoChan:             make(chan uint64, INO_CHAN_SIZE),
 	}
 
 	err = fs.mountHeartBeat()
@@ -209,10 +213,81 @@ func Attach(db fdb.Database) (*Fs, error) {
 	fs.workerWg.Add(1)
 	go func() {
 		defer fs.workerWg.Done()
+		fs.requestInosForever(workerCtx)
+	}()
+
+	fs.workerWg.Add(1)
+	go func() {
+		defer fs.workerWg.Done()
 		fs.mountHeartBeatForever(workerCtx)
 	}()
 
 	return fs, nil
+}
+
+func reservedIno(ino uint64) bool {
+	// XXX Why is this 4 bytes?
+	const FUSE_UNKNOWN_INO = 0xFFFFFFFF
+	// XXX We currently reserve this inode too pending an answer to https://github.com/hanwen/go-fuse/issues/439.
+	const RESERVED_INO_1 = 0xFFFFFFFFFFFFFFFF
+	return ino == FUSE_UNKNOWN_INO || ino == RESERVED_INO_1
+}
+
+func (fs *Fs) nextIno() (uint64, error) {
+	// XXX This is a single bottleneck, could we shard or use atomics?
+	for {
+		ino, ok := <-fs.inoChan
+		if !ok {
+			return 0, ErrUnmounted
+		}
+		if !reservedIno(ino) {
+			return ino, nil
+		}
+	}
+}
+
+func (fs *Fs) requestInosForever(ctx context.Context) {
+	nextInoKey := tuple.Tuple{"fs", "nextino"}
+	for {
+		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			nextInoBytes := tx.Get(nextInoKey).MustGet()
+			var currentIno uint64
+			err := json.Unmarshal(nextInoBytes, &currentIno)
+			if err != nil {
+				return nil, err
+			}
+			nextIno := currentIno + INO_BATCH_SIZE
+			if nextIno <= currentIno {
+				panic("inodes exhausted")
+			}
+			nextInoBytes, err = json.Marshal(nextIno)
+			if err != nil {
+				return nil, err
+			}
+			tx.Set(nextInoKey, nextInoBytes)
+			return currentIno, nil
+		})
+		if err != nil {
+			log.Printf("unable to allocate inode batch: %s", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+
+		currentIno := v.(uint64)
+		for currentIno < currentIno+INO_BATCH_SIZE {
+			select {
+			case fs.inoChan <- currentIno:
+			default:
+				select {
+				case fs.inoChan <- currentIno:
+				case <-ctx.Done():
+					close(fs.inoChan)
+					return
+				}
+			}
+			currentIno += 1
+		}
+	}
 }
 
 func (fs *Fs) mountHeartBeat() error {
@@ -312,38 +387,6 @@ func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) {
 	tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "stat"}, statBytes)
 }
 
-func (fs *Fs) txNextIno(tx fdb.Transaction) uint64 {
-	// XXX If we avoid json for this we could maybe use fdb native increment.
-	// XXX Lots of contention, we could use an array of counters and choose one.
-	var ino uint64
-	nextInoBytes := tx.Get(tuple.Tuple{"fs", "nextino"}).MustGet()
-	err := json.Unmarshal(nextInoBytes, &ino)
-	if err != nil {
-		panic(err)
-	}
-
-	nextIno := ino
-	for {
-		nextIno += 1
-		// XXX Why is this 4 bytes?
-		const FUSE_UNKNOWN_INO = 0xFFFFFFFF
-		// XXX We currently reserve this inode too pending an answer to https://github.com/hanwen/go-fuse/issues/439.
-		const RESERVED_INO_1 = 0xFFFFFFFFFFFFFFFF
-		if nextIno != FUSE_UNKNOWN_INO && nextIno != RESERVED_INO_1 {
-			break
-		} else if nextIno <= ino {
-			panic("inodes exhausted")
-		}
-	}
-
-	nextInoBytes, err = json.Marshal(nextIno)
-	if err != nil {
-		panic(err)
-	}
-	tx.Set(tuple.Tuple{"fs", "nextino"}, nextInoBytes)
-	return ino
-}
-
 type futureGetDirEnt struct {
 	name  string
 	bytes fdb.FutureByteSlice
@@ -432,7 +475,10 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 	} else if err != ErrNotExist {
 		return Stat{}, err
 	} else {
-		newIno := fs.txNextIno(tx)
+		newIno, err := fs.nextIno()
+		if err != nil {
+			return Stat{}, err
+		}
 		stat = Stat{
 			Ino:       newIno,
 			Size:      0,

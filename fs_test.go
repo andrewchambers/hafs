@@ -905,3 +905,21 @@ func TestWaitForLockWithPoll(t *testing.T) {
 		t.Fatal("wait took too long")
 	}
 }
+
+func TestInodeAllocation(t *testing.T) {
+	fs := tmpFs(t)
+
+	seen := make(map[uint64]struct{})
+
+	for i := 0; i < INO_BATCH_SIZE*3; i++ {
+		ino, err := fs.nextIno()
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, seenBefore := seen[ino]
+		if seenBefore {
+			t.Fatal("repeated inode")
+		}
+		seen[ino] = struct{}{}
+	}
+}
