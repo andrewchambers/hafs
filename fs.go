@@ -27,6 +27,7 @@ var (
 	ErrInvalid      = unix.EINVAL
 	ErrNotSupported = unix.ENOTSUP
 	ErrPermission   = unix.EPERM
+	ErrIntr         = unix.EINTR
 	ErrUnmounted    = errors.New("filesystem unmounted")
 )
 
@@ -186,7 +187,8 @@ func Attach(db fdb.Database) (*Fs, error) {
 		if !bytes.Equal(version, []byte{CURRENT_SCHEMA_VERSION}) {
 			return nil, fmt.Errorf("filesystem has different version - expected %d but got %d", CURRENT_SCHEMA_VERSION, version[0])
 		}
-		tx.Set(tuple.Tuple{"fs", "mounts", mountId, "attached"}, []byte{1})
+		tx.Set(tuple.Tuple{"fs", "mount", mountId, "attached"}, []byte{1})
+		tx.Set(tuple.Tuple{"fs", "mounts", mountId}, []byte{})
 		return nil, nil
 	})
 	if err != nil {
@@ -291,12 +293,12 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 }
 
 func (fs *Fs) mountHeartBeat() error {
-	lastSeen, err := json.Marshal(time.Now().Unix())
-	if err != nil {
-		return err
-	}
-	_, err = fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		heartBeatKey := tuple.Tuple{"fs", "mounts", fs.mountId, "heartbeat"}
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		heartBeatKey := tuple.Tuple{"fs", "mount", fs.mountId, "heartbeat"}
+		lastSeen, err := json.Marshal(time.Now().Unix())
+		if err != nil {
+			return nil, err
+		}
 		tx.Set(heartBeatKey, lastSeen)
 		return nil, nil
 	})
@@ -321,7 +323,7 @@ func (fs *Fs) Close() error {
 	fs.workerWg.Wait()
 
 	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		tx.ClearRange(tuple.Tuple{"fs", "mounts", fs.mountId})
+		tx.ClearRange(tuple.Tuple{"fs", "mount", fs.mountId})
 		return nil, nil
 	})
 	if err != nil {
@@ -332,7 +334,7 @@ func (fs *Fs) Close() error {
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
 	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "attached"})
+		mountCheck := tx.Get(tuple.Tuple{"fs", "mount", fs.mountId, "attached"})
 		v, err := f(tx)
 		if mountCheck.MustGet() == nil {
 			return v, ErrUnmounted
@@ -343,7 +345,7 @@ func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) 
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
 	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		mountCheck := tx.Get(tuple.Tuple{"fs", "mounts", fs.mountId, "attached"})
+		mountCheck := tx.Get(tuple.Tuple{"fs", "mount", fs.mountId, "attached"})
 		v, err := f(tx)
 		if mountCheck.MustGet() == nil {
 			return v, ErrUnmounted
@@ -1620,7 +1622,7 @@ func (fs *Fs) AwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) erro
 	select {
 	case <-cancel:
 		watch.Cancel()
-		return errors.New("lock wait cancelled")
+		return ErrIntr
 	case err := <-result:
 		return err
 	}
@@ -1701,6 +1703,113 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 
 	return nRemoved, nil
 }
+
+/*
+func (fs *Fs) EvictClient(clientId string) error {
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		// Invalidate all the clients in progress transactions.
+		tx.Clear(tuple.Tuple{"fs", "mount", clientId, "attached"})
+	})
+	if err != nil {
+		return err
+	}
+
+	// Remove all file locks held by the client.
+
+
+	iterBegin, iterEnd := tuple.Tuple{"fs", "mount", clientId, "lock"}.FDBRangeKeys()
+
+	iterRange := fdb.KeyRange{
+		Begin: iterBegin,
+		End:   iterEnd,
+	}
+
+
+	// Finally we can remove the client.
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		tx.Clear(tuple.Tuple{"fs", "mounts", clientId})
+		tx.ClearRange(tuple.Tuple{"fs", "mount", clientId})
+		return nil, nil
+	})
+
+	return nil
+}
+
+func (fs *Fs) RemoveExpiredClients(expiryDelay time.Duration) (uint64, error) {
+
+		nEvicted := uint64(0)
+
+		iterBegin, iterEnd := tuple.Tuple{"fs", "mounts"}.FDBRangeKeys()
+
+		iterRange := fdb.KeyRange{
+			Begin: iterBegin,
+			End:   iterEnd,
+		}
+
+		for  {
+			v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				kvs := tx.GetRange(iterRange, fdb.RangeOptions{
+					Limit:   100,
+				}).GetSliceOrPanic()
+				return v, nil
+			}
+			if err != nil {
+				return nEvicted, err
+			}
+
+			kvs := v.([]fdb.KeyValue)
+
+			if len(kvs) != 0 {
+				next, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+				if err != nil {
+					return nil, err
+				}
+				iterRange.Begin = fdb.Key(next)
+			} else {
+				break
+			}
+
+			for _, kv := range kvs {
+				tup, err := tuple.Unpack(kv.Key)
+				if err != nil {
+					return nEvicted, err
+				}
+
+				clientId := tup[len(tup)-1].(string)
+
+				// Check if this client has failed to update the heartbeat in the required time and
+				// invalidate it if it hasn't. We don't remove the client yet so we can remove the
+				// any locks the client still holds.
+				evicted, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+					var heartBeat uint64
+					heartBeatBytes := tx.Get(tuple.Tuple{"fs", "mount", clientId, "heartbeat"}).MustGet()
+					err := json.Unmarshal(heartBeatBytes, &heartBeat)
+					if err != nil {
+						return nil, err
+					}
+					lastSeen := time.Unix(heartBeat, 0)
+
+					evict := lastSeen.Add(expiryDelay).Before(time.Now())
+					return evict, nil
+				})
+				if err != nil {
+					return nEvicted, err
+				}
+
+				if !evict.(bool) {
+					continue
+				}
+
+				err = fs.EvictClient(clientId)
+				if err != nil {
+					return nEvicted, err
+				}
+
+				nEvicted += 1
+			}
+		}
+}
+*/
 
 type CollectGarbageOpts struct {
 	UnlinkedRemovalDelay time.Duration

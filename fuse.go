@@ -4,6 +4,7 @@ import (
 	"errors"
 	"io"
 	iofs "io/fs"
+	"log"
 	mathrand "math/rand"
 	"sync"
 	"sync/atomic"
@@ -60,9 +61,8 @@ func fillFuseEntryOutFromStat(stat *Stat, out *fuse.EntryOut) {
 }
 
 type openFile struct {
-	releaseLocks atomicBool
-	di           *DirIter
-	f            HafsFile
+	di *DirIter
+	f  HafsFile
 }
 
 type FuseFs struct {
@@ -73,15 +73,17 @@ type FuseFs struct {
 
 	fileHandleCounter uint64
 
-	lock        sync.Mutex
-	fh2OpenFile map[uint64]*openFile
+	lock           sync.Mutex
+	fh2OpenFile    map[uint64]*openFile
+	ino2LockOwners map[uint64]map[uint64]struct{}
 }
 
 func NewFuseFs(fs *Fs) *FuseFs {
 	return &FuseFs{
-		RawFileSystem: fuse.NewDefaultRawFileSystem(),
-		fs:            fs,
-		fh2OpenFile:   make(map[uint64]*openFile),
+		RawFileSystem:  fuse.NewDefaultRawFileSystem(),
+		fs:             fs,
+		fh2OpenFile:    make(map[uint64]*openFile),
+		ino2LockOwners: make(map[uint64]map[uint64]struct{}),
 	}
 }
 
@@ -245,42 +247,32 @@ func (fs *FuseFs) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
 func (fs *FuseFs) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	fs.lock.Lock()
 	f := fs.fh2OpenFile[in.Fh].f
+	_, hasLock := fs.ino2LockOwners[in.NodeId]
 	fs.lock.Unlock()
 
-	err := f.Flush()
-	if err != nil {
-		return errToFuseStatus(err)
+	flushErr := f.Flush()
+
+	// Release locks *AFTER* the above flush call.
+	if hasLock {
+		fs.releaseLocks(in.NodeId, in.LockOwner)
 	}
-	// XXX are we supposed to release locks here or in release.
-	return fuse.OK
+
+	return errToFuseStatus(flushErr)
 }
 
 func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 	fs.lock.Lock()
 	f := fs.fh2OpenFile[in.Fh]
 	delete(fs.fh2OpenFile, in.Fh)
+	_, hasLock := fs.ino2LockOwners[in.NodeId]
 	fs.lock.Unlock()
 
-	if f.releaseLocks.Load() {
-		for {
-			_, err := fs.fs.TrySetLock(in.NodeId, SetLockOpts{
-				Typ:   LOCK_NONE,
-				Owner: in.LockOwner,
-			})
-			if err == nil {
-				break
-			}
-			select {
-			case <-cancel:
-				break
-			case <-time.After(1 * time.Second):
-				// XXX what can we do? abort on too many retries?
-				// XXX Increment an error counter + log?
-			}
-		}
-	}
-
 	_ = f.f.Close()
+
+	// Release locks *AFTER* the close call.
+	if hasLock {
+		fs.releaseLocks(in.NodeId, in.LockOwner)
+	}
 }
 
 func (fs *FuseFs) Unlink(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
@@ -456,6 +448,34 @@ func (fs *FuseFs) RemoveXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr st
 	return errToFuseStatus(err)
 }
 
+func (fs *FuseFs) releaseLocks(ino uint64, lockOwner uint64) {
+
+	fs.lock.Lock()
+	lockOwners, hasLock := fs.ino2LockOwners[ino]
+	if hasLock {
+		delete(lockOwners, lockOwner)
+		if len(lockOwners) == 0 {
+			delete(fs.ino2LockOwners, ino)
+		}
+	}
+	fs.lock.Unlock()
+
+	for {
+		_, err := fs.fs.TrySetLock(ino, SetLockOpts{
+			Typ:   LOCK_NONE,
+			Owner: lockOwner,
+		})
+		if err == nil {
+			break
+		}
+		time.Sleep(1 * time.Second)
+		log.Printf("unable to release lock ino=%d owner=%d", ino, lockOwner)
+		// XXX Abort process on too many retries? Not much else we can do.
+		// XXX cancellation.
+	}
+
+}
+
 func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 
 	var lockType LockType
@@ -482,6 +502,19 @@ func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 		Typ:   lockType,
 		Owner: in.Owner,
 	})
+
+	// Unconditionally mark this inode as having an active lock regardless
+	// of if an error occured, releaseLocks() is guaranteed to be called for this ino
+	// when the current file gets released.
+	fs.lock.Lock()
+	lockOwners, hasLock := fs.ino2LockOwners[in.NodeId]
+	if !hasLock {
+		lockOwners = make(map[uint64]struct{})
+		fs.ino2LockOwners[in.NodeId] = lockOwners
+	}
+	lockOwners[in.Owner] = struct{}{}
+	fs.lock.Unlock()
+
 	if err != nil {
 		return errToFuseStatus(err)
 	}
@@ -489,12 +522,6 @@ func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 	if !ok {
 		return fuse.EAGAIN
 	}
-
-	fs.lock.Lock()
-	f := fs.fh2OpenFile[in.Fh]
-	// The file has been used for locking, cleanup on release.
-	f.releaseLocks.Store(true)
-	fs.lock.Unlock()
 
 	return fuse.OK
 }
@@ -506,6 +533,13 @@ func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 		if status != fuse.EAGAIN {
 			return status
 		}
+
+		select {
+		case <-cancel:
+			return fuse.EINTR
+		default:
+		}
+
 		if nAttempts >= 2 {
 			// Random delay to partially mitigate thundering herd on contended lock.
 			time.Sleep(time.Duration(mathrand.Int()%5_000) * time.Millisecond)

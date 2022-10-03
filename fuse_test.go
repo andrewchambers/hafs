@@ -21,6 +21,7 @@ func TestErrToFuseStatus(t *testing.T) {
 		{ErrNotDir, fuse.Status(unix.ENOTDIR)},
 		{ErrInvalid, fuse.Status(unix.EINVAL)},
 		{ErrPermission, fuse.Status(unix.EPERM)},
+		{ErrIntr, fuse.Status(unix.EINTR)},
 
 		{iofs.ErrPermission, fuse.Status(unix.EPERM)},
 		{iofs.ErrNotExist, fuse.Status(unix.ENOENT)},
