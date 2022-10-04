@@ -16,7 +16,7 @@ func usage() {
 }
 
 func main() {
-
+	cli.RegisterDefaultFlags()
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {

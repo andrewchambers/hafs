@@ -9,6 +9,7 @@ import (
 )
 
 func main() {
+	cli.RegisterDefaultFlags()
 	flag.Parse()
 	fs := cli.MustAttach()
 	defer fs.Close()

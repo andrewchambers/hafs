@@ -18,7 +18,7 @@ import (
 
 func tmpDB(t *testing.T) fdb.Database {
 	db := testutil.NewFDBTestServer(t).Dial()
-	err := Mkfs(db, MkfsOpts{Overwrite: false})
+	err := Mkfs(db, "testfs", MkfsOpts{Overwrite: false})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -27,7 +27,7 @@ func tmpDB(t *testing.T) fdb.Database {
 
 func tmpFs(t *testing.T) *Fs {
 	db := tmpDB(t)
-	fs, err := Attach(db, AttachOpts{})
+	fs, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +516,7 @@ func TestWriteDataOneChunk(t *testing.T) {
 		}
 
 		fetchedData, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 0}).MustGet()
+			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 0}).MustGet()
 			zeroExpandChunk(&data)
 			return data, nil
 		})
@@ -568,7 +568,7 @@ func TestWriteDataTwoChunks(t *testing.T) {
 		}
 
 		fetchedData1, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 0}).MustGet()
+			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 0}).MustGet()
 			zeroExpandChunk(&data)
 			return data, nil
 		})
@@ -577,7 +577,7 @@ func TestWriteDataTwoChunks(t *testing.T) {
 		}
 
 		fetchedData2, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 1}).MustGet()
+			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 1}).MustGet()
 			zeroExpandChunk(&data)
 			return data, nil
 		})
@@ -651,11 +651,11 @@ func TestTruncate(t *testing.T) {
 		}
 
 		_, err = fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			kvs := tx.GetRange(tuple.Tuple{"fs", "ino", stat.Ino, "data"}, fdb.RangeOptions{}).GetSliceOrPanic()
+			kvs := tx.GetRange(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data"}, fdb.RangeOptions{}).GetSliceOrPanic()
 			if len(kvs) != 1 {
 				t.Fatalf("bad number of data chunks: %d", len(kvs))
 			}
-			data := tx.Get(tuple.Tuple{"fs", "ino", stat.Ino, "data", 0}).MustGet()
+			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 0}).MustGet()
 			zeroExpandChunk(&data)
 			if len(data) != CHUNK_SIZE {
 				t.Fatalf("bad data size: %d", len(data))
@@ -1091,12 +1091,7 @@ func TestHardLinkDirFails(t *testing.T) {
 }
 
 func TestClientTimedOut(t *testing.T) {
-	db := tmpDB(t)
-	fs, err := Attach(db, AttachOpts{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs.Close()
+	fs := tmpFs(t)
 
 	expired, err := fs.IsClientTimedOut(fs.mountId, time.Duration(5*time.Second))
 	if err != nil {
@@ -1119,13 +1114,13 @@ func TestClientTimedOut(t *testing.T) {
 
 func TestClientSelfEvictExclusiveLock(t *testing.T) {
 	db := tmpDB(t)
-	fs1, err := Attach(db, AttachOpts{})
+	fs1, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fs1.Close()
 
-	fs2, err := Attach(db, AttachOpts{})
+	fs2, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1168,13 +1163,13 @@ func TestClientSelfEvictExclusiveLock(t *testing.T) {
 
 func TestClientSelfEvictSharedLock(t *testing.T) {
 	db := tmpDB(t)
-	fs1, err := Attach(db, AttachOpts{})
+	fs1, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fs1.Close()
 
-	fs2, err := Attach(db, AttachOpts{})
+	fs2, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1217,13 +1212,13 @@ func TestClientSelfEvictSharedLock(t *testing.T) {
 
 func TestEvictClient(t *testing.T) {
 	db := tmpDB(t)
-	fs1, err := Attach(db, AttachOpts{})
+	fs1, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer fs1.Close()
 
-	fs2, err := Attach(db, AttachOpts{})
+	fs2, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1275,7 +1270,7 @@ func TestEvictClient(t *testing.T) {
 
 func TestClientInfo(t *testing.T) {
 	db := tmpDB(t)
-	fs, err := Attach(db, AttachOpts{})
+	fs, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}

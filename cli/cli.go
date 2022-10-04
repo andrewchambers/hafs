@@ -11,10 +11,11 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var FsName string
 var ClientDescription string
 var ClusterFile string
 
-func init() {
+func RegisterClusterFileFlag() {
 	defaultClusterFile := os.Getenv("FDB_CLUSTER_FILE")
 	if defaultClusterFile == "" {
 		defaultClusterFile = "./fdb.cluster"
@@ -30,13 +31,30 @@ func init() {
 		defaultClusterFile,
 		"FoundationDB cluster file, defaults to FDB_CLUSTER_FILE if set, ./fdb.cluster if present, otherwise /etc/foundationdb/fdb.cluster",
 	)
+}
 
+func RegisterClientDescriptionFlag() {
 	flag.StringVar(
 		&ClientDescription,
 		"client-description",
 		"",
 		"Optional decription of this fs client.",
 	)
+}
+
+func RegisterFsNameFlag() {
+	flag.StringVar(
+		&FsName,
+		"fs-name",
+		"fs",
+		"Name of the filesystem to interact with.",
+	)
+}
+
+func RegisterDefaultFlags() {
+	RegisterClusterFileFlag()
+	RegisterClientDescriptionFlag()
+	RegisterFsNameFlag()
 }
 
 func RegisterDefaultSignalHandlers(fs *hafs.Fs) {
@@ -66,7 +84,7 @@ func MustOpenDatabase() fdb.Database {
 }
 
 func MustAttach() *hafs.Fs {
-	fs, err := hafs.Attach(MustOpenDatabase(), hafs.AttachOpts{
+	fs, err := hafs.Attach(MustOpenDatabase(), FsName, hafs.AttachOpts{
 		ClientDescription: ClientDescription,
 		OnEviction: func(fs *hafs.Fs) {
 			fmt.Fprintf(os.Stderr, "client evicted, aborting...\n")

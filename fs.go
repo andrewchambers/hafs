@@ -31,7 +31,7 @@ var (
 	ErrNotSupported = unix.ENOTSUP
 	ErrPermission   = unix.EPERM
 	ErrIntr         = unix.EINTR
-	ErrUnmounted    = errors.New("filesystem unmounted")
+	ErrDetached     = errors.New("filesystem detached")
 )
 
 const (
@@ -109,6 +109,7 @@ func (stat *Stat) Ctime() time.Time {
 
 type Fs struct {
 	db                  fdb.Database
+	fsName              string
 	mountId             string
 	onEviction          func(fs *Fs)
 	clientDetached      atomicBool
@@ -127,10 +128,10 @@ type MkfsOpts struct {
 	Overwrite bool
 }
 
-func Mkfs(db fdb.Database, opts MkfsOpts) error {
+func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 	_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 
-		if tx.Get(tuple.Tuple{"fs", "version"}).MustGet() != nil {
+		if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() != nil {
 			if !opts.Overwrite {
 				return nil, errors.New("filesystem already present")
 			}
@@ -163,10 +164,10 @@ func Mkfs(db fdb.Database, opts MkfsOpts) error {
 			return nil, err
 		}
 
-		tx.ClearRange(tuple.Tuple{"fs"})
-		tx.Set(tuple.Tuple{"fs", "version"}, []byte{CURRENT_SCHEMA_VERSION})
-		tx.Set(tuple.Tuple{"fs", "ino", ROOT_INO, "stat"}, rootStatBytes)
-		tx.Set(tuple.Tuple{"fs", "nextino"}, []byte("2"))
+		tx.ClearRange(tuple.Tuple{"hafs", fsName})
+		tx.Set(tuple.Tuple{"hafs", fsName, "version"}, []byte{CURRENT_SCHEMA_VERSION})
+		tx.Set(tuple.Tuple{"hafs", fsName, "ino", ROOT_INO, "stat"}, rootStatBytes)
+		tx.Set(tuple.Tuple{"hafs", fsName, "nextino"}, []byte("2"))
 		return nil, nil
 	})
 	return err
@@ -177,7 +178,7 @@ type AttachOpts struct {
 	OnEviction        func(fs *Fs)
 }
 
-func Attach(db fdb.Database, opts AttachOpts) (*Fs, error) {
+func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	hostname, _ := os.Hostname()
 
 	exe, _ := os.Executable()
@@ -222,7 +223,7 @@ func Attach(db fdb.Database, opts AttachOpts) (*Fs, error) {
 	}
 
 	_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		version := tx.Get(tuple.Tuple{"fs", "version"}).MustGet()
+		version := tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet()
 		if version == nil {
 			return nil, errors.New("filesystem is not formatted")
 		}
@@ -230,12 +231,12 @@ func Attach(db fdb.Database, opts AttachOpts) (*Fs, error) {
 			return nil, fmt.Errorf("filesystem has different version - expected %d but got %d", CURRENT_SCHEMA_VERSION, version[0])
 		}
 
-		tx.Set(tuple.Tuple{"fs", "mount", mountId, "info"}, clientInfoBytes)
-		tx.Set(tuple.Tuple{"fs", "mount", mountId, "heartbeat"}, initialHeartBeatBytes)
+		tx.Set(tuple.Tuple{"hafs", fsName, "mount", mountId, "info"}, clientInfoBytes)
+		tx.Set(tuple.Tuple{"hafs", fsName, "mount", mountId, "heartbeat"}, initialHeartBeatBytes)
 		for i := 0; i < _NATTACH_SHARDS; i++ {
-			tx.Set(tuple.Tuple{"fs", "mount", mountId, "attached", i}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fsName, "mount", mountId, "attached", i}, []byte{})
 		}
-		tx.Set(tuple.Tuple{"fs", "mounts", mountId}, []byte{})
+		tx.Set(tuple.Tuple{"hafs", fsName, "mounts", mountId}, []byte{})
 		return nil, nil
 	})
 	if err != nil {
@@ -246,6 +247,7 @@ func Attach(db fdb.Database, opts AttachOpts) (*Fs, error) {
 
 	fs := &Fs{
 		db:                  db,
+		fsName:              fsName,
 		onEviction:          opts.OnEviction,
 		dirRelMtimeDuration: 24 * time.Hour,
 		mountId:             mountId,
@@ -282,7 +284,7 @@ func (fs *Fs) nextIno() (uint64, error) {
 	for {
 		ino, ok := <-fs.inoChan
 		if !ok {
-			return 0, ErrUnmounted
+			return 0, ErrDetached
 		}
 		if !reservedIno(ino) {
 			return ino, nil
@@ -291,7 +293,7 @@ func (fs *Fs) nextIno() (uint64, error) {
 }
 
 func (fs *Fs) requestInosForever(ctx context.Context) {
-	nextInoKey := tuple.Tuple{"fs", "nextino"}
+	nextInoKey := tuple.Tuple{"hafs", fs.fsName, "nextino"}
 	for {
 		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 			nextInoBytes := tx.Get(nextInoKey).MustGet()
@@ -340,7 +342,7 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 
 func (fs *Fs) mountHeartBeat() error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		heartBeatKey := tuple.Tuple{"fs", "mount", fs.mountId, "heartbeat"}
+		heartBeatKey := tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "heartbeat"}
 		lastSeen, err := json.Marshal(time.Now().Unix())
 		if err != nil {
 			return nil, err
@@ -358,7 +360,7 @@ func (fs *Fs) mountHeartBeatForever(ctx context.Context) {
 		select {
 		case <-ticker.C:
 			err := fs.mountHeartBeat()
-			if errors.Is(err, ErrUnmounted) {
+			if errors.Is(err, ErrDetached) {
 				// Must be done in new goroutine to prevent deadlock.
 				go fs.onEviction(fs)
 				return
@@ -382,24 +384,24 @@ func (fs *Fs) Close() error {
 }
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
-	attachKey := tuple.Tuple{"fs", "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
+	attachKey := tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
 	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
 		if attachCheck.MustGet() == nil {
-			return v, ErrUnmounted
+			return v, ErrDetached
 		}
 		return v, err
 	})
 }
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
-	attachKey := tuple.Tuple{"fs", "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
+	attachKey := tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
 	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
 		if attachCheck.MustGet() == nil {
-			return v, ErrUnmounted
+			return v, ErrDetached
 		}
 		return v, err
 	})
@@ -428,7 +430,7 @@ func (fut futureStat) Get() (Stat, error) {
 func (fs *Fs) txGetStat(tx fdb.ReadTransaction, ino uint64) futureStat {
 	return futureStat{
 		ino:   ino,
-		bytes: tx.Get(tuple.Tuple{"fs", "ino", ino, "stat"}),
+		bytes: tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "stat"}),
 	}
 }
 
@@ -437,7 +439,7 @@ func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) {
 	if err != nil {
 		panic(err)
 	}
-	tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "stat"}, statBytes)
+	tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "stat"}, statBytes)
 }
 
 type futureGetDirEnt struct {
@@ -459,7 +461,7 @@ func (fut futureGetDirEnt) Get() (DirEnt, error) {
 func (fs *Fs) txGetDirEnt(tx fdb.ReadTransaction, dirIno uint64, name string) futureGetDirEnt {
 	return futureGetDirEnt{
 		name:  name,
-		bytes: tx.Get(tuple.Tuple{"fs", "ino", dirIno, "child", name}),
+		bytes: tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child", name}),
 	}
 }
 
@@ -468,7 +470,7 @@ func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, ent DirEnt) {
 	if err != nil {
 		panic(err)
 	}
-	tx.Set(tuple.Tuple{"fs", "ino", dirIno, "child", ent.Name}, dirEntBytes)
+	tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child", ent.Name}, dirEntBytes)
 }
 
 func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
@@ -483,7 +485,7 @@ func (fs *Fs) GetDirEnt(dirIno uint64, name string) (DirEnt, error) {
 }
 
 func (fs *Fs) txDirHasChildren(tx fdb.ReadTransaction, dirIno uint64) bool {
-	kvs := tx.GetRange(tuple.Tuple{"fs", "ino", dirIno, "child"}, fdb.RangeOptions{
+	kvs := tx.GetRange(tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child"}, fdb.RangeOptions{
 		Limit: 1,
 	}).GetSliceOrPanic()
 	return len(kvs) != 0
@@ -572,7 +574,7 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 	}
 
 	if stat.Mode&S_IFMT == S_IFLNK {
-		tx.Set(tuple.Tuple{"fs", "ino", stat.Ino, "target"}, opts.LinkTarget)
+		tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "target"}, opts.LinkTarget)
 	}
 
 	return stat, nil
@@ -685,9 +687,9 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		stat.SetCtime(now)
 		fs.txSetStat(tx, stat)
 		if stat.Nlink == 0 {
-			tx.Set(tuple.Tuple{"fs", "unlinked", dirEnt.Ino}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fs.fsName, "unlinked", dirEnt.Ino}, []byte{})
 		}
-		tx.Clear(tuple.Tuple{"fs", "ino", dirIno, "child", name})
+		tx.Clear(tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child", name})
 		return nil, nil
 	})
 	return err
@@ -744,7 +746,7 @@ func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 			if firstWriteCount > uint64(len(buf)) {
 				firstWriteCount = uint64(len(buf))
 			}
-			firstChunkKey := tuple.Tuple{"fs", "ino", f.ino, "data", firstChunkNo}
+			firstChunkKey := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", firstChunkNo}
 			chunk := tx.Get(firstChunkKey).MustGet()
 			zeroExpandChunk(&chunk)
 			copy(chunk[firstChunkOffset:firstChunkOffset+firstWriteCount], remainingBuf)
@@ -754,7 +756,7 @@ func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 		}
 
 		for {
-			key := tuple.Tuple{"fs", "ino", f.ino, "data", currentOffset / CHUNK_SIZE}
+			key := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", currentOffset / CHUNK_SIZE}
 			if len(remainingBuf) >= CHUNK_SIZE {
 				tx.Set(key, zeroTrimChunk(remainingBuf[:CHUNK_SIZE]))
 				currentOffset += CHUNK_SIZE
@@ -833,7 +835,7 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 				firstReadCount = uint64(len(remainingBuf))
 			}
 
-			firstChunkKey := tuple.Tuple{"fs", "ino", f.ino, "data", firstChunkNo}
+			firstChunkKey := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", firstChunkNo}
 			chunk := tx.Get(firstChunkKey).MustGet()
 			if chunk != nil {
 				zeroExpandChunk(&chunk)
@@ -856,7 +858,7 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 
 		// Read all chunks in parallel using futures.
 		for i := uint64(0); i < nChunks; i++ {
-			key := tuple.Tuple{"fs", "ino", f.ino, "data", (currentOffset / CHUNK_SIZE) + i}
+			key := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", (currentOffset / CHUNK_SIZE) + i}
 			chunkFutures = append(chunkFutures, tx.Get(key))
 		}
 
@@ -1102,7 +1104,7 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 func (fs *Fs) ReadSymlink(ino uint64) ([]byte, error) {
 	l, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		statFut := fs.txGetStat(tx, ino)
-		lFut := tx.Get(tuple.Tuple{"fs", "ino", ino, "target"})
+		lFut := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "target"})
 		stat, err := statFut.Get()
 		if err != nil {
 			return nil, err
@@ -1240,7 +1242,7 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 		}
 
 		if stat.Size == 0 {
-			tx.ClearRange(tuple.Tuple{"fs", "ino", ino, "data"})
+			tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data"})
 			/*
 				if stat.Storage != "" {
 					// XXX We have no way to reclaim the space for this object.
@@ -1256,14 +1258,14 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 			}
 
 			clearBegin := (stat.Size + (CHUNK_SIZE - stat.Size%4096)) / CHUNK_SIZE
-			_, clearEnd := tuple.Tuple{"fs", "ino", ino, "data"}.FDBRangeKeys()
+			_, clearEnd := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data"}.FDBRangeKeys()
 			tx.ClearRange(fdb.KeyRange{
-				Begin: tuple.Tuple{"fs", "ino", ino, "data", clearBegin},
+				Begin: tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data", clearBegin},
 				End:   clearEnd,
 			})
 			lastChunkIdx := stat.Size / CHUNK_SIZE
 			lastChunkSize := stat.Size % CHUNK_SIZE
-			lastChunkKey := tuple.Tuple{"fs", "ino", ino, "data", lastChunkIdx}
+			lastChunkKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data", lastChunkIdx}
 			if lastChunkSize == 0 {
 				tx.Clear(lastChunkKey)
 			}
@@ -1365,7 +1367,7 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 			fs.txSetStat(tx, toStat)
 
 			if toStat.Nlink == 0 {
-				tx.Set(tuple.Tuple{"fs", "unlinked", toStat.Ino}, []byte{})
+				tx.Set(tuple.Tuple{"hafs", fs.fsName, "unlinked", toStat.Ino}, []byte{})
 			}
 		}
 
@@ -1382,7 +1384,7 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 			fs.txSetStat(tx, toDirStat)
 		}
 
-		tx.Clear(tuple.Tuple{"fs", "ino", fromDirIno, "child", fromName})
+		tx.Clear(tuple.Tuple{"hafs", fs.fsName, "ino", fromDirIno, "child", fromName})
 		fs.txSetDirEnt(tx, toDirIno, DirEnt{
 			Name: toName,
 			Mode: fromDirEnt.Mode,
@@ -1490,7 +1492,7 @@ func (di *DirIter) Unget(ent DirEnt) {
 }
 
 func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
-	iterBegin, iterEnd := tuple.Tuple{"fs", "ino", dirIno, "child"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child"}.FDBRangeKeys()
 	di := &DirIter{
 		fs: fs,
 		iterRange: fdb.KeyRange{
@@ -1507,7 +1509,7 @@ func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
 func (fs *Fs) GetXAttr(ino uint64, name string) ([]byte, error) {
 	x, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 		statFut := fs.txGetStat(tx, ino)
-		xFut := tx.Get(tuple.Tuple{"fs", "ino", ino, "xattr", name})
+		xFut := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr", name})
 		_, err := statFut.Get()
 		if err != nil {
 			return nil, err
@@ -1536,7 +1538,7 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 			fs.txSetStat(tx, stat)
 		default:
 		}
-		tx.Set(tuple.Tuple{"fs", "ino", ino, "xattr", name}, data)
+		tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr", name}, data)
 		return nil, nil
 	})
 	return err
@@ -1558,7 +1560,7 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			fs.txSetStat(tx, stat)
 		default:
 		}
-		tx.Clear(tuple.Tuple{"fs", "ino", ino, "xattr", name})
+		tx.Clear(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr", name})
 		return nil, nil
 	})
 	return err
@@ -1570,7 +1572,7 @@ func (fs *Fs) ListXAttr(ino uint64) ([]string, error) {
 		if err != nil {
 			return nil, err
 		}
-		kvs := tx.GetRange(tuple.Tuple{"fs", "ino", ino, "xattr"}, fdb.RangeOptions{}).GetSliceOrPanic()
+		kvs := tx.GetRange(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr"}, fdb.RangeOptions{}).GetSliceOrPanic()
 		return kvs, nil
 	})
 	if err != nil {
@@ -1617,7 +1619,7 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 			return false, ErrInvalid
 		}
 
-		exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+		exclusiveLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "exclusive"}
 
 		switch opts.Typ {
 		case LOCK_NONE:
@@ -1638,25 +1640,25 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 				}
 				tx.Clear(exclusiveLockKey)
 			} else {
-				sharedLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "shared", fs.mountId, opts.Owner}
+				sharedLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", fs.mountId, opts.Owner}
 				tx.Clear(sharedLockKey)
 			}
-			tx.Clear(tuple.Tuple{"fs", "mount", fs.mountId, "lock", ino, opts.Owner})
+			tx.Clear(tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "lock", ino, opts.Owner})
 			return true, nil
 		case LOCK_SHARED:
 			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
 			if exclusiveLockBytes != nil {
 				return false, nil
 			}
-			tx.Set(tuple.Tuple{"fs", "ino", ino, "lock", "shared", fs.mountId, opts.Owner}, []byte{})
-			tx.Set(tuple.Tuple{"fs", "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", fs.mountId, opts.Owner}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
 			return true, nil
 		case LOCK_EXCLUSIVE:
 			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
 			if exclusiveLockBytes != nil {
 				return false, nil
 			}
-			sharedLocks := tx.GetRange(tuple.Tuple{"fs", "ino", ino, "lock", "shared"}, fdb.RangeOptions{
+			sharedLocks := tx.GetRange(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared"}, fdb.RangeOptions{
 				Limit: 1,
 			}).GetSliceOrPanic()
 			if len(sharedLocks) > 0 {
@@ -1670,7 +1672,7 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 				return false, err
 			}
 			tx.Set(exclusiveLockKey, exclusiveLockBytes)
-			tx.Set(tuple.Tuple{"fs", "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
 			return true, nil
 		default:
 			panic("api misuse")
@@ -1685,7 +1687,7 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 func (fs *Fs) PollAwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) error {
 	for {
 		released, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+			exclusiveLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "exclusive"}
 			return tx.Get(exclusiveLockKey).MustGet() == nil, nil
 		})
 		if err != nil {
@@ -1700,7 +1702,7 @@ func (fs *Fs) PollAwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) 
 
 func (fs *Fs) AwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) error {
 	w, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+		exclusiveLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "exclusive"}
 		if tx.Get(exclusiveLockKey).MustGet() == nil {
 			return nil, nil
 		}
@@ -1731,7 +1733,7 @@ func (fs *Fs) AwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) erro
 
 func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) {
 
-	iterBegin, iterEnd := tuple.Tuple{"fs", "unlinked"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "unlinked"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
 		Begin: iterBegin,
@@ -1824,8 +1826,8 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 
 			_, err = fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 				for _, stat := range expiredStats {
-					tx.Clear(tuple.Tuple{"fs", "unlinked", stat.Ino})
-					tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino})
+					tx.Clear(tuple.Tuple{"hafs", fs.fsName, "unlinked", stat.Ino})
+					tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino})
 				}
 				return nil, nil
 			})
@@ -1849,7 +1851,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 }
 
 func (fs *Fs) txBreakLock(tx fdb.Transaction, clientId string, ino uint64, owner uint64) error {
-	exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+	exclusiveLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "exclusive"}
 	exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
 	if exclusiveLockBytes != nil {
 		exclusiveLock := exclusiveLockRecord{}
@@ -1861,10 +1863,10 @@ func (fs *Fs) txBreakLock(tx fdb.Transaction, clientId string, ino uint64, owner
 			tx.Clear(exclusiveLockKey)
 		}
 	} else {
-		sharedLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "shared", clientId, owner}
+		sharedLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", clientId, owner}
 		tx.Clear(sharedLockKey)
 	}
-	tx.Clear(tuple.Tuple{"fs", "mount", clientId, "lock", ino, owner})
+	tx.Clear(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "lock", ino, owner})
 	return nil
 }
 
@@ -1872,7 +1874,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 
 	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		// Invalidate all the clients in progress transactions.
-		tx.ClearRange(tuple.Tuple{"fs", "mount", clientId, "attached"})
+		tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "attached"})
 		return nil, nil
 	})
 	if err != nil {
@@ -1880,7 +1882,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 	}
 
 	// Remove all file locks held by the client.
-	iterBegin, iterEnd := tuple.Tuple{"fs", "mount", clientId, "lock"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "lock"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
 		Begin: iterBegin,
@@ -1938,8 +1940,8 @@ func (fs *Fs) EvictClient(clientId string) error {
 
 	// Finally we can remove the client.
 	_, err = fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		tx.Clear(tuple.Tuple{"fs", "mounts", clientId})
-		tx.ClearRange(tuple.Tuple{"fs", "mount", clientId})
+		tx.Clear(tuple.Tuple{"hafs", fs.fsName, "mounts", clientId})
+		tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "mount", clientId})
 		return nil, nil
 	})
 	if err != nil {
@@ -1952,7 +1954,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bool, error) {
 	timedOut, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		var heartBeat uint64
-		heatBeatKey := tuple.Tuple{"fs", "mount", clientId, "heartbeat"}
+		heatBeatKey := tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "heartbeat"}
 		heartBeatBytes := tx.Get(heatBeatKey).MustGet()
 		if heartBeatBytes == nil {
 			return true, nil
@@ -1977,7 +1979,7 @@ func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) 
 
 	nEvicted := uint64(0)
 
-	iterBegin, iterEnd := tuple.Tuple{"fs", "mounts"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "mounts"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
 		Begin: iterBegin,
@@ -2088,7 +2090,7 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 		info = ClientInfo{}
 		ok = false
 
-		infoBytes := tx.Get(tuple.Tuple{"fs", "mount", clientId, "info"}).MustGet()
+		infoBytes := tx.Get(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "info"}).MustGet()
 		if infoBytes == nil {
 			return nil, nil
 		}
@@ -2098,7 +2100,7 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 			return nil, err
 		}
 
-		heartBeatBytes := tx.Get(tuple.Tuple{"fs", "mount", clientId, "heartbeat"}).MustGet()
+		heartBeatBytes := tx.Get(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "heartbeat"}).MustGet()
 		err = json.Unmarshal(heartBeatBytes, &info.HeartBeatUnix)
 		if err != nil {
 			return nil, err
@@ -2117,7 +2119,7 @@ func (fs *Fs) ListClients() ([]ClientInfo, error) {
 
 	clients := []ClientInfo{}
 
-	iterBegin, iterEnd := tuple.Tuple{"fs", "mounts"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "mounts"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
 		Begin: iterBegin,
