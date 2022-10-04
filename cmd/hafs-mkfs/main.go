@@ -10,7 +10,7 @@ import (
 )
 
 func main() {
-	overwrite := flag.Bool("overwrite", false, "Overwrite any existing filesystem.")
+	overwrite := flag.Bool("overwrite", false, "Overwrite any existing filesystem (does not free storage objects).")
 	flag.Parse()
 	db := cli.MustOpenDatabase()
 	err := hafs.Mkfs(db, hafs.MkfsOpts{

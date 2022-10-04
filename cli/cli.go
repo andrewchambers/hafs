@@ -4,11 +4,14 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"os/signal"
 
 	"github.com/andrewchambers/hafs"
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
+	"golang.org/x/sys/unix"
 )
 
+var ClientDescription string
 var ClusterFile string
 
 func init() {
@@ -27,6 +30,30 @@ func init() {
 		defaultClusterFile,
 		"FoundationDB cluster file, defaults to FDB_CLUSTER_FILE if set, ./fdb.cluster if present, otherwise /etc/foundationdb/fdb.cluster",
 	)
+
+	flag.StringVar(
+		&ClientDescription,
+		"client-description",
+		"",
+		"Optional decription of this fs client.",
+	)
+}
+
+func RegisterDefaultSignalHandlers(fs *hafs.Fs) {
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, unix.SIGINT, unix.SIGTERM)
+
+	go func() {
+		<-sigChan
+		signal.Reset()
+		fmt.Fprintf(os.Stderr, "closing down due to signal...\n")
+		err := fs.Close()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error disconnecting client: %s\n", err)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}()
 }
 
 func MustOpenDatabase() fdb.Database {
@@ -39,7 +66,13 @@ func MustOpenDatabase() fdb.Database {
 }
 
 func MustAttach() *hafs.Fs {
-	fs, err := hafs.Attach(MustOpenDatabase())
+	fs, err := hafs.Attach(MustOpenDatabase(), hafs.AttachOpts{
+		ClientDescription: ClientDescription,
+		OnEviction: func(fs *hafs.Fs) {
+			fmt.Fprintf(os.Stderr, "client evicted, aborting...\n")
+			os.Exit(1)
+		},
+	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to connect to filesystem: %s\n", err)
 		os.Exit(1)

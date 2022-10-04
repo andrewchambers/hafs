@@ -27,7 +27,7 @@ func tmpDB(t *testing.T) fdb.Database {
 
 func tmpFs(t *testing.T) *Fs {
 	db := tmpDB(t)
-	fs, err := Attach(db)
+	fs, err := Attach(db, AttachOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -994,189 +994,6 @@ func TestInodeAllocation(t *testing.T) {
 	}
 }
 
-func TestClientTimedOut(t *testing.T) {
-	db := tmpDB(t)
-	fs, err := Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs.Close()
-
-	expired, err := fs.IsClientTimedOut(fs.mountId, time.Duration(5*time.Second))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if expired {
-		t.Fatal("expected not expired")
-	}
-
-	time.Sleep(1 * time.Second)
-
-	expired, err = fs.IsClientTimedOut(fs.mountId, time.Duration(0))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !expired {
-		t.Fatal("expected expired")
-	}
-}
-
-func TestClientSelfEvictExclusiveLock(t *testing.T) {
-	db := tmpDB(t)
-	fs1, err := Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs1.Close()
-
-	fs2, err := Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs2.Close()
-
-	stat, err := fs1.Mknod(ROOT_INO, "f", MknodOpts{
-		Mode: S_IFREG | 0o777,
-		Uid:  0,
-		Gid:  0,
-	})
-
-	ok, err := fs1.TrySetLock(stat.Ino, SetLockOpts{
-		Typ:   LOCK_EXCLUSIVE,
-		Owner: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal()
-	}
-
-	err = fs1.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ok, err = fs2.TrySetLock(stat.Ino, SetLockOpts{
-		Typ:   LOCK_EXCLUSIVE,
-		Owner: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal()
-	}
-
-}
-
-func TestClientSelfEvictSharedLock(t *testing.T) {
-	db := tmpDB(t)
-	fs1, err := Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs1.Close()
-
-	fs2, err := Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs2.Close()
-
-	stat, err := fs1.Mknod(ROOT_INO, "f", MknodOpts{
-		Mode: S_IFREG | 0o777,
-		Uid:  0,
-		Gid:  0,
-	})
-
-	ok, err := fs1.TrySetLock(stat.Ino, SetLockOpts{
-		Typ:   LOCK_SHARED,
-		Owner: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal()
-	}
-
-	err = fs1.Close()
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ok, err = fs2.TrySetLock(stat.Ino, SetLockOpts{
-		Typ:   LOCK_EXCLUSIVE,
-		Owner: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal()
-	}
-
-}
-
-func TestEvictClient(t *testing.T) {
-	db := tmpDB(t)
-	fs1, err := Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs1.Close()
-
-	fs2, err := Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs2.Close()
-
-	stat, err := fs1.Mknod(ROOT_INO, "f", MknodOpts{
-		Mode: S_IFREG | 0o777,
-		Uid:  0,
-		Gid:  0,
-	})
-
-	ok, err := fs1.TrySetLock(stat.Ino, SetLockOpts{
-		Typ:   LOCK_SHARED,
-		Owner: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal()
-	}
-
-	err = fs2.EvictClient(fs1.mountId)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	ok, err = fs2.TrySetLock(stat.Ino, SetLockOpts{
-		Typ:   LOCK_EXCLUSIVE,
-		Owner: 1,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !ok {
-		t.Fatal()
-	}
-
-	_, err = fs1.Mknod(ROOT_INO, "f2", MknodOpts{
-		Mode: S_IFREG | 0o777,
-		Uid:  0,
-		Gid:  0,
-	})
-	if err != ErrUnmounted {
-		t.Fatal(err)
-	}
-
-}
-
 func TestHardLink(t *testing.T) {
 	fs := tmpFs(t)
 
@@ -1271,4 +1088,216 @@ func TestHardLinkDirFails(t *testing.T) {
 		t.Fatal(err)
 	}
 
+}
+
+func TestClientTimedOut(t *testing.T) {
+	db := tmpDB(t)
+	fs, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	expired, err := fs.IsClientTimedOut(fs.mountId, time.Duration(5*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if expired {
+		t.Fatal("expected not expired")
+	}
+
+	time.Sleep(1 * time.Second)
+
+	expired, err = fs.IsClientTimedOut(fs.mountId, time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !expired {
+		t.Fatal("expected expired")
+	}
+}
+
+func TestClientSelfEvictExclusiveLock(t *testing.T) {
+	db := tmpDB(t)
+	fs1, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs1.Close()
+
+	fs2, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs2.Close()
+
+	stat, err := fs1.Mknod(ROOT_INO, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+
+	ok, err := fs1.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	err = fs1.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err = fs2.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+}
+
+func TestClientSelfEvictSharedLock(t *testing.T) {
+	db := tmpDB(t)
+	fs1, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs1.Close()
+
+	fs2, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs2.Close()
+
+	stat, err := fs1.Mknod(ROOT_INO, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+
+	ok, err := fs1.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_SHARED,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	err = fs1.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err = fs2.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+}
+
+func TestEvictClient(t *testing.T) {
+	db := tmpDB(t)
+	fs1, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs1.Close()
+
+	fs2, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs2.Close()
+
+	stat, err := fs1.Mknod(ROOT_INO, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+
+	ok, err := fs1.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_SHARED,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	err = fs2.EvictClient(fs1.mountId)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ok, err = fs2.TrySetLock(stat.Ino, SetLockOpts{
+		Typ:   LOCK_EXCLUSIVE,
+		Owner: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal()
+	}
+
+	_, err = fs1.Mknod(ROOT_INO, "f2", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != ErrUnmounted {
+		t.Fatal(err)
+	}
+
+}
+
+func TestClientInfo(t *testing.T) {
+	db := tmpDB(t)
+	fs, err := Attach(db, AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	info, ok, err := fs.ClientInfo(fs.mountId)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("client missing")
+	}
+
+	if info.Pid != int64(os.Getpid()) {
+		t.Fatalf("%v", info)
+	}
+
+	clients, err := fs.ListClients()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(clients) != 1 {
+		t.Fatal("unexpected number of clients")
+	}
 }

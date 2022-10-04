@@ -11,6 +11,7 @@ import (
 	"io"
 	"log"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -108,6 +109,8 @@ func (stat *Stat) Ctime() time.Time {
 type Fs struct {
 	db                  fdb.Database
 	mountId             string
+	onEviction          func(fs *Fs)
+	clientDetached      atomicBool
 	inoChan             chan uint64
 	dirRelMtimeDuration time.Duration // TODO XXX make an option.
 	workerWg            *sync.WaitGroup
@@ -167,19 +170,54 @@ func Mkfs(db fdb.Database, opts MkfsOpts) error {
 	return err
 }
 
-func Attach(db fdb.Database) (*Fs, error) {
+type AttachOpts struct {
+	ClientDescription string
+	OnEviction        func(fs *Fs)
+}
+
+func Attach(db fdb.Database, opts AttachOpts) (*Fs, error) {
 	hostname, _ := os.Hostname()
-	if hostname == "" {
-		hostname = "unknown"
+
+	exe, _ := os.Executable()
+
+	if opts.ClientDescription == "" {
+		if idx := strings.LastIndex(exe, "/"); idx != -1 {
+			opts.ClientDescription = exe[idx+1:]
+		} else {
+			opts.ClientDescription = exe
+		}
 	}
 
-	cookie := [16]byte{}
-	_, err := rand.Read(cookie[:])
+	if opts.OnEviction == nil {
+		opts.OnEviction = func(fs *Fs) {}
+	}
+
+	idBytes := [16]byte{}
+	_, err := rand.Read(idBytes[:])
+	if err != nil {
+		return nil, err
+	}
+	mountId := hex.EncodeToString(idBytes[:])
+
+	now := time.Now()
+
+	clientInfo := ClientInfo{
+		Pid:            int64(os.Getpid()),
+		Exe:            exe,
+		Description:    opts.ClientDescription,
+		Hostname:       hostname,
+		AttachTimeUnix: uint64(now.Unix()),
+	}
+
+	clientInfoBytes, err := json.Marshal(&clientInfo)
 	if err != nil {
 		return nil, err
 	}
 
-	mountId := fmt.Sprintf("%s.%d.%s", hostname, time.Now().Unix(), hex.EncodeToString(cookie[:]))
+	initialHeartBeatBytes, err := json.Marshal(now.Unix())
+	if err != nil {
+		return nil, err
+	}
 
 	_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		version := tx.Get(tuple.Tuple{"fs", "version"}).MustGet()
@@ -189,6 +227,9 @@ func Attach(db fdb.Database) (*Fs, error) {
 		if !bytes.Equal(version, []byte{CURRENT_SCHEMA_VERSION}) {
 			return nil, fmt.Errorf("filesystem has different version - expected %d but got %d", CURRENT_SCHEMA_VERSION, version[0])
 		}
+
+		tx.Set(tuple.Tuple{"fs", "mount", mountId, "info"}, clientInfoBytes)
+		tx.Set(tuple.Tuple{"fs", "mount", mountId, "heartbeat"}, initialHeartBeatBytes)
 		tx.Set(tuple.Tuple{"fs", "mount", mountId, "attached"}, []byte{1})
 		tx.Set(tuple.Tuple{"fs", "mounts", mountId}, []byte{})
 		return nil, nil
@@ -201,17 +242,12 @@ func Attach(db fdb.Database) (*Fs, error) {
 
 	fs := &Fs{
 		db:                  db,
+		onEviction:          opts.OnEviction,
 		dirRelMtimeDuration: 24 * time.Hour,
 		mountId:             mountId,
 		cancelWorkers:       cancelWorkers,
 		workerWg:            &sync.WaitGroup{},
 		inoChan:             make(chan uint64, INO_CHAN_SIZE),
-	}
-
-	err = fs.mountHeartBeat()
-	if err != nil {
-		_ = fs.Close()
-		return nil, err
 	}
 
 	fs.workerWg.Add(1)
@@ -317,11 +353,20 @@ func (fs *Fs) mountHeartBeatForever(ctx context.Context) {
 	for {
 		select {
 		case <-ticker.C:
-			_ = fs.mountHeartBeat()
+			err := fs.mountHeartBeat()
+			if errors.Is(err, ErrUnmounted) {
+				// Must be done in new goroutine to prevent deadlock.
+				go fs.onEviction(fs)
+				return
+			}
 		case <-ctx.Done():
 			return
 		}
 	}
+}
+
+func (fs *Fs) IsDetatched() bool {
+	return fs.clientDetached.Load()
 }
 
 func (fs *Fs) Close() error {
@@ -1984,7 +2029,7 @@ func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) 
 			}
 
 			if len(tup) < 1 {
-				return nEvicted, errors.New("corrupt mount key")
+				return nEvicted, errors.New("corrupt client key")
 			}
 
 			clientId := tup[len(tup)-1].(string)
@@ -2035,4 +2080,109 @@ func (fs *Fs) CollectGarbage(opts CollectGarbageOpts) (CollectGarbageStats, erro
 	}
 
 	return stats, nil
+}
+
+type ClientInfo struct {
+	Id             string `json:",omitempty"`
+	Description    string
+	Hostname       string
+	Pid            int64
+	Exe            string
+	AttachTimeUnix uint64    `json:",omitempty"`
+	AttachTime     time.Time `json:"-"`
+	HeartBeatUnix  uint64    `json:",omitempty"`
+	HeartBeat      time.Time `json:"-"`
+}
+
+func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
+
+	var ok bool
+	var info ClientInfo
+
+	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		info = ClientInfo{}
+		ok = false
+
+		infoBytes := tx.Get(tuple.Tuple{"fs", "mount", clientId, "info"}).MustGet()
+		if infoBytes == nil {
+			return nil, nil
+		}
+
+		err := json.Unmarshal(infoBytes, &info)
+		if err != nil {
+			return nil, err
+		}
+
+		heartBeatBytes := tx.Get(tuple.Tuple{"fs", "mount", clientId, "heartbeat"}).MustGet()
+		err = json.Unmarshal(heartBeatBytes, &info.HeartBeatUnix)
+		if err != nil {
+			return nil, err
+		}
+		info.Id = clientId
+		ok = true
+		return nil, nil
+	})
+
+	info.HeartBeat = time.Unix(int64(info.HeartBeatUnix), 0)
+	info.AttachTime = time.Unix(int64(info.AttachTimeUnix), 0)
+	return info, ok, err
+}
+
+func (fs *Fs) ListClients() ([]ClientInfo, error) {
+
+	clients := []ClientInfo{}
+
+	iterBegin, iterEnd := tuple.Tuple{"fs", "mounts"}.FDBRangeKeys()
+
+	iterRange := fdb.KeyRange{
+		Begin: iterBegin,
+		End:   iterEnd,
+	}
+
+	for {
+		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
+				Limit: 100,
+			}).GetSliceOrPanic()
+			return kvs, nil
+		})
+		if err != nil {
+			return clients, err
+		}
+
+		kvs := v.([]fdb.KeyValue)
+
+		if len(kvs) == 0 {
+			break
+		}
+
+		nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+		if err != nil {
+			return clients, err
+		}
+		iterRange.Begin = fdb.Key(nextBegin)
+
+		for _, kv := range kvs {
+			tup, err := tuple.Unpack(kv.Key)
+			if err != nil {
+				return clients, err
+			}
+
+			if len(tup) < 1 {
+				return clients, errors.New("corrupt client key")
+			}
+
+			clientId := tup[len(tup)-1].(string)
+
+			client, ok, err := fs.ClientInfo(clientId)
+			if err != nil {
+				return clients, err
+			}
+			if ok {
+				clients = append(clients, client)
+			}
+		}
+	}
+
+	return clients, nil
 }

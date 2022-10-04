@@ -4,34 +4,20 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"os/signal"
 	"time"
 
 	"github.com/andrewchambers/hafs"
 	"github.com/andrewchambers/hafs/cli"
-	"golang.org/x/sys/unix"
 )
 
 func main() {
-	unlinkRemovalDelay := flag.Duration("unlink-removal-delay", 6*time.Hour, "Grace period for removal of unlinked files.")
-	clientTimeout := flag.Duration("client-timeout", 6*time.Hour, "Grace period for unresponsive clients.")
+	unlinkRemovalDelay := flag.Duration("unlink-removal-delay", 15*time.Minute, "Grace period for removal of unlinked files.")
+	clientTimeout := flag.Duration("client-timeout", 15*time.Minute, "Grace period for unresponsive clients.")
 	flag.Parse()
 	fs := cli.MustAttach()
+	defer fs.Close()
 
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, unix.SIGINT, unix.SIGTERM)
-
-	go func() {
-		<-sigChan
-		signal.Reset()
-		fmt.Fprintf(os.Stderr, "closing down due to signal...\n")
-		err := fs.Close()
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error disconnecting client: %s\n", err)
-			os.Exit(1)
-		}
-		os.Exit(0)
-	}()
+	cli.RegisterDefaultSignalHandlers(fs)
 
 	stats, err := fs.CollectGarbage(hafs.CollectGarbageOpts{
 		UnlinkedRemovalDelay: *unlinkRemovalDelay,
