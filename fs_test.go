@@ -176,7 +176,16 @@ func TestUnlink(t *testing.T) {
 		t.Fatal("expected unlinked")
 	}
 
-	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err := fs.RemoveExpiredUnlinked(10 * time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nRemoved != 0 {
+		t.Fatal("expected nothing to be removed")
+	}
+
+	nRemoved, err = fs.RemoveExpiredUnlinked(time.Duration(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +200,7 @@ func TestUnlink(t *testing.T) {
 	}
 
 	if nRemoved != 0 {
-		t.Fatal("nothing to be removed")
+		t.Fatal("expected nothing to be removed")
 	}
 }
 
@@ -991,16 +1000,9 @@ func TestClientTimedOut(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	expiredId := fs.mountId
-	_ = fs.Close()
-
-	fs, err = Attach(db)
-	if err != nil {
-		t.Fatal(err)
-	}
 	defer fs.Close()
 
-	expired, err := fs.IsClientTimedOut(expiredId, time.Duration(5*time.Second))
+	expired, err := fs.IsClientTimedOut(fs.mountId, time.Duration(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1010,7 +1012,7 @@ func TestClientTimedOut(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	expired, err = fs.IsClientTimedOut(expiredId, time.Duration(0))
+	expired, err = fs.IsClientTimedOut(fs.mountId, time.Duration(0))
 	if err != nil {
 		t.Fatal(err)
 	}

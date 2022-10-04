@@ -1688,7 +1688,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 					futureStats = append(futureStats, fs.txGetStat(tx, ino))
 				}
 
-				expiredStats := []Stat{}
+				expiredStats := make([]Stat, 0, len(futureStats))
 
 				now := time.Now()
 				for _, futureStat := range futureStats {
@@ -1696,13 +1696,12 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 					if err != nil {
 						return nil, err
 					}
-					if err == ErrNotExist {
+					if errors.Is(err, ErrNotExist) {
 						continue
 					}
 					if now.After(stat.Ctime().Add(removalDelay)) {
-
+						expiredStats = append(expiredStats, stat)
 					}
-					expiredStats = append(expiredStats, stat)
 				}
 
 				return expiredStats, nil
