@@ -981,7 +981,7 @@ func TestInodeAllocation(t *testing.T) {
 
 	seen := make(map[uint64]struct{})
 
-	for i := 0; i < INO_BATCH_SIZE*3; i++ {
+	for i := 0; i < _INO_BATCH_SIZE*3; i++ {
 		ino, err := fs.nextIno()
 		if err != nil {
 			t.Fatal(err)

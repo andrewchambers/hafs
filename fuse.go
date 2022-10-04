@@ -257,14 +257,14 @@ func (fs *FuseFs) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	_, hasLock := fs.ino2LockOwners[in.NodeId]
 	fs.lock.Unlock()
 
-	flushErr := f.Flush()
+	fsyncErr := f.Fsync()
 
 	// Release locks *AFTER* the above flush call.
 	if hasLock {
 		fs.releaseLocks(in.NodeId, in.LockOwner)
 	}
 
-	return errToFuseStatus(flushErr)
+	return errToFuseStatus(fsyncErr)
 }
 
 func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
@@ -566,4 +566,20 @@ func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 		}
 		nAttempts += 1
 	}
+}
+
+func (fs *FuseFs) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
+
+	stats, err := fs.fs.FsStats()
+	if err != nil {
+		return errToFuseStatus(err)
+	}
+
+	out.Bsize = CHUNK_SIZE
+	out.Blocks = stats.UsedBytes / CHUNK_SIZE
+	out.Bfree = stats.FreeBytes / CHUNK_SIZE
+	out.Bavail = out.Bfree
+	out.NameLen = 4096
+
+	return fuse.OK
 }

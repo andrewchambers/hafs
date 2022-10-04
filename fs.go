@@ -8,12 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"github.com/valyala/fastjson"
 	"io"
 	"log"
 	"os"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
@@ -39,8 +39,9 @@ const (
 	CURRENT_SCHEMA_VERSION  = 1
 	ROOT_INO                = 1
 	CHUNK_SIZE              = 4096
-	INO_BATCH_SIZE          = 65536
-	INO_CHAN_SIZE           = 16384
+	_INO_BATCH_SIZE         = 65536
+	_INO_CHAN_SIZE          = 16384
+	_NATTACH_SHARDS         = 4 // One of these is read for each transaction, so spread load.
 )
 
 const (
@@ -111,6 +112,7 @@ type Fs struct {
 	mountId             string
 	onEviction          func(fs *Fs)
 	clientDetached      atomicBool
+	txCounter           atomicUint64
 	inoChan             chan uint64
 	dirRelMtimeDuration time.Duration // TODO XXX make an option.
 	workerWg            *sync.WaitGroup
@@ -230,7 +232,9 @@ func Attach(db fdb.Database, opts AttachOpts) (*Fs, error) {
 
 		tx.Set(tuple.Tuple{"fs", "mount", mountId, "info"}, clientInfoBytes)
 		tx.Set(tuple.Tuple{"fs", "mount", mountId, "heartbeat"}, initialHeartBeatBytes)
-		tx.Set(tuple.Tuple{"fs", "mount", mountId, "attached"}, []byte{1})
+		for i := 0; i < _NATTACH_SHARDS; i++ {
+			tx.Set(tuple.Tuple{"fs", "mount", mountId, "attached", i}, []byte{})
+		}
 		tx.Set(tuple.Tuple{"fs", "mounts", mountId}, []byte{})
 		return nil, nil
 	})
@@ -247,7 +251,7 @@ func Attach(db fdb.Database, opts AttachOpts) (*Fs, error) {
 		mountId:             mountId,
 		cancelWorkers:       cancelWorkers,
 		workerWg:            &sync.WaitGroup{},
-		inoChan:             make(chan uint64, INO_CHAN_SIZE),
+		inoChan:             make(chan uint64, _INO_CHAN_SIZE),
 	}
 
 	fs.workerWg.Add(1)
@@ -296,7 +300,7 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 			if err != nil {
 				return nil, err
 			}
-			nextIno := currentIno + INO_BATCH_SIZE
+			nextIno := currentIno + _INO_BATCH_SIZE
 			if nextIno >= 0x7FFFFFFFFFFFFFFF {
 				// Don't allow inodes to get into the range where
 				// they can't be represented by int64 or uint64 -
@@ -318,7 +322,7 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 		}
 
 		currentIno := v.(uint64)
-		for currentIno < currentIno+INO_BATCH_SIZE {
+		for currentIno < currentIno+_INO_BATCH_SIZE {
 			select {
 			case fs.inoChan <- currentIno:
 			default:
@@ -378,10 +382,11 @@ func (fs *Fs) Close() error {
 }
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
+	attachKey := tuple.Tuple{"fs", "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
 	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		mountCheck := tx.Get(tuple.Tuple{"fs", "mount", fs.mountId, "attached"})
+		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
-		if mountCheck.MustGet() == nil {
+		if attachCheck.MustGet() == nil {
 			return v, ErrUnmounted
 		}
 		return v, err
@@ -389,10 +394,11 @@ func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) 
 }
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
+	attachKey := tuple.Tuple{"fs", "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
 	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		mountCheck := tx.Get(tuple.Tuple{"fs", "mount", fs.mountId, "attached"})
+		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
-		if mountCheck.MustGet() == nil {
+		if attachCheck.MustGet() == nil {
 			return v, ErrUnmounted
 		}
 		return v, err
@@ -691,7 +697,6 @@ type HafsFile interface {
 	WriteData([]byte, uint64) (uint32, error)
 	ReadData([]byte, uint64) (uint32, error)
 	Fsync() error
-	Flush() error
 	Close() error
 }
 
@@ -895,7 +900,6 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 	}
 }
 func (f *foundationDBFile) Fsync() error { return nil }
-func (f *foundationDBFile) Flush() error { return nil }
 func (f *foundationDBFile) Close() error { return nil }
 
 type invalidFile struct{}
@@ -903,7 +907,6 @@ type invalidFile struct{}
 func (f *invalidFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrInvalid }
 func (f *invalidFile) ReadData(buf []byte, offset uint64) (uint32, error)  { return 0, ErrInvalid }
 func (f *invalidFile) Fsync() error                                        { return ErrInvalid }
-func (f *invalidFile) Flush() error                                        { return nil }
 func (f *invalidFile) Close() error                                        { return nil }
 
 type externalStoreReadOnlyFile struct {
@@ -920,10 +923,6 @@ func (f *externalStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32,
 }
 
 func (f *externalStoreReadOnlyFile) Fsync() error {
-	return nil
-}
-
-func (f *externalStoreReadOnlyFile) Flush() error {
 	return nil
 }
 
@@ -1048,6 +1047,7 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			f = &externalStoreReadWriteFile{
 				fs:      fs,
 				ino:     stat.Ino,
+				dirty:   atomicBool{1},
 				storage: stat.Storage,
 				tmpFile: tmpFile,
 			}
@@ -1753,7 +1753,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 		End:   iterEnd,
 	}
 
-	nRemoved := uint64(0)
+	nRemoved := &atomicUint64{}
 
 	errg, _ := errgroup.WithContext(context.Background())
 	errg.SetLimit(128)
@@ -1767,7 +1767,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 			return kvs, nil
 		})
 		if err != nil {
-			return nRemoved, err
+			return nRemoved.Load(), err
 		}
 
 		kvs := v.([]fdb.KeyValue)
@@ -1778,7 +1778,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 
 		nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
 		if err != nil {
-			return nRemoved, err
+			return nRemoved.Load(), err
 		}
 		iterRange.Begin = fdb.Key(nextBegin)
 
@@ -1848,7 +1848,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 				return err
 			}
 
-			atomic.AddUint64(&nRemoved, uint64(len(expiredStats)))
+			nRemoved.Add(uint64(len(expiredStats)))
 			return nil
 
 		})
@@ -1857,10 +1857,10 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 
 	err := errg.Wait()
 	if err != nil {
-		return nRemoved, err
+		return nRemoved.Load(), err
 	}
 
-	return nRemoved, nil
+	return nRemoved.Load(), nil
 }
 
 func (fs *Fs) txBreakLock(tx fdb.Transaction, clientId string, ino uint64, owner uint64) error {
@@ -1887,7 +1887,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 
 	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		// Invalidate all the clients in progress transactions.
-		tx.Clear(tuple.Tuple{"fs", "mount", clientId, "attached"})
+		tx.ClearRange(tuple.Tuple{"fs", "mount", clientId, "attached"})
 		return nil, nil
 	})
 	if err != nil {
@@ -2099,7 +2099,7 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 	var ok bool
 	var info ClientInfo
 
-	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+	_, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 		info = ClientInfo{}
 		ok = false
 
@@ -2140,7 +2140,7 @@ func (fs *Fs) ListClients() ([]ClientInfo, error) {
 	}
 
 	for {
-		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		v, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
 				Limit: 100,
 			}).GetSliceOrPanic()
@@ -2185,4 +2185,38 @@ func (fs *Fs) ListClients() ([]ClientInfo, error) {
 	}
 
 	return clients, nil
+}
+
+type FsStats struct {
+	UsedBytes uint64
+	FreeBytes uint64
+}
+
+func (fs *Fs) FsStats() (FsStats, error) {
+
+	fsStats := FsStats{}
+
+	v, err := fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		return tx.Get(fdb.Key("\xFF\xFF/status/json")).MustGet(), nil
+	})
+	if err != nil {
+		return FsStats{}, err
+	}
+
+	var p fastjson.Parser
+
+	status, err := p.ParseBytes(v.([]byte))
+	if err != nil {
+		return fsStats, err
+	}
+
+	processes := status.GetObject("cluster", "processes")
+	if processes != nil {
+		processes.Visit(func(key []byte, v *fastjson.Value) {
+			fsStats.FreeBytes += v.GetUint64("disk", "free_bytes")
+			fsStats.UsedBytes += v.GetUint64("disk", "total_bytes")
+		})
+	}
+
+	return fsStats, nil
 }
