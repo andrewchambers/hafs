@@ -259,7 +259,11 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 				return nil, err
 			}
 			nextIno := currentIno + INO_BATCH_SIZE
-			if nextIno <= currentIno {
+			if nextIno >= 0x7FFFFFFFFFFFFFFF {
+				// Don't allow inodes to get into the range where
+				// they can't be represented by int64 or uint64 -
+				// We do this because FoundationDB encodes inodes
+				// in key tuples as int64.
 				panic("inodes exhausted")
 			}
 			nextInoBytes, err = json.Marshal(nextIno)
@@ -322,14 +326,8 @@ func (fs *Fs) Close() error {
 	fs.cancelWorkers()
 	fs.workerWg.Wait()
 
-	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		tx.ClearRange(tuple.Tuple{"fs", "mount", fs.mountId})
-		return nil, nil
-	})
-	if err != nil {
-		return fmt.Errorf("unable to remove mount: %w", err)
-	}
-	return nil
+	err := fs.EvictClient(fs.mountId)
+	return err
 }
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
@@ -854,13 +852,11 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 
 	_, err := f.tmpFile.Seek(0, 0)
 	if err != nil {
-		fmt.Printf("XXX1: %#v\n", err)
 		return err
 	}
 
 	size, err := storageWrite(f.storage, f.ino, f.tmpFile)
 	if err != nil {
-		fmt.Printf("XXX2: %#v\n", err)
 		return err
 	}
 
@@ -1704,19 +1700,38 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 	return nRemoved, nil
 }
 
-/*
+func (fs *Fs) txBreakLock(tx fdb.Transaction, clientId string, ino uint64, owner uint64) error {
+	exclusiveLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "exclusive"}
+	exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
+	if exclusiveLockBytes != nil {
+		exclusiveLock := exclusiveLockRecord{}
+		err := json.Unmarshal(exclusiveLockBytes, &exclusiveLock)
+		if err != nil {
+			return err
+		}
+		if exclusiveLock.ClientId == fs.mountId && exclusiveLock.Owner == owner {
+			tx.Clear(exclusiveLockKey)
+		}
+	} else {
+		sharedLockKey := tuple.Tuple{"fs", "ino", ino, "lock", "shared", clientId, owner}
+		tx.Clear(sharedLockKey)
+	}
+	tx.Clear(tuple.Tuple{"fs", "mount", clientId, "lock", ino, owner})
+	return nil
+}
+
 func (fs *Fs) EvictClient(clientId string) error {
-	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		// Invalidate all the clients in progress transactions.
 		tx.Clear(tuple.Tuple{"fs", "mount", clientId, "attached"})
+		return nil, nil
 	})
 	if err != nil {
 		return err
 	}
 
 	// Remove all file locks held by the client.
-
-
 	iterBegin, iterEnd := tuple.Tuple{"fs", "mount", clientId, "lock"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
@@ -1724,92 +1739,158 @@ func (fs *Fs) EvictClient(clientId string) error {
 		End:   iterEnd,
 	}
 
+	for {
+		v, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
+				Limit: 64,
+			}).GetSliceOrPanic()
+			return kvs, nil
+		})
+		if err != nil {
+			return err
+		}
+
+		kvs := v.([]fdb.KeyValue)
+
+		if len(kvs) == 0 {
+			break
+		}
+
+		nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+		if err != nil {
+			return err
+		}
+		iterRange.Begin = fdb.Key(nextBegin)
+
+		_, err = fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			for _, kv := range kvs {
+				tup, err := tuple.Unpack(kv.Key)
+				if err != nil {
+					return nil, err
+				}
+				if len(tup) < 2 {
+					return nil, errors.New("corrupt lock entry")
+				}
+				owner := uint64(tup[len(tup)-1].(int64))
+				ino := uint64(tup[len(tup)-2].(int64))
+				err = fs.txBreakLock(tx, clientId, ino, owner)
+				if err != nil {
+					return nil, err
+				}
+			}
+
+			return nil, nil
+		})
+
+		if err != nil {
+			return err
+		}
+
+	}
 
 	// Finally we can remove the client.
-	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+	_, err = fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		tx.Clear(tuple.Tuple{"fs", "mounts", clientId})
 		tx.ClearRange(tuple.Tuple{"fs", "mount", clientId})
 		return nil, nil
 	})
+	if err != nil {
+		return err
+	}
 
 	return nil
 }
 
-func (fs *Fs) RemoveExpiredClients(expiryDelay time.Duration) (uint64, error) {
+func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bool, error) {
+	timedOut, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		var heartBeat uint64
+		heatBeatKey := tuple.Tuple{"fs", "mount", clientId, "heartbeat"}
+		heartBeatBytes := tx.Get(heatBeatKey).MustGet()
+		if heartBeatBytes == nil {
+			return true, nil
+		}
+		err := json.Unmarshal(heartBeatBytes, &heartBeat)
+		if err != nil {
+			return nil, err
+		}
+		lastSeen := time.Unix(int64(heartBeat), 0)
+		timedOut := lastSeen.Add(clientTimeout).Before(time.Now())
+		return timedOut, nil
+	})
 
-		nEvicted := uint64(0)
+	if err != nil {
+		return false, err
+	}
 
-		iterBegin, iterEnd := tuple.Tuple{"fs", "mounts"}.FDBRangeKeys()
+	return timedOut.(bool), nil
+}
 
-		iterRange := fdb.KeyRange{
-			Begin: iterBegin,
-			End:   iterEnd,
+func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) {
+
+	nEvicted := uint64(0)
+
+	iterBegin, iterEnd := tuple.Tuple{"fs", "mounts"}.FDBRangeKeys()
+
+	iterRange := fdb.KeyRange{
+		Begin: iterBegin,
+		End:   iterEnd,
+	}
+
+	for {
+		v, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
+				Limit: 100,
+			}).GetSliceOrPanic()
+			return kvs, nil
+		})
+		if err != nil {
+			return nEvicted, err
 		}
 
-		for  {
-			v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-				kvs := tx.GetRange(iterRange, fdb.RangeOptions{
-					Limit:   100,
-				}).GetSliceOrPanic()
-				return v, nil
-			}
+		kvs := v.([]fdb.KeyValue)
+
+		if len(kvs) == 0 {
+			break
+		}
+
+		nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+		if err != nil {
+			return nEvicted, err
+		}
+		iterRange.Begin = fdb.Key(nextBegin)
+
+		for _, kv := range kvs {
+			tup, err := tuple.Unpack(kv.Key)
 			if err != nil {
 				return nEvicted, err
 			}
 
-			kvs := v.([]fdb.KeyValue)
-
-			if len(kvs) != 0 {
-				next, err := fdb.Strinc(kvs[len(kvs)-1].Key)
-				if err != nil {
-					return nil, err
-				}
-				iterRange.Begin = fdb.Key(next)
-			} else {
-				break
+			if len(tup) < 1 {
+				return nEvicted, errors.New("corrupt mount key")
 			}
 
-			for _, kv := range kvs {
-				tup, err := tuple.Unpack(kv.Key)
-				if err != nil {
-					return nEvicted, err
-				}
+			clientId := tup[len(tup)-1].(string)
 
-				clientId := tup[len(tup)-1].(string)
-
-				// Check if this client has failed to update the heartbeat in the required time and
-				// invalidate it if it hasn't. We don't remove the client yet so we can remove the
-				// any locks the client still holds.
-				evicted, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-					var heartBeat uint64
-					heartBeatBytes := tx.Get(tuple.Tuple{"fs", "mount", clientId, "heartbeat"}).MustGet()
-					err := json.Unmarshal(heartBeatBytes, &heartBeat)
-					if err != nil {
-						return nil, err
-					}
-					lastSeen := time.Unix(heartBeat, 0)
-
-					evict := lastSeen.Add(expiryDelay).Before(time.Now())
-					return evict, nil
-				})
-				if err != nil {
-					return nEvicted, err
-				}
-
-				if !evict.(bool) {
-					continue
-				}
-
-				err = fs.EvictClient(clientId)
-				if err != nil {
-					return nEvicted, err
-				}
-
-				nEvicted += 1
+			shouldEvict, err := fs.IsClientTimedOut(clientId, clientTimeout)
+			if err != nil {
+				return nEvicted, err
 			}
+
+			if !shouldEvict {
+				continue
+			}
+
+			err = fs.EvictClient(clientId)
+			if err != nil {
+				return nEvicted, err
+			}
+
+			nEvicted += 1
 		}
+	}
+
+	return nEvicted, nil
 }
-*/
 
 type CollectGarbageOpts struct {
 	UnlinkedRemovalDelay time.Duration
@@ -1830,7 +1911,10 @@ func (fs *Fs) CollectGarbage(opts CollectGarbageOpts) (CollectGarbageStats, erro
 		return stats, err
 	}
 
-	// TODO client eviction in parallel with RemoveExpired
+	stats.ClientEvictionCount, err = fs.RemoveExpiredClients(opts.ClientTimeout)
+	if err != nil {
+		return stats, err
+	}
 
 	return stats, nil
 }
