@@ -722,7 +722,7 @@ func zeroExpandChunk(chunk *[]byte) {
 }
 
 func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) {
-	const MAX_WRITE = 128 * CHUNK_SIZE
+	const MAX_WRITE = 32 * CHUNK_SIZE
 
 	// FoundationDB has a transaction time limit and a transaction size limit,
 	// limit the write to something that can fit.
@@ -746,30 +746,27 @@ func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 			}
 			firstChunkKey := tuple.Tuple{"fs", "ino", f.ino, "data", firstChunkNo}
 			chunk := tx.Get(firstChunkKey).MustGet()
-			if chunk == nil {
-				chunk = make([]byte, CHUNK_SIZE, CHUNK_SIZE)
-			} else {
-				zeroExpandChunk(&chunk)
-			}
+			zeroExpandChunk(&chunk)
 			copy(chunk[firstChunkOffset:firstChunkOffset+firstWriteCount], remainingBuf)
 			currentOffset += firstWriteCount
 			remainingBuf = remainingBuf[firstWriteCount:]
 			tx.Set(firstChunkKey, zeroTrimChunk(chunk))
 		}
 
-		if len(remainingBuf) > 0 {
-			unalignedTrailingBytes := (currentOffset + uint64(len(remainingBuf))) % CHUNK_SIZE
-			if unalignedTrailingBytes != 0 {
-				// Do trailing unaligned bytes next write.
-				remainingBuf = remainingBuf[:uint64(len(remainingBuf))-unalignedTrailingBytes]
-			}
-		}
-
-		for len(remainingBuf) != 0 {
+		for {
 			key := tuple.Tuple{"fs", "ino", f.ino, "data", currentOffset / CHUNK_SIZE}
-			tx.Set(key, zeroTrimChunk(remainingBuf[:CHUNK_SIZE]))
-			currentOffset += CHUNK_SIZE
-			remainingBuf = remainingBuf[CHUNK_SIZE:]
+			if len(remainingBuf) >= CHUNK_SIZE {
+				tx.Set(key, zeroTrimChunk(remainingBuf[:CHUNK_SIZE]))
+				currentOffset += CHUNK_SIZE
+				remainingBuf = remainingBuf[CHUNK_SIZE:]
+			} else {
+				chunk := tx.Get(key).MustGet()
+				zeroExpandChunk(&chunk)
+				copy(chunk, remainingBuf)
+				tx.Set(key, zeroTrimChunk(chunk))
+				currentOffset += uint64(len(remainingBuf))
+				break
+			}
 		}
 
 		stat, err := futureStat.Get()
@@ -798,7 +795,7 @@ func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 }
 func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 
-	const MAX_READ = 128 * CHUNK_SIZE
+	const MAX_READ = 32 * CHUNK_SIZE
 
 	if len(buf) > MAX_READ {
 		buf = buf[:MAX_READ]
@@ -851,14 +848,6 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 			currentOffset += firstReadCount
 		}
 
-		if len(remainingBuf) > 0 {
-			unalignedTrailingBytes := (currentOffset + uint64(len(remainingBuf))) % CHUNK_SIZE
-			if unalignedTrailingBytes != 0 {
-				// Do trailing unaligned bytes next read.
-				remainingBuf = remainingBuf[:uint64(len(remainingBuf))-unalignedTrailingBytes]
-			}
-		}
-
 		nChunks := uint64(len(remainingBuf)) / CHUNK_SIZE
 		chunkFutures := make([]fdb.FutureByteSlice, 0, nChunks)
 
@@ -881,6 +870,20 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 			}
 			remainingBuf = remainingBuf[CHUNK_SIZE:]
 			currentOffset += CHUNK_SIZE
+		}
+
+		if len(remainingBuf) > 0 {
+			lastChunkKey := tuple.Tuple{"fs", "ino", f.ino, "data", currentOffset / CHUNK_SIZE}
+			chunk := tx.Get(lastChunkKey).MustGet()
+			if chunk != nil {
+				zeroExpandChunk(&chunk)
+				copy(remainingBuf, chunk)
+			} else {
+				for i := 0; i < len(remainingBuf); i += 1 {
+					remainingBuf[i] = 0
+				}
+			}
+			currentOffset += uint64(len(remainingBuf))
 		}
 
 		nRead := currentOffset - offset

@@ -216,7 +216,6 @@ func (fs *FuseFs) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fus
 
 	nTotal := uint32(0)
 	for nTotal != uint32(len(buf)) {
-		// XXX is this implemented ReaderAt we wouldn't need to loop.
 		n, err := f.ReadData(buf[nTotal:], uint64(in.Offset)+uint64(nTotal))
 		nTotal += n
 		if err == io.EOF {
@@ -237,7 +236,6 @@ func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (u
 
 	nTotal := uint32(0)
 	for nTotal != uint32(len(buf)) {
-		// XXX is this implemented WriterAt we wouldn't need to loop.
 		n, err := f.WriteData(buf[nTotal:], uint64(in.Offset)+uint64(nTotal))
 		nTotal += uint32(n)
 		if err != nil {
