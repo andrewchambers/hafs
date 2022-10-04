@@ -849,6 +849,9 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 		}
 
 		nChunks := uint64(len(remainingBuf)) / CHUNK_SIZE
+		if (len(remainingBuf) % CHUNK_SIZE) != 0 {
+			nChunks += 1
+		}
 		chunkFutures := make([]fdb.FutureByteSlice, 0, nChunks)
 
 		// Read all chunks in parallel using futures.
@@ -859,31 +862,10 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 
 		for i := uint64(0); i < nChunks; i++ {
 			chunk := chunkFutures[i].MustGet()
-			if chunk != nil {
-				zeroExpandChunk(&chunk)
-				copy(remainingBuf[:CHUNK_SIZE], chunk)
-			} else {
-				// Sparse read.
-				for i := 0; i < CHUNK_SIZE; i++ {
-					remainingBuf[i] = 0
-				}
-			}
-			remainingBuf = remainingBuf[CHUNK_SIZE:]
-			currentOffset += CHUNK_SIZE
-		}
-
-		if len(remainingBuf) > 0 {
-			lastChunkKey := tuple.Tuple{"fs", "ino", f.ino, "data", currentOffset / CHUNK_SIZE}
-			chunk := tx.Get(lastChunkKey).MustGet()
-			if chunk != nil {
-				zeroExpandChunk(&chunk)
-				copy(remainingBuf, chunk)
-			} else {
-				for i := 0; i < len(remainingBuf); i += 1 {
-					remainingBuf[i] = 0
-				}
-			}
-			currentOffset += uint64(len(remainingBuf))
+			zeroExpandChunk(&chunk)
+			n := copy(remainingBuf, chunk)
+			currentOffset += uint64(n)
+			remainingBuf = remainingBuf[n:]
 		}
 
 		nRead := currentOffset - offset
