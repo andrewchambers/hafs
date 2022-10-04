@@ -1176,3 +1176,99 @@ func TestEvictClient(t *testing.T) {
 	}
 
 }
+
+func TestHardLink(t *testing.T) {
+	fs := tmpFs(t)
+
+	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foo2Stat, err := fs.HardLink(ROOT_INO, foo1Stat.Ino, "foo2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if foo2Stat.Nlink != 2 {
+		t.Fatal(err)
+	}
+
+	foo1Stat, err = fs.Lookup(ROOT_INO, "foo1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foo1Stat.Nlink != 2 {
+		t.Fatal(err)
+	}
+
+	foo1Stat, err = fs.Lookup(ROOT_INO, "foo1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foo1Stat.Nlink != 2 {
+		t.Fatal(err)
+	}
+
+	if foo1Stat.Ino != foo2Stat.Ino {
+		t.Fatal("inos differ")
+	}
+
+	err = fs.Unlink(ROOT_INO, "foo2")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	foo1Stat, err = fs.Lookup(ROOT_INO, "foo1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if foo1Stat.Nlink != 1 {
+		t.Fatal(err)
+	}
+
+	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nRemoved != 0 {
+		t.Fatal("unexpected remove count")
+	}
+
+	err = fs.Unlink(ROOT_INO, "foo1")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nRemoved, err = fs.RemoveExpiredUnlinked(time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nRemoved != 1 {
+		t.Fatal("unexpected remove count")
+	}
+
+}
+
+func TestHardLinkDirFails(t *testing.T) {
+	fs := tmpFs(t)
+
+	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.HardLink(ROOT_INO, foo1Stat.Ino, "foo2")
+	if err != ErrPermission {
+		t.Fatal(err)
+	}
+
+}

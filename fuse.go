@@ -231,6 +231,13 @@ func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (u
 	return n, fuse.OK
 }
 
+func (fs *FuseFs) Lseek(cancel <-chan struct{}, in *fuse.LseekIn, out *fuse.LseekOut) fuse.Status {
+	// XXX We do support sparse files, so this could be implemented.
+	// It's worth noting that it seems like fuse only uses Lseek for SEEK_DATA and SEEK_HOLE but
+	// we could be wrong on that.
+	return fuse.ENOSYS
+}
+
 func (fs *FuseFs) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
 	fs.lock.Lock()
 	f := fs.fh2OpenFile[in.Fh].f
@@ -283,6 +290,15 @@ func (fs *FuseFs) Unlink(cancel <-chan struct{}, in *fuse.InHeader, name string)
 func (fs *FuseFs) Rmdir(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
 	err := fs.fs.Unlink(in.NodeId, name)
 	return errToFuseStatus(err)
+}
+
+func (fs *FuseFs) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
+	stat, err := fs.fs.HardLink(in.NodeId, in.Oldnodeid, name)
+	if err != nil {
+		return errToFuseStatus(err)
+	}
+	fillFuseEntryOutFromStat(&stat, out)
+	return fuse.OK
 }
 
 func (fs *FuseFs) Symlink(cancel <-chan struct{}, in *fuse.InHeader, pointedTo string, linkName string, out *fuse.EntryOut) fuse.Status {

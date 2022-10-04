@@ -538,6 +538,69 @@ func (fs *Fs) Mknod(dirIno uint64, name string, opts MknodOpts) (Stat, error) {
 	return stat.(Stat), nil
 }
 
+func (fs *Fs) HardLink(dirIno, ino uint64, name string) (Stat, error) {
+	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+		dirStatFut := fs.txGetStat(tx, dirIno)
+		dirEntFut := fs.txGetDirEnt(tx, dirIno, name)
+		statFut := fs.txGetStat(tx, ino)
+
+		dirStat, err := dirStatFut.Get()
+		if err != nil {
+			return Stat{}, err
+		}
+		if dirStat.Mode&S_IFMT != S_IFDIR {
+			return Stat{}, ErrNotDir
+		}
+
+		stat, err := statFut.Get()
+		if err != nil {
+			return Stat{}, err
+		}
+		// Can't hardlink directories.
+		if stat.Mode&S_IFMT == S_IFDIR {
+			return Stat{}, ErrPermission
+		}
+		if stat.Nlink == 0 {
+			// Don't resurrect inodes.
+			return Stat{}, ErrInvalid
+		}
+
+		_, err = dirEntFut.Get()
+		if err == nil {
+			return Stat{}, ErrExist
+		}
+		if err != ErrNotExist {
+			return Stat{}, err
+		}
+
+		now := time.Now()
+
+		stat.SetAtime(now)
+		stat.SetCtime(now)
+		stat.Nlink += 1
+		fs.txSetStat(tx, stat)
+
+		fs.txSetDirEnt(tx, dirIno, DirEnt{
+			Name: name,
+			Mode: stat.Mode & S_IFMT,
+			Ino:  stat.Ino,
+		})
+
+		if dirStat.Mtime().Before(now.Add(-fs.dirRelMtimeDuration)) {
+			dirStat.SetMtime(now)
+			dirStat.SetAtime(now)
+			fs.txSetStat(tx, dirStat)
+		}
+
+		return stat, nil
+	})
+	if err != nil {
+		return Stat{}, err
+	}
+	return stat.(Stat), nil
+}
+
 func (fs *Fs) Unlink(dirIno uint64, name string) error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		dirStatFut := fs.txGetStat(tx, dirIno)
