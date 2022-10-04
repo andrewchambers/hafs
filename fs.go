@@ -548,6 +548,11 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		if err != nil {
 			return nil, err
 		}
+		// With client side inode caching we could unlink an already unreachable
+		// file, prevent that.
+		if stat.Nlink == 0 {
+			return nil, ErrNotExist
+		}
 
 		dirStat, err := dirStatFut.Get()
 		if err != nil {
