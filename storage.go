@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	"net/url"
 	"os"
 	"strings"
@@ -12,6 +13,8 @@ import (
 	"github.com/minio/minio-go/v7"
 	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
 )
+
+// TODO make a storage interface.
 
 // This cache only grows which is a good use for sync.Map - it doesn't seem like it will
 // ever be a practical problem that the cache never shrinks.
@@ -137,6 +140,7 @@ func storageOpen(storage string, inode uint64) (readerAtCloser, error) {
 }
 
 func storageWrite(storage string, inode uint64, data *os.File) (int64, error) {
+
 	if strings.HasPrefix(storage, "s3://") {
 		storage, err := getS3Client(storage)
 		if err != nil {
@@ -177,4 +181,39 @@ func storageWrite(storage string, inode uint64, data *os.File) (int64, error) {
 	}
 
 	return 0, fmt.Errorf("unknown storage scheme: %s", storage)
+}
+
+func storageRemove(storage string, inode uint64) error {
+	if strings.HasPrefix(storage, "s3://") {
+		storage, err := getS3Client(storage)
+		if err != nil {
+			return err
+		}
+		err = storage.client.RemoveObject(
+			context.Background(),
+			storage.url.Hostname(),
+			fmt.Sprintf("%s/%d", storage.url.Path, inode),
+			minio.RemoveObjectOptions{},
+		)
+		if err != nil {
+			if minio.ToErrorResponse(err).StatusCode == 404 {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+
+	if strings.HasPrefix(storage, "file://") {
+		err := os.Remove(fmt.Sprintf("%s/%d", storage[7:], inode))
+		if err != nil {
+			if err == iofs.ErrNotExist {
+				return nil
+			}
+			return err
+		}
+		return nil
+	}
+
+	return fmt.Errorf("unknown storage scheme: %s", storage)
 }

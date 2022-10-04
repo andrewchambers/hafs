@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	iofs "io/fs"
 	mathrand "math/rand"
 	"os"
 	"testing"
@@ -192,6 +193,61 @@ func TestUnlink(t *testing.T) {
 	if nRemoved != 0 {
 		t.Fatal("nothing to be removed")
 	}
+}
+
+func TestUnlinkExternalStorage(t *testing.T) {
+	fs := tmpFs(t)
+
+	storageDir := t.TempDir()
+
+	err := fs.SetXAttr(ROOT_INO, "hafs.storage", []byte("file://"+storageDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, stat, err := fs.CreateFile(ROOT_INO, "f", CreateFileOpts{
+		Mode: 0o777,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+
+	_, err = f.WriteData([]byte{1}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f.Fsync()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	inodeDataPath := fmt.Sprintf("%s/%d", storageDir, stat.Ino)
+	_, err = os.Stat(inodeDataPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.Unlink(ROOT_INO, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if nRemoved != 1 {
+		t.Fatal("expected file to be removed")
+	}
+
+	_, err = os.Stat(inodeDataPath)
+	if !errors.Is(err, iofs.ErrNotExist) {
+		t.Fatal(err)
+	}
+
 }
 
 func TestRenameSameDir(t *testing.T) {

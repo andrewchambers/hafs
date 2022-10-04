@@ -39,8 +39,9 @@ func main() {
 		err := fs.Close()
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error disconnecting client: %s\n", err)
+			os.Exit(1)
 		}
-		os.Exit(1)
+		os.Exit(0)
 	}()
 
 	server, err := fuse.NewServer(

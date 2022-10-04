@@ -12,10 +12,12 @@ import (
 	"log"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
 
@@ -548,11 +550,6 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		if err != nil {
 			return nil, err
 		}
-		// With client side inode caching we could unlink an already unreachable
-		// file, prevent that.
-		if stat.Nlink == 0 {
-			return nil, ErrNotExist
-		}
 
 		dirStat, err := dirStatFut.Get()
 		if err != nil {
@@ -847,6 +844,7 @@ func (f *externalStoreReadWriteFile) ReadData(buf []byte, offset uint64) (uint32
 }
 
 func (f *externalStoreReadWriteFile) Fsync() error {
+
 	dirty := f.dirty.Load()
 	if !dirty {
 		return nil
@@ -1150,6 +1148,15 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 
 		if stat.Size == 0 {
 			tx.ClearRange(tuple.Tuple{"fs", "ino", ino, "data"})
+			/*
+				if stat.Storage != "" {
+					// XXX We have no way to reclaim the space for this object.
+					// leaving it is relatively harmless as it will likely be overwritten.
+					//
+					// A good solution would be to add a generation count to object data and
+					// queue the deletion of the old generation in this transaction.
+				}
+			*/
 		} else {
 			if stat.Storage != "" {
 				return Stat{}, ErrNotSupported
@@ -1639,67 +1646,111 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 	}
 
 	nRemoved := uint64(0)
-	done := false
 
-	for !done {
+	errg, _ := errgroup.WithContext(context.Background())
+	errg.SetLimit(128)
 
-		nRemovedThisBatch := uint64(0)
-		nextIterBegin := fdb.Key([]byte{})
+	for {
 
-		_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-
-			// Reset for retries.
-			nRemovedThisBatch = 0
-			done = false
-
+		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
-				Limit:   128,
-				Mode:    fdb.StreamingModeIterator, // XXX do we want StreamingModeWantAll ?
-				Reverse: false,
+				Limit: 128,
 			}).GetSliceOrPanic()
-
-			if len(kvs) != 0 {
-				next, err := fdb.Strinc(kvs[len(kvs)-1].Key)
-				if err != nil {
-					return nil, err
-				}
-				nextIterBegin = fdb.Key(next)
-			} else {
-				done = true
-			}
-
-			futureStats := make([]futureStat, 0, len(kvs))
-			for _, kv := range kvs {
-				keyTuple, err := tuple.Unpack(kv.Key)
-				if err != nil {
-					return nil, err
-				}
-				ino := uint64(keyTuple[len(keyTuple)-1].(int64))
-				futureStats = append(futureStats, fs.txGetStat(tx, ino))
-			}
-
-			now := time.Now()
-			for _, futureStat := range futureStats {
-				stat, err := futureStat.Get()
-				if err != nil {
-					return nil, err
-				}
-				if now.After(stat.Ctime().Add(removalDelay)) {
-					tx.Clear(tuple.Tuple{"fs", "unlinked", stat.Ino})
-					tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino})
-					nRemovedThisBatch += 1
-				}
-			}
-
-			return nil, nil
-
+			return kvs, nil
 		})
 		if err != nil {
 			return nRemoved, err
 		}
 
-		iterRange.Begin = nextIterBegin
-		nRemoved += nRemovedThisBatch
+		kvs := v.([]fdb.KeyValue)
+
+		if len(kvs) == 0 {
+			break
+		}
+
+		nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+		if err != nil {
+			return nRemoved, err
+		}
+		iterRange.Begin = fdb.Key(nextBegin)
+
+		errg.Go(func() error {
+
+			v, err = fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+
+				futureStats := make([]futureStat, 0, len(kvs))
+				for _, kv := range kvs {
+					keyTuple, err := tuple.Unpack(kv.Key)
+					if err != nil {
+						return nil, err
+					}
+					ino := uint64(keyTuple[len(keyTuple)-1].(int64))
+					futureStats = append(futureStats, fs.txGetStat(tx, ino))
+				}
+
+				expiredStats := []Stat{}
+
+				now := time.Now()
+				for _, futureStat := range futureStats {
+					stat, err := futureStat.Get()
+					if err != nil {
+						return nil, err
+					}
+					if err == ErrNotExist {
+						continue
+					}
+					if now.After(stat.Ctime().Add(removalDelay)) {
+
+					}
+					expiredStats = append(expiredStats, stat)
+				}
+
+				return expiredStats, nil
+			})
+			if err != nil {
+				return err
+			}
+
+			expiredStats := v.([]Stat)
+
+			if len(expiredStats) == 0 {
+				return nil
+			}
+
+			for _, stat := range expiredStats {
+				if stat.Mode&S_IFMT != S_IFREG {
+					continue
+				}
+
+				if stat.Storage != "" {
+					err := storageRemove(stat.Storage, stat.Ino)
+					if err != nil {
+						return err
+					}
+				}
+			}
+
+			_, err = fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+				for _, stat := range expiredStats {
+					tx.Clear(tuple.Tuple{"fs", "unlinked", stat.Ino})
+					tx.ClearRange(tuple.Tuple{"fs", "ino", stat.Ino})
+				}
+				return nil, nil
+			})
+			if err != nil {
+				return err
+			}
+
+			atomic.AddUint64(&nRemoved, uint64(len(expiredStats)))
+			return nil
+
+		})
+
+	}
+
+	err := errg.Wait()
+	if err != nil {
+		return nRemoved, err
 	}
 
 	return nRemoved, nil
