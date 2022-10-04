@@ -173,6 +173,64 @@ func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 	return err
 }
 
+func ListFilesystems(db fdb.Database) ([]string, error) {
+
+	filesystems := []string{}
+
+	iterBegin, iterEnd := tuple.Tuple{"hafs"}.FDBRangeKeys()
+	iterRange := fdb.KeyRange{
+		Begin: iterBegin,
+		End:   iterEnd,
+	}
+
+	v, err := db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		kvs := tx.GetRange(iterRange, fdb.RangeOptions{
+			Limit: 1,
+		}).GetSliceOrPanic()
+		return kvs, nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	kvs := v.([]fdb.KeyValue)
+	if len(kvs) == 0 {
+		return filesystems, nil
+	}
+
+	curFsTup, err := tuple.Unpack(kvs[0].Key)
+	if err != nil {
+		return nil, err
+	}
+
+	filesystems = append(filesystems, curFsTup[1].(string))
+
+	for {
+		_, iterRange.Begin = curFsTup[:2].FDBRangeKeys()
+
+		v, err := db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
+				Limit: 1,
+			}).GetSliceOrPanic()
+			return kvs, nil
+		})
+		if err != nil {
+			return nil, err
+		}
+		kvs := v.([]fdb.KeyValue)
+		if len(kvs) == 0 {
+			return filesystems, nil
+		}
+
+		curFsTup, err = tuple.Unpack(kvs[0].Key)
+		if err != nil {
+			return nil, err
+		}
+
+		filesystems = append(filesystems, curFsTup[1].(string))
+	}
+
+}
+
 type AttachOpts struct {
 	ClientDescription string
 	OnEviction        func(fs *Fs)

@@ -8,6 +8,7 @@ import (
 	iofs "io/fs"
 	mathrand "math/rand"
 	"os"
+	"reflect"
 	"testing"
 	"time"
 
@@ -1295,4 +1296,25 @@ func TestClientInfo(t *testing.T) {
 	if len(clients) != 1 {
 		t.Fatal("unexpected number of clients")
 	}
+}
+
+func TestListFilesystems(t *testing.T) {
+	db := tmpDB(t)
+
+	for _, name := range []string{"myfs", "zzz"} {
+		err := Mkfs(db, name, MkfsOpts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	filesystems, err := ListFilesystems(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !reflect.DeepEqual(filesystems, []string{"myfs", "testfs", "zzz"}) {
+		t.Fatalf("unexpected filesystem list")
+	}
+
 }
