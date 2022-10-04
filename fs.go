@@ -820,10 +820,10 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 		// Don't read past the end of the file.
 		if stat.Size < currentOffset+uint64(len(remainingBuf)) {
 			overshoot := (currentOffset + uint64(len(remainingBuf))) - stat.Size
-			remainingBuf = remainingBuf[:uint64(len(remainingBuf))-overshoot]
-			if len(remainingBuf) == 0 {
+			if overshoot >= uint64(len(remainingBuf)) {
 				return 0, io.EOF
 			}
+			remainingBuf = remainingBuf[:uint64(len(remainingBuf))-overshoot]
 		}
 
 		// Deal with the first unaligned and undersized chunk.

@@ -213,22 +213,39 @@ func (fs *FuseFs) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fus
 	fs.lock.Lock()
 	f := fs.fh2OpenFile[in.Fh].f
 	fs.lock.Unlock()
-	n, err := f.ReadData(buf, uint64(in.Offset))
-	if err != nil && err != io.EOF {
-		return nil, errToFuseStatus(err)
+
+	nTotal := uint32(0)
+	for nTotal != uint32(len(buf)) {
+		// XXX is this implemented ReaderAt we wouldn't need to loop.
+		n, err := f.ReadData(buf[nTotal:], uint64(in.Offset)+uint64(nTotal))
+		nTotal += n
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, errToFuseStatus(err)
+		}
 	}
-	return fuse.ReadResultData(buf[:n]), fuse.OK
+
+	return fuse.ReadResultData(buf[:nTotal]), fuse.OK
 }
 
 func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (uint32, fuse.Status) {
 	fs.lock.Lock()
 	f := fs.fh2OpenFile[in.Fh].f
 	fs.lock.Unlock()
-	n, err := f.WriteData(buf, uint64(in.Offset))
-	if err != nil {
-		return n, errToFuseStatus(err)
+
+	nTotal := uint32(0)
+	for nTotal != uint32(len(buf)) {
+		// XXX is this implemented WriterAt we wouldn't need to loop.
+		n, err := f.WriteData(buf[nTotal:], uint64(in.Offset)+uint64(nTotal))
+		nTotal += uint32(n)
+		if err != nil {
+			return nTotal, errToFuseStatus(err)
+		}
 	}
-	return n, fuse.OK
+
+	return nTotal, fuse.OK
 }
 
 func (fs *FuseFs) Lseek(cancel <-chan struct{}, in *fuse.LseekIn, out *fuse.LseekOut) fuse.Status {
