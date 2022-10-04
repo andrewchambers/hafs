@@ -110,7 +110,7 @@ func (stat *Stat) Ctime() time.Time {
 type Fs struct {
 	db                  fdb.Database
 	fsName              string
-	mountId             string
+	clientId            string
 	onEviction          func(fs *Fs)
 	clientDetached      atomicBool
 	txCounter           atomicUint64
@@ -200,7 +200,7 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	if err != nil {
 		return nil, err
 	}
-	mountId := hex.EncodeToString(idBytes[:])
+	clientId := hex.EncodeToString(idBytes[:])
 
 	now := time.Now()
 
@@ -231,12 +231,12 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 			return nil, fmt.Errorf("filesystem has different version - expected %d but got %d", CURRENT_SCHEMA_VERSION, version[0])
 		}
 
-		tx.Set(tuple.Tuple{"hafs", fsName, "mount", mountId, "info"}, clientInfoBytes)
-		tx.Set(tuple.Tuple{"hafs", fsName, "mount", mountId, "heartbeat"}, initialHeartBeatBytes)
+		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "info"}, clientInfoBytes)
+		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "heartbeat"}, initialHeartBeatBytes)
 		for i := 0; i < _NATTACH_SHARDS; i++ {
-			tx.Set(tuple.Tuple{"hafs", fsName, "mount", mountId, "attached", i}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "attached", i}, []byte{})
 		}
-		tx.Set(tuple.Tuple{"hafs", fsName, "mounts", mountId}, []byte{})
+		tx.Set(tuple.Tuple{"hafs", fsName, "clients", clientId}, []byte{})
 		return nil, nil
 	})
 	if err != nil {
@@ -250,7 +250,7 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 		fsName:              fsName,
 		onEviction:          opts.OnEviction,
 		dirRelMtimeDuration: 24 * time.Hour,
-		mountId:             mountId,
+		clientId:            clientId,
 		cancelWorkers:       cancelWorkers,
 		workerWg:            &sync.WaitGroup{},
 		inoChan:             make(chan uint64, _INO_CHAN_SIZE),
@@ -342,7 +342,7 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 
 func (fs *Fs) mountHeartBeat() error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		heartBeatKey := tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "heartbeat"}
+		heartBeatKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "heartbeat"}
 		lastSeen, err := json.Marshal(time.Now().Unix())
 		if err != nil {
 			return nil, err
@@ -379,12 +379,12 @@ func (fs *Fs) Close() error {
 	fs.cancelWorkers()
 	fs.workerWg.Wait()
 
-	err := fs.EvictClient(fs.mountId)
+	err := fs.EvictClient(fs.clientId)
 	return err
 }
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
-	attachKey := tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
+	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
 	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
@@ -396,7 +396,7 @@ func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) 
 }
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
-	attachKey := tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
+	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
 	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
@@ -1631,7 +1631,7 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 					return false, err
 				}
 				// The lock isn't owned by this client.
-				if exclusiveLock.ClientId != fs.mountId {
+				if exclusiveLock.ClientId != fs.clientId {
 					return false, nil
 				}
 				// The request isn't for this owner.
@@ -1640,18 +1640,18 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 				}
 				tx.Clear(exclusiveLockKey)
 			} else {
-				sharedLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", fs.mountId, opts.Owner}
+				sharedLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", fs.clientId, opts.Owner}
 				tx.Clear(sharedLockKey)
 			}
-			tx.Clear(tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "lock", ino, opts.Owner})
+			tx.Clear(tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "lock", ino, opts.Owner})
 			return true, nil
 		case LOCK_SHARED:
 			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
 			if exclusiveLockBytes != nil {
 				return false, nil
 			}
-			tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", fs.mountId, opts.Owner}, []byte{})
-			tx.Set(tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", fs.clientId, opts.Owner}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "lock", ino, opts.Owner}, []byte{})
 			return true, nil
 		case LOCK_EXCLUSIVE:
 			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
@@ -1665,14 +1665,14 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 				return false, nil
 			}
 			exclusiveLockBytes, err := json.Marshal(exclusiveLockRecord{
-				ClientId: fs.mountId,
+				ClientId: fs.clientId,
 				Owner:    opts.Owner,
 			})
 			if err != nil {
 				return false, err
 			}
 			tx.Set(exclusiveLockKey, exclusiveLockBytes)
-			tx.Set(tuple.Tuple{"hafs", fs.fsName, "mount", fs.mountId, "lock", ino, opts.Owner}, []byte{})
+			tx.Set(tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "lock", ino, opts.Owner}, []byte{})
 			return true, nil
 		default:
 			panic("api misuse")
@@ -1859,14 +1859,14 @@ func (fs *Fs) txBreakLock(tx fdb.Transaction, clientId string, ino uint64, owner
 		if err != nil {
 			return err
 		}
-		if exclusiveLock.ClientId == fs.mountId && exclusiveLock.Owner == owner {
+		if exclusiveLock.ClientId == fs.clientId && exclusiveLock.Owner == owner {
 			tx.Clear(exclusiveLockKey)
 		}
 	} else {
 		sharedLockKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "lock", "shared", clientId, owner}
 		tx.Clear(sharedLockKey)
 	}
-	tx.Clear(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "lock", ino, owner})
+	tx.Clear(tuple.Tuple{"hafs", fs.fsName, "client", clientId, "lock", ino, owner})
 	return nil
 }
 
@@ -1874,7 +1874,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 
 	_, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		// Invalidate all the clients in progress transactions.
-		tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "attached"})
+		tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "client", clientId, "attached"})
 		return nil, nil
 	})
 	if err != nil {
@@ -1882,7 +1882,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 	}
 
 	// Remove all file locks held by the client.
-	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "lock"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "client", clientId, "lock"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
 		Begin: iterBegin,
@@ -1940,8 +1940,8 @@ func (fs *Fs) EvictClient(clientId string) error {
 
 	// Finally we can remove the client.
 	_, err = fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		tx.Clear(tuple.Tuple{"hafs", fs.fsName, "mounts", clientId})
-		tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "mount", clientId})
+		tx.Clear(tuple.Tuple{"hafs", fs.fsName, "clients", clientId})
+		tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "client", clientId})
 		return nil, nil
 	})
 	if err != nil {
@@ -1954,7 +1954,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bool, error) {
 	timedOut, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		var heartBeat uint64
-		heatBeatKey := tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "heartbeat"}
+		heatBeatKey := tuple.Tuple{"hafs", fs.fsName, "client", clientId, "heartbeat"}
 		heartBeatBytes := tx.Get(heatBeatKey).MustGet()
 		if heartBeatBytes == nil {
 			return true, nil
@@ -1979,7 +1979,7 @@ func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) 
 
 	nEvicted := uint64(0)
 
-	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "mounts"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "clients"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
 		Begin: iterBegin,
@@ -2090,7 +2090,7 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 		info = ClientInfo{}
 		ok = false
 
-		infoBytes := tx.Get(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "info"}).MustGet()
+		infoBytes := tx.Get(tuple.Tuple{"hafs", fs.fsName, "client", clientId, "info"}).MustGet()
 		if infoBytes == nil {
 			return nil, nil
 		}
@@ -2100,7 +2100,7 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 			return nil, err
 		}
 
-		heartBeatBytes := tx.Get(tuple.Tuple{"hafs", fs.fsName, "mount", clientId, "heartbeat"}).MustGet()
+		heartBeatBytes := tx.Get(tuple.Tuple{"hafs", fs.fsName, "client", clientId, "heartbeat"}).MustGet()
 		err = json.Unmarshal(heartBeatBytes, &info.HeartBeatUnix)
 		if err != nil {
 			return nil, err
@@ -2119,7 +2119,7 @@ func (fs *Fs) ListClients() ([]ClientInfo, error) {
 
 	clients := []ClientInfo{}
 
-	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "mounts"}.FDBRangeKeys()
+	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "clients"}.FDBRangeKeys()
 
 	iterRange := fdb.KeyRange{
 		Begin: iterBegin,

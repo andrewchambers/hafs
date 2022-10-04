@@ -1093,7 +1093,7 @@ func TestHardLinkDirFails(t *testing.T) {
 func TestClientTimedOut(t *testing.T) {
 	fs := tmpFs(t)
 
-	expired, err := fs.IsClientTimedOut(fs.mountId, time.Duration(5*time.Second))
+	expired, err := fs.IsClientTimedOut(fs.clientId, time.Duration(5*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1103,7 +1103,7 @@ func TestClientTimedOut(t *testing.T) {
 
 	time.Sleep(1 * time.Second)
 
-	expired, err = fs.IsClientTimedOut(fs.mountId, time.Duration(0))
+	expired, err = fs.IsClientTimedOut(fs.clientId, time.Duration(0))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1241,7 +1241,7 @@ func TestEvictClient(t *testing.T) {
 		t.Fatal()
 	}
 
-	err = fs2.EvictClient(fs1.mountId)
+	err = fs2.EvictClient(fs1.clientId)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1262,7 +1262,7 @@ func TestEvictClient(t *testing.T) {
 		Uid:  0,
 		Gid:  0,
 	})
-	if err != ErrUnmounted {
+	if err != ErrDetached {
 		t.Fatal(err)
 	}
 
@@ -1276,7 +1276,7 @@ func TestClientInfo(t *testing.T) {
 	}
 	defer fs.Close()
 
-	info, ok, err := fs.ClientInfo(fs.mountId)
+	info, ok, err := fs.ClientInfo(fs.clientId)
 	if err != nil {
 		t.Fatal(err)
 	}
