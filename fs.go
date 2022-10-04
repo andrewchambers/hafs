@@ -1802,7 +1802,7 @@ func (fs *Fs) EvictClient(clientId string) error {
 }
 
 func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bool, error) {
-	timedOut, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+	timedOut, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		var heartBeat uint64
 		heatBeatKey := tuple.Tuple{"fs", "mount", clientId, "heartbeat"}
 		heartBeatBytes := tx.Get(heatBeatKey).MustGet()
@@ -1837,7 +1837,7 @@ func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) 
 	}
 
 	for {
-		v, err := fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
 				Limit: 100,
 			}).GetSliceOrPanic()
