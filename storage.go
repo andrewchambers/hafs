@@ -201,7 +201,11 @@ func newStorageEngine(storage string) (storageEngine, error) {
 			isSecure = secureParam[0] != "false"
 		}
 
-		endpoint := fmt.Sprintf("%s:%s", u.Hostname(), u.Port())
+		endpoint := u.Hostname()
+		if u.Port() != "" {
+			endpoint = endpoint + ":" + u.Port()
+		}
+
 		client, err := minio.New(endpoint, &minio.Options{
 			Creds:  creds,
 			Secure: isSecure,
@@ -217,7 +221,7 @@ func newStorageEngine(storage string) (storageEngine, error) {
 		}, nil
 	}
 
-	return nil, errors.New("invalid storage specification")
+	return nil, errors.New("unknown/invalid storage specification")
 }
 
 // This cache only ever grows - which is a good use for sync.Map.

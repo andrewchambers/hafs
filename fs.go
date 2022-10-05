@@ -1595,7 +1595,8 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 			stat.Storage = string(data)
 			err := storageValidate(stat.Storage)
 			if err != nil {
-				// XXX TODO log.
+				// XXX TODO log to a better place.
+				log.Printf("unable to validate storage specification: %s", err)
 				return nil, ErrInvalid
 			}
 			fs.txSetStat(tx, stat)
