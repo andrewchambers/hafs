@@ -1593,6 +1593,11 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 				return nil, ErrInvalid
 			}
 			stat.Storage = string(data)
+			err := storageValidate(stat.Storage)
+			if err != nil {
+				// XXX TODO log.
+				return nil, ErrInvalid
+			}
 			fs.txSetStat(tx, stat)
 		default:
 		}

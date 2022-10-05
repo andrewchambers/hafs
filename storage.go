@@ -2,6 +2,7 @@ package hafs
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	iofs "io/fs"
@@ -14,65 +15,64 @@ import (
 	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-// TODO make a storage interface.
-
-// This cache only grows which is a good use for sync.Map - it doesn't seem like it will
-// ever be a practical problem that the cache never shrinks.
-var s3StorageCache sync.Map
-
-type cachedS3Storage struct {
-	url    *url.URL
-	client *minio.Client
+type readerAtCloser interface {
+	io.ReaderAt
+	io.Closer
 }
 
-func getS3Client(storage string) (*cachedS3Storage, error) {
-	cached, ok := s3StorageCache.Load(storage)
-	if !ok {
-		var creds *miniocredentials.Credentials
+type storageEngine interface {
+	Open(inode uint64) (readerAtCloser, error)
+	Write(inode uint64, data *os.File) (int64, error)
+	Remove(inode uint64) error
+	Validate() error
+	Close() error
+}
 
-		u, err := url.Parse(storage)
-		if err != nil {
-			return nil, err
-		}
+type fileStorageEngine struct {
+	path string
+}
 
-		q := u.Query()
+func (s *fileStorageEngine) Open(inode uint64) (readerAtCloser, error) {
+	f, err := os.Open(fmt.Sprintf("%s/%d", s.path, inode))
+	return f, err
+}
 
-		if u.User != nil {
-			accessKeyID := u.User.Username()
-			secretAccessKey, _ := u.User.Password()
-			creds = miniocredentials.NewStaticV4(accessKeyID, secretAccessKey, "")
-		} else {
-			creds = miniocredentials.NewEnvAWS()
-		}
-
-		endpoint, ok := q["endpoint"]
-		if !ok {
-			return nil, fmt.Errorf("s3 storage url %q must contain an endpoint parameter", u.Redacted())
-		}
-
-		isSecure := true
-		secureParam, ok := q["secure"]
-		if ok {
-			isSecure = secureParam[0] != "false"
-		}
-
-		client, err := minio.New(endpoint[0], &minio.Options{
-			Creds:  creds,
-			Secure: isSecure,
-		})
-
-		if err != nil {
-			return nil, err
-		}
-
-		newCached := &cachedS3Storage{
-			url:    u,
-			client: client,
-		}
-		s3StorageCache.Store(storage, newCached)
-		cached = newCached
+func (s *fileStorageEngine) Write(inode uint64, data *os.File) (int64, error) {
+	f, err := os.Create(fmt.Sprintf("%s/%d", s.path, inode))
+	if err != nil {
+		return 0, err
 	}
-	return cached.(*cachedS3Storage), nil
+	defer f.Close()
+	n, err := io.Copy(f, data)
+	if err != nil {
+		return n, err
+	}
+	return n, f.Sync()
+}
+
+func (s *fileStorageEngine) Remove(inode uint64) error {
+	err := os.Remove(fmt.Sprintf("%s/%d", s.path, inode))
+	if err != nil {
+		if err == iofs.ErrNotExist {
+			return nil
+		}
+		return err
+	}
+	return nil
+}
+
+func (s *fileStorageEngine) Validate() error {
+	return nil
+}
+
+func (s *fileStorageEngine) Close() error {
+	return nil
+}
+
+type s3StorageEngine struct {
+	path   string
+	bucket string
+	client *minio.Client
 }
 
 // Wrapper around a minio object that implements ReaderAt in a nicer way than
@@ -104,116 +104,169 @@ func (r *s3Reader) Close() error {
 	return r.obj.Close()
 }
 
-type readerAtCloser interface {
-	io.ReaderAt
-	io.Closer
+func (s *s3StorageEngine) Open(inode uint64) (readerAtCloser, error) {
+	obj, err := s.client.GetObject(
+		context.Background(),
+		s.bucket,
+		fmt.Sprintf("%s/%d", s.path, inode),
+		minio.GetObjectOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &s3Reader{
+		obj:           obj,
+		currentOffset: 0,
+	}, nil
 }
 
-func storageOpen(storage string, inode uint64) (readerAtCloser, error) {
+func (s *s3StorageEngine) Write(inode uint64, data *os.File) (int64, error) {
+	stat, err := data.Stat()
+	if err != nil {
+		return 0, err
+	}
+	obj, err := s.client.PutObject(
+		context.Background(),
+		s.bucket,
+		fmt.Sprintf("%s/%d", s.path, inode),
+		data,
+		stat.Size(),
+		minio.PutObjectOptions{},
+	)
+	if err != nil {
+		if minio.ToErrorResponse(err).StatusCode == 403 {
+			return 0, ErrPermission
+		}
+		return 0, err
+	}
+	return obj.Size, nil
+}
 
-	if strings.HasPrefix(storage, "s3://") {
-		storage, err := getS3Client(storage)
-		if err != nil {
-			return nil, err
+func (s *s3StorageEngine) Remove(inode uint64) error {
+	err := s.client.RemoveObject(
+		context.Background(),
+		s.bucket,
+		fmt.Sprintf("%s/%d", s.path, inode),
+		minio.RemoveObjectOptions{},
+	)
+	if err != nil {
+		if minio.ToErrorResponse(err).StatusCode == 404 {
+			return nil
 		}
-		obj, err := storage.client.GetObject(
-			context.Background(),
-			storage.url.Hostname(),
-			fmt.Sprintf("%s/%d", storage.url.Path, inode),
-			minio.GetObjectOptions{},
-		)
-		if err != nil {
-			return nil, err
-		}
-		return &s3Reader{
-			obj:           obj,
-			currentOffset: 0,
+		return err
+	}
+	return nil
+}
+
+func (s *s3StorageEngine) Validate() error {
+	return nil
+}
+
+func (s *s3StorageEngine) Close() error {
+	return nil
+}
+
+func newStorageEngine(storage string) (storageEngine, error) {
+	if strings.HasPrefix(storage, "file://") {
+		return &fileStorageEngine{
+			path: storage[7:],
 		}, nil
 	}
 
-	if strings.HasPrefix(storage, "file://") {
-		f, err := os.Open(fmt.Sprintf("%s/%d", storage[7:], inode))
-		return f, err
+	if strings.HasPrefix(storage, "s3://") {
+		var creds *miniocredentials.Credentials
+
+		u, err := url.Parse(storage)
+		if err != nil {
+			return nil, err
+		}
+
+		q := u.Query()
+
+		if u.User != nil {
+			accessKeyID := u.User.Username()
+			secretAccessKey, _ := u.User.Password()
+			creds = miniocredentials.NewStaticV4(accessKeyID, secretAccessKey, "")
+		} else {
+			creds = miniocredentials.NewEnvAWS()
+		}
+
+		bucket, ok := q["bucket"]
+		if !ok {
+			return nil, fmt.Errorf("s3 storage url %q must contain bucket parameter", u.Redacted())
+		}
+
+		isSecure := true
+		if secureParam, ok := q["secure"]; ok {
+			isSecure = secureParam[0] != "false"
+		}
+
+		endpoint := fmt.Sprintf("%s:%s", u.Hostname(), u.Port())
+		client, err := minio.New(endpoint, &minio.Options{
+			Creds:  creds,
+			Secure: isSecure,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		return &s3StorageEngine{
+			bucket: bucket[0],
+			path:   u.Path,
+			client: client,
+		}, nil
 	}
 
-	return nil, fmt.Errorf("unknown storage scheme: %s", storage)
+	return nil, errors.New("invalid storage specification")
+}
+
+// This cache only ever grows - which is a good use for sync.Map.
+// it doesn't seem like the infinite growth ever be a practical problem,
+// but we can address that if it ever does.
+var storageEngineCache sync.Map
+
+func getStorageEngine(storage string) (storageEngine, error) {
+	cached, ok := storageEngineCache.Load(storage)
+	if !ok {
+		engine, err := newStorageEngine(storage)
+		if err != nil {
+			return nil, err
+		}
+		storageEngineCache.Store(storage, engine)
+		return engine, nil
+	}
+	return cached.(storageEngine), nil
+}
+
+func storageValidate(storage string) error {
+	s, err := newStorageEngine(storage)
+	if err != nil {
+		return err
+	}
+	defer s.Close()
+	return s.Validate()
+}
+
+func storageOpen(storage string, inode uint64) (readerAtCloser, error) {
+	s, err := getStorageEngine(storage)
+	if err != nil {
+		return nil, err
+	}
+	return s.Open(inode)
 }
 
 func storageWrite(storage string, inode uint64, data *os.File) (int64, error) {
-
-	if strings.HasPrefix(storage, "s3://") {
-		storage, err := getS3Client(storage)
-		if err != nil {
-			return 0, err
-		}
-		stat, err := data.Stat()
-		if err != nil {
-			return 0, err
-		}
-		obj, err := storage.client.PutObject(
-			context.Background(),
-			storage.url.Hostname(),
-			fmt.Sprintf("%s/%d", storage.url.Path, inode),
-			data,
-			stat.Size(),
-			minio.PutObjectOptions{},
-		)
-		if err != nil {
-			if minio.ToErrorResponse(err).StatusCode == 403 {
-				return 0, ErrPermission
-			}
-			return 0, err
-		}
-		return obj.Size, nil
+	s, err := getStorageEngine(storage)
+	if err != nil {
+		return 0, err
 	}
-
-	if strings.HasPrefix(storage, "file://") {
-		f, err := os.Create(fmt.Sprintf("%s/%d", storage[7:], inode))
-		if err != nil {
-			return 0, err
-		}
-		defer f.Close()
-		n, err := io.Copy(f, data)
-		if err != nil {
-			return n, err
-		}
-		return n, f.Sync()
-	}
-
-	return 0, fmt.Errorf("unknown storage scheme: %s", storage)
+	return s.Write(inode, data)
 }
 
 func storageRemove(storage string, inode uint64) error {
-	if strings.HasPrefix(storage, "s3://") {
-		storage, err := getS3Client(storage)
-		if err != nil {
-			return err
-		}
-		err = storage.client.RemoveObject(
-			context.Background(),
-			storage.url.Hostname(),
-			fmt.Sprintf("%s/%d", storage.url.Path, inode),
-			minio.RemoveObjectOptions{},
-		)
-		if err != nil {
-			if minio.ToErrorResponse(err).StatusCode == 404 {
-				return nil
-			}
-			return err
-		}
-		return nil
+	s, err := getStorageEngine(storage)
+	if err != nil {
+		return err
 	}
-
-	if strings.HasPrefix(storage, "file://") {
-		err := os.Remove(fmt.Sprintf("%s/%d", storage[7:], inode))
-		if err != nil {
-			if err == iofs.ErrNotExist {
-				return nil
-			}
-			return err
-		}
-		return nil
-	}
-
-	return fmt.Errorf("unknown storage scheme: %s", storage)
+	return s.Remove(inode)
 }
