@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -10,15 +12,16 @@ import (
 	"io"
 	"io/fs"
 	"log"
-	"lukechampine.com/blake3"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"golang.org/x/sync/errgroup"
+	"lukechampine.com/blake3"
 )
 
 var (
@@ -39,10 +42,18 @@ func (cfg *PlacementConfig) Crush(k string) ([]Location, error) {
 	return cfg.hierarchy.Crush(k, cfg.selectors)
 }
 
-var _placementConfigs []*PlacementConfig
+var _placementConfig atomic.Value
 
-func getPlacementConfigs() []*PlacementConfig {
-	return _placementConfigs
+func SetPlacementConfig(cfg *PlacementConfig) {
+	_placementConfig.Store(cfg)
+	select {
+	case scrubStartTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func GetPlacementConfig() *PlacementConfig {
+	return _placementConfig.Load().(*PlacementConfig)
 }
 
 func replicateObj(server string, k string, f *os.File) error {
@@ -116,9 +127,41 @@ func checkObj(server string, k string) (ObjMeta, bool, error) {
 	return stat, true, err
 }
 
+type ObjStamp struct {
+	Tombstone          bool
+	CreatedAtUnixMicro uint64
+}
+
+func ObjStampFromBytes(b []byte) ObjStamp {
+	stamp := ObjStamp{}
+	stamp.FieldsFromBytes(b[:])
+	return stamp
+}
+
+func (s *ObjStamp) IsExpired(now time.Time, timeout time.Duration) bool {
+	return s.Tombstone && time.UnixMicro(int64(s.CreatedAtUnixMicro)).Add(timeout).Before(now)
+}
+
+func (s *ObjStamp) FieldsFromBytes(b []byte) {
+	stamp := binary.BigEndian.Uint64(b)
+	s.Tombstone = (stamp >> 63) != 0
+	s.CreatedAtUnixMicro = (stamp << 1) >> 1
+}
+
+func (s *ObjStamp) ToBytes() [8]byte {
+	stamp := s.CreatedAtUnixMicro
+	if s.Tombstone {
+		stamp |= 1 << 63
+	}
+	b := [8]byte{}
+	binary.BigEndian.PutUint64(b[:], stamp)
+	return b
+}
+
 type ObjMeta struct {
-	Size     int64
-	B3Sum256 string
+	Size               uint64
+	Tombstone          bool
+	CreatedAtUnixMicro uint64
 }
 
 func checkHandler(w http.ResponseWriter, req *http.Request) {
@@ -145,20 +188,20 @@ func checkHandler(w http.ResponseWriter, req *http.Request) {
 		panic(err)
 	}
 
-	hash := [32]byte{}
-	_, err = f.ReadAt(hash[:], 0)
+	stampBytes := [8]byte{}
+	_, err = f.ReadAt(stampBytes[:], 32)
 	if err != nil {
 		panic(err)
 	}
-
+	stamp := ObjStampFromBytes(stampBytes[:])
 	buf, err := json.Marshal(ObjMeta{
-		B3Sum256: hex.EncodeToString(hash[:]),
-		Size:     stat.Size(),
+		Size:               uint64(stat.Size()) - 40,
+		Tombstone:          stamp.Tombstone,
+		CreatedAtUnixMicro: stamp.CreatedAtUnixMicro,
 	})
 	if err != nil {
 		panic(err)
 	}
-
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(buf)
 }
@@ -210,15 +253,13 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	objPath := filepath.Join(*DataDir, k)
 
-	placementCfg := getPlacementConfigs()[0]
-	locs, err := placementCfg.Crush(k)
+	locs, err := GetPlacementConfig().Crush(k)
 	if err != nil {
 		panic(err)
 	}
 	primaryLoc := locs[0]
 	isPrimary := primaryLoc.Equals(ThisLocation)
 	isReplication := q.Get("type") == "replicate"
-	alreadyHashed := isReplication
 
 	// Only the primary supports non replication writes.
 	if !isReplication && !isPrimary {
@@ -253,32 +294,48 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	}()
 
 	hash := [32]byte{}
+	stamp := ObjStamp{}
 
-	if alreadyHashed {
-		_, err := io.ReadFull(dataFile, hash[:])
+	hasher := blake3.New(32, nil)
+
+	if isReplication {
+		header := [40]byte{}
+		_, err := io.ReadFull(dataFile, header[:])
 		if err != nil {
 			panic(err)
 		}
-		_, err = tmpF.Write(hash[:])
+		copy(hash[:], header[:32])
+		stamp.FieldsFromBytes(header[32:40])
+		_, err = hasher.Write(header[32:40])
+		if err != nil {
+			panic(err)
+		}
+		_, err = tmpF.Write(header[:])
 		if err != nil {
 			panic(err)
 		}
 	} else {
-		// Reserve space for the future hash.
-		_, err := tmpF.Write(hash[:])
+		header := [40]byte{}
+		stamp.Tombstone = false
+		stamp.CreatedAtUnixMicro = uint64(time.Now().UnixMicro())
+		stampBytes := stamp.ToBytes()
+		_, err = hasher.Write(stampBytes[:])
+		if err != nil {
+			panic(err)
+		}
+		copy(header[32:], stampBytes[:])
+		_, err := tmpF.Write(header[:])
 		if err != nil {
 			panic(err)
 		}
 	}
-
-	hasher := blake3.New(32, nil)
 
 	_, err = io.Copy(io.MultiWriter(tmpF, hasher), dataFile)
 	if err != nil {
 		panic(err)
 	}
 
-	if alreadyHashed {
+	if isReplication {
 		actualHash := [32]byte{}
 		copy(actualHash[:], hasher.Sum(nil))
 		if hash != actualHash {
@@ -302,19 +359,35 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		}
 	}
 	if existingF != nil {
-		existingHash := [32]byte{}
-		_, err := existingF.ReadAt(existingHash[:], 0)
+		existingHeader := [40]byte{}
+		_, err := existingF.ReadAt(existingHeader[:], 0)
 		if err != nil {
 			panic(err)
 		}
-		if hash != existingHash {
-			w.WriteHeader(400)
-			w.Write([]byte("conflicting put"))
+
+		existingStamp := ObjStampFromBytes(existingHeader[32:])
+		if existingStamp.Tombstone && stamp.Tombstone {
+			// Nothing to do, already deleted.
+			w.WriteHeader(200)
 			return
+		}
+
+		// Only accept the put if it is a delete or reupload of the existing object.
+		if !stamp.Tombstone {
+			if !bytes.Equal(hash[:], existingHeader[:32]) {
+				w.WriteHeader(400)
+				w.Write([]byte("conflicting put"))
+				return
+			}
 		}
 	}
 
 	err = tmpF.Sync()
+	if err != nil {
+		panic(err)
+	}
+
+	err = tmpF.Close()
 	if err != nil {
 		panic(err)
 	}
@@ -340,12 +413,12 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 			server := loc[len(loc)-1][1]
 			if isReplication {
-				_, ok, err := checkObj(server, k)
+				meta, ok, err := checkObj(server, k)
 				if err != nil {
 					panic(err)
 				}
-				if ok {
-					/* TODO check stat up to date. */
+				if ok && stamp.Tombstone == meta.Tombstone {
+					// Don't need to replicate, the remote is up to date.
 					continue
 				}
 			}
@@ -362,14 +435,106 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 			}
 		}
 	}
-
 }
 
-func scrub(fullScrub bool) {
+func deleteHandler(w http.ResponseWriter, req *http.Request) {
+	if req.Method != "POST" {
+		panic("XXX")
+	}
+
+	q := req.URL.Query()
+	k := q.Get("key")
+	if k == "" {
+		panic("XXX")
+	}
+	objPath := filepath.Join(*DataDir, k)
+
+	locs, err := GetPlacementConfig().Crush(k)
+	if err != nil {
+		panic(err)
+	}
+	primaryLoc := locs[0]
+
+	if !primaryLoc.Equals(ThisLocation) {
+		endpoint := fmt.Sprintf("%s/delete?key=%s", primaryLoc[len(primaryLoc)-1][1], k)
+		log.Printf("not primary, redirecting delete %q to primary@%s", k, endpoint)
+		http.Redirect(w, req, endpoint, http.StatusTemporaryRedirect)
+		return
+	}
+
+	objStamp := ObjStamp{
+		Tombstone:          true,
+		CreatedAtUnixMicro: uint64(time.Now().UnixMicro()),
+	}
+	objStampBytes := objStamp.ToBytes()
+	objHash := blake3.Sum256(objStampBytes[:])
+	obj := [40]byte{}
+	copy(obj[0:32], objHash[:])
+	copy(obj[32:40], objStampBytes[:])
+
+	// Write object.
+	tmpF, err := os.CreateTemp(*DataDir, "obj.*.tmp")
+	if err != nil {
+		panic(err)
+	}
+	defer tmpF.Close()
+	removeTmp := true
+	defer func() {
+		if removeTmp {
+			_ = os.Remove(tmpF.Name())
+		}
+	}()
+
+	_, err = tmpF.Write(obj[:])
+	if err != nil {
+		panic(err)
+	}
+
+	err = tmpF.Sync()
+	if err != nil {
+		panic(err)
+	}
+
+	err = tmpF.Close()
+	if err != nil {
+		panic(err)
+	}
+
+	err = os.Rename(tmpF.Name(), objPath)
+	if err != nil {
+		panic(err)
+	}
+	removeTmp = false
+
+	// XXX TODO
+	// FlushDirectory()
+	// Flush directory - can we batch these together with other requests?
+
+	// Replicate the delete.
+	// XXX do in parallel.
+	for i := 1; i < len(locs); i++ {
+		loc := locs[i]
+		server := loc[len(loc)-1][1]
+		objF, err := os.Open(objPath)
+		if err != nil {
+			panic(err)
+		}
+		defer objF.Close()
+		log.Printf("replicating deletion of %q to %s", k, server)
+		err = replicateObj(server, k, objF)
+		if err != nil {
+			panic(err)
+		}
+	}
+}
+
+type ScrubOpts struct {
+	Full bool
+}
+
+func Scrub(opts ScrubOpts) {
 	log.Printf("scrub started")
 	defer log.Printf("scrub finished")
-
-	placementCfg := getPlacementConfigs()[0]
 
 	filepath.WalkDir(*DataDir, func(objPath string, e fs.DirEntry, err error) error {
 		if e.IsDir() {
@@ -382,7 +547,7 @@ func scrub(fullScrub bool) {
 			return nil
 		}
 
-		locs, err := placementCfg.Crush(k)
+		locs, err := GetPlacementConfig().Crush(k)
 		if err != nil {
 			log.Printf("scrubber unable to place %q: %s", k, err)
 			return nil
@@ -396,7 +561,24 @@ func scrub(fullScrub bool) {
 		}
 		defer objF.Close()
 
-		if fullScrub {
+		stampBytes := [8]byte{}
+		_, err = objF.ReadAt(stampBytes[:], 32)
+		if err != nil {
+			panic(err)
+		}
+		stamp := ObjStampFromBytes(stampBytes[:])
+
+		const TOMBSTONE_EXPIRY = 120 * time.Second // TODO a real/configurable value.
+		if stamp.IsExpired(time.Now(), TOMBSTONE_EXPIRY) {
+			log.Printf("scrubber removing %q, it has expired", k)
+			err := os.Remove(objPath)
+			if err != nil {
+				log.Printf("unable to remove %q: %s", k, err)
+			}
+			return nil
+		}
+
+		if opts.Full {
 			expectedHash := [32]byte{}
 			actualHash := [32]byte{}
 			_, err := io.ReadFull(objF, expectedHash[:])
@@ -429,48 +611,52 @@ func scrub(fullScrub bool) {
 		if ThisLocation.Equals(primaryLoc) {
 			for i := 1; i < len(locs); i++ {
 				server := locs[i][len(locs[i])-1][1]
-				_, ok, err := checkObj(server, k)
+				meta, ok, err := checkObj(server, k)
 				if err != nil {
 					log.Printf("scrubber stat failed: %s", err)
 					continue
 				}
-				if !ok /* XXX | out of date */ {
-					log.Printf("restoring %q to %s", k, server)
+				needsReplication := false
+				if ok {
+					if stamp.Tombstone && !meta.Tombstone {
+						log.Printf("scrubber replicating tombstone of %q to %s", k, server)
+						needsReplication = true
+					}
+				} else {
+					log.Printf("scrubber replicating missing %q to %s", k, server)
+					needsReplication = true
+				}
+				if needsReplication {
 					err := replicateObj(server, k, objF)
 					if err != nil {
-						log.Printf("scrubber replication failed: %s", err)
-						continue
+						log.Printf("scrubber replication of %q failed: %s", k, err)
 					}
 				}
 			}
 		} else {
 			primaryServer := primaryLoc[len(primaryLoc)-1][1]
-			_, ok, err := checkObj(primaryServer, k)
+			meta, ok, err := checkObj(primaryServer, k)
 			if err != nil {
 				log.Printf("scrubber was unable to verify primary placement of %q: %s", k, err)
 				return nil
 			}
-			if !ok {
+			if !ok || (stamp.Tombstone && !meta.Tombstone) {
 				log.Printf("restoring %q to primary server %s", k, primaryServer)
 				err := replicateObj(primaryServer, k, objF)
-				if err == nil {
-					ok = true
-				}
 				if err != nil {
-					log.Printf("scrubber replication failed: %s", err)
+					log.Printf("scrubber replication of %q failed: %s", k, err)
+					return nil
 				}
 			}
-			if ok {
-				keepObject := false
-				for i := 0; i < len(locs); i++ {
-					keepObject = keepObject || ThisLocation.Equals(locs[i])
-				}
-				if !keepObject {
-					log.Printf("scrubber removing %q, it has been moved", k)
-					err = os.Remove(objPath)
-					if err != nil {
-						log.Printf("unable to remove %q: %s", k, err)
-					}
+			keepObject := false
+			for i := 0; i < len(locs); i++ {
+				keepObject = keepObject || ThisLocation.Equals(locs[i])
+			}
+			if !keepObject {
+				log.Printf("scrubber removing %q, it has been moved", k)
+				err = os.Remove(objPath)
+				if err != nil {
+					log.Printf("unable to remove %q: %s", k, err)
 				}
 			}
 		}
@@ -479,14 +665,27 @@ func scrub(fullScrub bool) {
 	})
 }
 
-var scrubStartChan chan struct{} = make(chan struct{}, 1)
+var scrubStartTrigger chan struct{} = make(chan struct{})
 
 func scrubberForever() {
+	full := false
+	fullScrub := time.NewTicker(5 * time.Minute)
+	fastScrub := time.NewTicker(30 * time.Second)
 	for {
-		scrub(true)
+		startCfg := GetPlacementConfig()
+		Scrub(ScrubOpts{Full: full}) // XXX config full and not.
+		if GetPlacementConfig() != startCfg {
+			// The config changed while scrubbing
+			// we must scrub again to shift chunks to their desired placement
+			// in a timely way.
+			continue
+		}
 		select {
-		case <-time.After(30 * time.Second): // XXX config/better/interval.
-		case <-scrubStartChan:
+		case <-fullScrub.C: // XXX config/better/interval.
+			full = true
+		case <-fastScrub.C:
+			full = false
+		case <-scrubStartTrigger:
 		}
 	}
 }
@@ -561,7 +760,7 @@ func main() {
 
 	log.Printf("serving hierarchy:\n%s\n", storageHierarchy.AsciiTree())
 
-	_placementConfigs = []*PlacementConfig{&PlacementConfig{
+	SetPlacementConfig(&PlacementConfig{
 		hierarchy: storageHierarchy,
 		selectors: []CrushSelection{
 			CrushSelection{
@@ -573,12 +772,12 @@ func main() {
 				Count: 2,
 			},
 		},
-	},
-	}
+	})
 
-	http.HandleFunc("/get", getHandler)
 	http.HandleFunc("/put", putHandler)
+	http.HandleFunc("/get", getHandler)
 	http.HandleFunc("/check", checkHandler)
+	http.HandleFunc("/delete", deleteHandler)
 	http.HandleFunc("/refresh", refreshHandler)
 	http.HandleFunc("/start_scrub", startScrubHandler)
 
