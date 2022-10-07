@@ -28,6 +28,20 @@ type Node interface {
 
 type Location [][2]string
 
+func (l Location) Equals(other Location) bool {
+	if len(l) != len(other) {
+		return false
+	}
+	// Reverse order should exit faster since most
+	// locations actually have a unique end.
+	for i := len(l) - 1; i >= 0; i -= 1 {
+		if l[i] != other[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func (l Location) String() string {
 	var buf bytes.Buffer
 	for i, kv := range l {
@@ -424,61 +438,4 @@ func (h *StorageHierarchy) AsciiTree() string {
 	}
 	recurse(t, h.Root)
 	return t.String()
-}
-
-func main() {
-	h, err := NewStorageHierarchyFromSpec("server")
-	if err != nil {
-		panic(err)
-	}
-
-	storageNodes := []StorageNodeInfo{}
-
-	for i := 0; i < 10; i += 1 {
-		storageNodes = append(storageNodes,
-			StorageNodeInfo{
-				Location: Location{
-					{"server", fmt.Sprintf("server%d", i)},
-				},
-				TotalSpace: 100,
-			},
-		)
-	}
-
-	for _, storageNode := range storageNodes {
-		err = h.AddStorageNode(&storageNode)
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	h.Finish()
-
-	_, _ = fmt.Println(h.AsciiTree())
-
-	if err != nil {
-		panic(err)
-	}
-
-	selections := []CrushSelection{
-		CrushSelection{
-			Type:  "server",
-			Count: 1,
-		},
-	}
-
-	counts := make(map[string]int64)
-
-	for i := 0; i < 1000000; i++ {
-		k := fmt.Sprintf("%d", i)
-		locations, err := h.Crush(k, selections)
-		if err != nil {
-			panic(err)
-		}
-
-		n, _ := counts[locations[0][0][1]]
-		counts[locations[0][0][1]] = n + 1
-	}
-
-	fmt.Printf("%#v", counts)
 }
