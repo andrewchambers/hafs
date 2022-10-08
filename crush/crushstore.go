@@ -239,7 +239,7 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 	// Only the primary supports non replication writes.
 	if !isReplication && !isPrimary {
-		endpoint := fmt.Sprintf("%s/put?key=%s", primaryLoc[len(primaryLoc)-1][1], k)
+		endpoint := fmt.Sprintf("%s/put?key=%s", primaryLoc[len(primaryLoc)-1], k)
 		log.Printf("redirecting put %q to %s", k, endpoint)
 		http.Redirect(w, req, endpoint, http.StatusTemporaryRedirect)
 		return
@@ -438,7 +438,7 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	primaryLoc := locs[0]
 
 	if !primaryLoc.Equals(ThisLocation) {
-		endpoint := fmt.Sprintf("%s/delete?key=%s", primaryLoc[len(primaryLoc)-1][1], k)
+		endpoint := fmt.Sprintf("%s/delete?key=%s", primaryLoc[len(primaryLoc)-1], k)
 		log.Printf("redirecting delete %q to %s", k, endpoint)
 		http.Redirect(w, req, endpoint, http.StatusTemporaryRedirect)
 		return
@@ -820,7 +820,7 @@ func nodeInfoHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 type ClusterConfig struct {
-	ConfigYaml       []byte
+	ConfigBytes      []byte
 	ClusterSecret    string
 	PlacementRules   []CrushSelection
 	StorageHierarchy *StorageHierarchy
@@ -833,6 +833,9 @@ func (cfg *ClusterConfig) Crush(k string) ([]Location, error) {
 var _clusterConfig atomic.Value
 
 func SetClusterConfig(cfg *ClusterConfig) {
+	if !cfg.StorageHierarchy.ContainsStorageNodeAtLocation(ThisLocation) {
+		log.Printf("WARNING - config storage hierarchy does not contain the current node at %s.", ThisLocation)
+	}
 	_clusterConfig.Store(cfg)
 	select {
 	case rebalanceTrigger <- struct{}{}:
@@ -841,13 +844,14 @@ func SetClusterConfig(cfg *ClusterConfig) {
 }
 
 func GetClusterConfig() *ClusterConfig {
-	return _clusterConfig.Load().(*ClusterConfig)
+	config, _ := _clusterConfig.Load().(*ClusterConfig)
+	return config
 }
 
 func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 
 	newConfig := &ClusterConfig{
-		ConfigYaml: configYamlBytes,
+		ConfigBytes: configYamlBytes,
 	}
 
 	rawConfig := struct {
@@ -954,11 +958,66 @@ func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 	return newConfig, nil
 }
 
+func ReloadClusterConfigFromFile(configPath string) error {
+	configBytes, err := os.ReadFile(configPath)
+	if err != nil {
+		return err
+	}
+	currentConfig := GetClusterConfig()
+	if currentConfig != nil {
+		if bytes.Equal(configBytes, currentConfig.ConfigBytes) {
+			return nil
+		}
+	}
+	newConfig, err := ParseClusterConfig(configBytes)
+	if err != nil {
+		return err
+	}
+	SetClusterConfig(newConfig)
+	return nil
+}
+
+func WatchClusterConfigForever(configPath string) {
+	lastUpdate := time.Now()
+	for {
+		stat, err := os.Stat(configPath)
+		if err != nil {
+			log.Printf("unable to stat config: %s", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
+		if stat.ModTime().After(lastUpdate) {
+			log.Printf("detected config change, reloading.")
+			err = ReloadClusterConfigFromFile(configPath)
+			if err != nil {
+				log.Fatalf("error reloading config: %s", err)
+			}
+			lastUpdate = stat.ModTime()
+		}
+
+		// Check the config on fixed unix time boundaries, this
+		// means our cluster is more likely to reload their configs
+		// in sync when polling a network config.
+		const RELOAD_BOUNDARY = 60
+		nowUnix := time.Now().Unix()
+		delaySecs := int64(RELOAD_BOUNDARY / 2)
+		// XXX loop is dumb (but works).
+		for {
+			if (nowUnix+delaySecs)%RELOAD_BOUNDARY == 0 {
+				break
+			}
+			delaySecs += 1
+		}
+		time.Sleep(time.Duration(delaySecs) * time.Second)
+	}
+}
+
 func main() {
 
 	listenAddress := flag.String("listen-address", "", "Address to listen on.")
 	location := flag.String("location", "", "Storage location specification, defaults to http://${listen-address}.")
 	dataDir := flag.String("data-dir", "", "Directory to store objects under.")
+	clusterConfigFile := flag.String("cluster-config", "./crushstore-cluster.conf", "Directory to store objects under.")
 
 	flag.Parse()
 
@@ -987,27 +1046,13 @@ func main() {
 
 	log.Printf("serving location %v", ThisLocation)
 
-	clusterConfig, err := ParseClusterConfig([]byte(`
-cluster-secret: abc
-storage-schema: host
-placement-rules:
-    - select host 1
-    - select port 2
-storage-nodes:
-    - 100 + http://127.0.0.1:5000
-    - 100 ! http://127.0.0.1:5001
-`))
+	err = ReloadClusterConfigFromFile(*clusterConfigFile)
 	if err != nil {
-		log.Fatalf("error parsing config: %s", err)
+		log.Fatalf("error loading initial config: %s", err)
 	}
+	log.Printf("serving hierarchy:\n%s\n", GetClusterConfig().StorageHierarchy.AsciiTree())
 
-	if !clusterConfig.StorageHierarchy.ContainsStorageNodeAtLocation(ThisLocation) {
-		log.Printf("WARNING: config storage hierarchy does not contain %s.", ThisLocation)
-	}
-
-	log.Printf("serving hierarchy:\n%s\n", clusterConfig.StorageHierarchy.AsciiTree())
-
-	SetClusterConfig(clusterConfig)
+	go WatchClusterConfigForever(*clusterConfigFile)
 
 	http.HandleFunc("/put", putHandler)
 	http.HandleFunc("/get", getHandler)
@@ -1018,5 +1063,6 @@ storage-nodes:
 	log.Printf("serving on %s", *listenAddress)
 
 	go ScrubForever()
+
 	http.ListenAndServe(*listenAddress, nil)
 }
