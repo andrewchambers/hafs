@@ -47,7 +47,7 @@ var _placementConfig atomic.Value
 func SetPlacementConfig(cfg *PlacementConfig) {
 	_placementConfig.Store(cfg)
 	select {
-	case scrubStartTrigger <- struct{}{}:
+	case rebalanceTrigger <- struct{}{}:
 	default:
 	}
 }
@@ -91,7 +91,7 @@ func replicateObj(server string, k string, f *os.File) error {
 	}
 
 	if resp.StatusCode != 200 {
-		return fmt.Errorf("post object %q to %s failed with status=%s: %s", k, endpoint, resp.Status, body)
+		return fmt.Errorf("post object %q to %s failed: %s, body=%q", k, endpoint, resp.Status, body)
 	}
 
 	uploadErr := errg.Wait()
@@ -264,7 +264,7 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	// Only the primary supports non replication writes.
 	if !isReplication && !isPrimary {
 		endpoint := fmt.Sprintf("%s/put?key=%s", primaryLoc[len(primaryLoc)-1][1], k)
-		log.Printf("not primary, redirecting put %q to primary@%s", k, endpoint)
+		log.Printf("redirecting put %q to %s", k, endpoint)
 		http.Redirect(w, req, endpoint, http.StatusTemporaryRedirect)
 		return
 	}
@@ -302,7 +302,13 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		header := [40]byte{}
 		_, err := io.ReadFull(dataFile, header[:])
 		if err != nil {
-			panic(err)
+			if errors.Is(err, io.EOF) {
+				w.WriteHeader(400)
+			} else {
+				log.Printf("unable to read put object: %s", err)
+				w.WriteHeader(500)
+			}
+			return
 		}
 		copy(hash[:], header[:32])
 		stamp.FieldsFromBytes(header[32:40])
@@ -457,7 +463,7 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 
 	if !primaryLoc.Equals(ThisLocation) {
 		endpoint := fmt.Sprintf("%s/delete?key=%s", primaryLoc[len(primaryLoc)-1][1], k)
-		log.Printf("not primary, redirecting delete %q to primary@%s", k, endpoint)
+		log.Printf("redirecting delete %q to %s", k, endpoint)
 		http.Redirect(w, req, endpoint, http.StatusTemporaryRedirect)
 		return
 	}
@@ -528,180 +534,240 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	}
 }
 
+func ScrubObject(objPath string, opts ScrubOpts) {
+	log.Printf("scrubbing %q", objPath)
+	k := filepath.Base(objPath)
+
+	locs, err := GetPlacementConfig().Crush(k)
+	if err != nil {
+		logScrubError(SCRUB_EOTHER, "scrubber unable to place %q: %s", objPath, err)
+		return
+	}
+	primaryLoc := locs[0]
+
+	objF, err := os.Open(objPath)
+	if err != nil {
+		logScrubError(SCRUB_EOTHER, "scrubber unable to open %q: %s", objPath, err)
+		return
+	}
+	defer objF.Close()
+
+	stampBytes := [8]byte{}
+	_, err = objF.ReadAt(stampBytes[:], 32)
+	if err != nil {
+		logScrubError(SCRUB_EOTHER, "scrubber unable to read %q: %s", objPath, err)
+	}
+
+	stamp := ObjStampFromBytes(stampBytes[:])
+
+	if opts.Full {
+		expectedHash := [32]byte{}
+		actualHash := [32]byte{}
+		_, err := io.ReadFull(objF, expectedHash[:])
+		if err != nil && !errors.Is(err, io.EOF) {
+			logScrubError(SCRUB_EOTHER, "io error scrubbing %q: %s", objPath, err)
+			return
+		}
+		hasher := blake3.New(32, nil)
+		_, err = io.Copy(hasher, objF)
+		if err != nil {
+			logScrubError(SCRUB_EOTHER, "io error scrubbing %q: %s", objPath, err)
+			return
+		}
+		copy(actualHash[:], hasher.Sum(nil))
+		if expectedHash != actualHash {
+			log.Printf("scrub detected corrupt file at %q, removing it", objPath)
+			err = os.Remove(objPath)
+			if err != nil {
+				logScrubError(SCRUB_ECORRUPT, "io error removing %q: %s", objPath, err)
+			}
+			return
+		}
+
+		_, err = objF.Seek(0, io.SeekStart)
+		if err != nil {
+			logScrubError(SCRUB_EOTHER, "io error seeking %q", objPath)
+			return
+		}
+
+		// We only expire tombstones on full scrubs.
+		const TOMBSTONE_EXPIRY = 120 * time.Second // TODO a real/configurable value.
+		if stamp.IsExpired(time.Now(), TOMBSTONE_EXPIRY) {
+			log.Printf("scrubber removing %q, it has expired", objPath)
+			err := os.Remove(objPath)
+			if err != nil {
+				logScrubError(SCRUB_EOTHER, "unable to remove %q: %s", objPath, err)
+			}
+			return
+		}
+
+	}
+
+	if ThisLocation.Equals(primaryLoc) {
+		for i := 1; i < len(locs); i++ {
+			server := locs[i][len(locs[i])-1][1]
+			meta, ok, err := checkObj(server, k)
+			if err != nil {
+				logScrubError(SCRUB_EREPL, "scrubber check failed: %s", err)
+				continue
+			}
+			if ok {
+				if stamp.Tombstone && !meta.Tombstone {
+					// Both have the data, but they disagree about the deletion state.
+					log.Printf("scrubber replicating tombstone of %q to %s", k, server)
+					err := replicateObj(server, k, objF)
+					if err != nil {
+						logScrubError(SCRUB_EREPL, "scrubber replication of %q failed: %s", k, err)
+					}
+				}
+			} else {
+				log.Printf("scrubber replicating %q to %s", k, server)
+				err := replicateObj(server, k, objF)
+				if err != nil {
+					logScrubError(SCRUB_EREPL, "scrubber replication of %q failed: %s", k, err)
+				}
+			}
+		}
+	} else {
+		primaryServer := primaryLoc[len(primaryLoc)-1][1]
+		meta, ok, err := checkObj(primaryServer, k)
+		if err != nil {
+			logScrubError(SCRUB_EREPL, "scrubber was unable to verify primary placement of %q: %s", k, err)
+			return
+		}
+		if !ok || (stamp.Tombstone && !meta.Tombstone) {
+			if !ok {
+				log.Printf("restoring %q to primary server %s", k, primaryServer)
+			} else {
+				log.Printf("scrubber replicating tombstone of %q to %s", k, primaryServer)
+			}
+			err := replicateObj(primaryServer, k, objF)
+			if err != nil {
+				logScrubError(SCRUB_EREPL, "scrubber replication of %q failed: %s", k, err)
+				return
+			}
+		}
+		keepObject := false
+		for i := 0; i < len(locs); i++ {
+			keepObject = keepObject || ThisLocation.Equals(locs[i])
+		}
+		if !keepObject {
+			log.Printf("scrubber removing %q, it has been moved", k)
+			err = os.Remove(objPath)
+			if err != nil {
+				logScrubError(SCRUB_EOTHER, "unable to remove %q: %s", objPath, err)
+			}
+		}
+	}
+}
+
 type ScrubOpts struct {
 	Full bool
 }
 
 func Scrub(opts ScrubOpts) {
-	log.Printf("scrub started")
-	defer log.Printf("scrub finished")
+	log.Printf("scrub started, full=%v", opts.Full)
+	atomic.StoreUint64(&_scrubInProgress, 1)
 
-	filepath.WalkDir(*DataDir, func(objPath string, e fs.DirEntry, err error) error {
+	startReplicationErrorCount := atomic.LoadUint64(&_scrubReplicationErrorCount)
+	startCorruptionErrorCount := atomic.LoadUint64(&_scrubCorruptionErrorCount)
+	startOtherErrorCount := atomic.LoadUint64(&_scrubOtherErrorCount)
+
+	defer func() {
+		replicationErrorCount := atomic.LoadUint64(&_scrubReplicationErrorCount) - startReplicationErrorCount
+		corruptionErrorCount := atomic.LoadUint64(&_scrubCorruptionErrorCount) - startCorruptionErrorCount
+		otherErrorCount := atomic.LoadUint64(&_scrubOtherErrorCount) - startOtherErrorCount
+		errorCount := replicationErrorCount + corruptionErrorCount + otherErrorCount
+		log.Printf("scrub finished with %d errors", errorCount)
+		atomic.StoreUint64(&_scrubInProgress, 0)
+	}()
+
+	dispatch := make(chan string)
+
+	errg, _ := errgroup.WithContext(context.Background())
+	const N_SCRUB_WORKERS = 4
+	for i := 0; i < N_SCRUB_WORKERS; i++ {
+		errg.Go(func() error {
+			for {
+				path, ok := <-dispatch
+				if !ok {
+					return nil
+				}
+				ScrubObject(path, opts)
+			}
+		})
+	}
+
+	filepath.WalkDir(*DataDir, func(path string, e fs.DirEntry, err error) error {
 		if e.IsDir() {
 			return nil
 		}
-		k := filepath.Base(objPath)
-
-		if strings.HasSuffix(k, ".tmp") {
+		if strings.HasSuffix(path, ".tmp") {
 			// TODO cleanup old tmp files.
 			return nil
 		}
-
-		locs, err := GetPlacementConfig().Crush(k)
-		if err != nil {
-			log.Printf("scrubber unable to place %q: %s", k, err)
-			return nil
-		}
-		primaryLoc := locs[0]
-
-		objF, err := os.Open(objPath)
-		if err != nil {
-			log.Printf("scrubber unable to open %q: %s", k, err)
-			return nil
-		}
-		defer objF.Close()
-
-		stampBytes := [8]byte{}
-		_, err = objF.ReadAt(stampBytes[:], 32)
-		if err != nil {
-			panic(err)
-		}
-		stamp := ObjStampFromBytes(stampBytes[:])
-
-		const TOMBSTONE_EXPIRY = 120 * time.Second // TODO a real/configurable value.
-		if stamp.IsExpired(time.Now(), TOMBSTONE_EXPIRY) {
-			log.Printf("scrubber removing %q, it has expired", k)
-			err := os.Remove(objPath)
-			if err != nil {
-				log.Printf("unable to remove %q: %s", k, err)
-			}
-			return nil
-		}
-
-		if opts.Full {
-			expectedHash := [32]byte{}
-			actualHash := [32]byte{}
-			_, err := io.ReadFull(objF, expectedHash[:])
-			if err != nil {
-				log.Printf("io error scrubbing %q: %s", k, err)
-			}
-			hasher := blake3.New(32, nil)
-			_, err = io.Copy(hasher, objF)
-			if err != nil {
-				log.Printf("io error scrubbing %q: %s", k, err)
-			}
-			copy(actualHash[:], hasher.Sum(nil))
-			if expectedHash != actualHash {
-				log.Printf("scrub detected corrupt %q", k)
-				err = os.Remove(objPath)
-				if err != nil {
-					log.Printf("io error removing %q: %s", k, err)
-				}
-				// Nothing more to do for this entry.
-				return nil
-			}
-
-			_, err = objF.Seek(0, io.SeekStart)
-			if err != nil {
-				log.Printf("io error seeking %q", k)
-				return nil
-			}
-		}
-
-		if ThisLocation.Equals(primaryLoc) {
-			for i := 1; i < len(locs); i++ {
-				server := locs[i][len(locs[i])-1][1]
-				meta, ok, err := checkObj(server, k)
-				if err != nil {
-					log.Printf("scrubber stat failed: %s", err)
-					continue
-				}
-				needsReplication := false
-				if ok {
-					if stamp.Tombstone && !meta.Tombstone {
-						log.Printf("scrubber replicating tombstone of %q to %s", k, server)
-						needsReplication = true
-					}
-				} else {
-					log.Printf("scrubber replicating missing %q to %s", k, server)
-					needsReplication = true
-				}
-				if needsReplication {
-					err := replicateObj(server, k, objF)
-					if err != nil {
-						log.Printf("scrubber replication of %q failed: %s", k, err)
-					}
-				}
-			}
-		} else {
-			primaryServer := primaryLoc[len(primaryLoc)-1][1]
-			meta, ok, err := checkObj(primaryServer, k)
-			if err != nil {
-				log.Printf("scrubber was unable to verify primary placement of %q: %s", k, err)
-				return nil
-			}
-			if !ok || (stamp.Tombstone && !meta.Tombstone) {
-				log.Printf("restoring %q to primary server %s", k, primaryServer)
-				err := replicateObj(primaryServer, k, objF)
-				if err != nil {
-					log.Printf("scrubber replication of %q failed: %s", k, err)
-					return nil
-				}
-			}
-			keepObject := false
-			for i := 0; i < len(locs); i++ {
-				keepObject = keepObject || ThisLocation.Equals(locs[i])
-			}
-			if !keepObject {
-				log.Printf("scrubber removing %q, it has been moved", k)
-				err = os.Remove(objPath)
-				if err != nil {
-					log.Printf("unable to remove %q: %s", k, err)
-				}
-			}
-		}
-
+		dispatch <- path
 		return nil
 	})
+
+	close(dispatch)
+	err := errg.Wait()
+	if err != nil {
+		logScrubError(SCRUB_EOTHER, "scrub worker had an error: %s", err)
+	}
+
+	atomic.AddUint64(&_scrubsCompleted, 1)
 }
 
-var scrubStartTrigger chan struct{} = make(chan struct{})
+var rebalanceTrigger chan struct{} = make(chan struct{})
+var _scrubReplicationErrorCount uint64 = 0
+var _scrubCorruptionErrorCount uint64 = 0
+var _scrubOtherErrorCount uint64 = 0
+var _scrubsCompleted uint64 = 0
+var _scrubInProgress uint64 = 0
 
-func scrubberForever() {
-	full := false
-	fullScrub := time.NewTicker(5 * time.Minute)
-	fastScrub := time.NewTicker(30 * time.Second)
+const (
+	SCRUB_EOTHER = iota
+	SCRUB_EREPL
+	SCRUB_ECORRUPT
+)
+
+func logScrubError(class int, format string, a ...interface{}) {
+	switch class {
+	case SCRUB_EREPL:
+		atomic.AddUint64(&_scrubReplicationErrorCount, 1)
+	case SCRUB_ECORRUPT:
+		atomic.AddUint64(&_scrubCorruptionErrorCount, 1)
+	default:
+		atomic.AddUint64(&_scrubOtherErrorCount, 1)
+	}
+	log.Printf(format, a...)
+}
+
+func ScrubForever() {
+	full := true // XXX store the state somewhere?
+	// XXX config/better/intervals.
+	fullScrubTicker := time.NewTicker(5 * time.Minute)
+	fastScrubTicker := time.NewTicker(30 * time.Second)
 	for {
 		startCfg := GetPlacementConfig()
 		Scrub(ScrubOpts{Full: full}) // XXX config full and not.
-		if GetPlacementConfig() != startCfg {
-			// The config changed while scrubbing
-			// we must scrub again to shift chunks to their desired placement
-			// in a timely way.
+		endCfg := GetPlacementConfig()
+		if startCfg != endCfg {
+			// The config changed while scrubbing, we must scrub again with
+			// the new config to handle any placement changes.
+			full = false
 			continue
 		}
 		select {
-		case <-fullScrub.C: // XXX config/better/interval.
+		case <-fullScrubTicker.C:
 			full = true
-		case <-fastScrub.C:
+		case <-fastScrubTicker.C:
 			full = false
-		case <-scrubStartTrigger:
+		case <-rebalanceTrigger:
+			full = false
 		}
 	}
-}
-
-func refreshHandler(w http.ResponseWriter, req *http.Request) {
-	if req.Method != "POST" {
-		panic("TODO")
-	}
-	panic("TODO")
-}
-
-func startScrubHandler(w http.ResponseWriter, req *http.Request) {
-	if req.Method != "POST" {
-		panic("TODO")
-	}
-	panic("TODO")
 }
 
 func main() {
@@ -778,11 +844,9 @@ func main() {
 	http.HandleFunc("/get", getHandler)
 	http.HandleFunc("/check", checkHandler)
 	http.HandleFunc("/delete", deleteHandler)
-	http.HandleFunc("/refresh", refreshHandler)
-	http.HandleFunc("/start_scrub", startScrubHandler)
 
 	log.Printf("serving on %s", *ListenAddress)
 
-	go scrubberForever()
+	go ScrubForever()
 	http.ListenAndServe(*ListenAddress, nil)
 }

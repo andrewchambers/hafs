@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sort"
 	"strings"
@@ -279,8 +280,14 @@ type CrushSelection struct {
 }
 
 func (h *StorageHierarchy) Crush(input string, selections []CrushSelection) ([]Location, error) {
-	nodes := []Node{h.Root}
 
+	if len(selections) == 0 {
+		return nil, errors.New("expected at least one selection rule")
+	}
+
+	expectedCount := 1
+
+	nodes := []Node{h.Root}
 	hashedInput := btoi(digestString(input))
 
 	for _, sel := range selections {
@@ -288,7 +295,10 @@ func (h *StorageHierarchy) Crush(input string, selections []CrushSelection) ([]L
 		if !ok {
 			return nil, fmt.Errorf("unable to do CRUSH mapping, unknown type '%s'", sel.Type)
 		}
+
+		expectedCount *= sel.Count
 		nextNodes := make([]Node, 0, len(nodes)*sel.Count)
+
 		for _, n := range nodes {
 			selection := h.doSelect(n, hashedInput, sel.Count, nodeType, nil)
 			nextNodes = append(nextNodes, selection...)
@@ -303,6 +313,10 @@ func (h *StorageHierarchy) Crush(input string, selections []CrushSelection) ([]L
 			return nil, fmt.Errorf("'%s' is a not a storage node", node.GetId())
 		}
 		locations = append(locations, storageNode.Location)
+	}
+
+	if len(locations) != expectedCount {
+		return locations, errors.New("unable to satisfy crush placement")
 	}
 
 	return locations, nil
