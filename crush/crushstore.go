@@ -694,11 +694,13 @@ func Scrub(opts ScrubOpts) {
 					return nil
 				}
 				ScrubObject(path, opts)
+				atomic.AddUint64(&_totalScrubbedObjectCount, 1)
 			}
 		})
 	}
 
-	filepath.WalkDir(*DataDir, func(path string, e fs.DirEntry, err error) error {
+	objectCount := uint64(0)
+	err := filepath.WalkDir(*DataDir, func(path string, e fs.DirEntry, err error) error {
 		if e.IsDir() {
 			return nil
 		}
@@ -707,11 +709,16 @@ func Scrub(opts ScrubOpts) {
 			return nil
 		}
 		dispatch <- path
+		objectCount += 1
 		return nil
 	})
+	if err != nil {
+		logScrubError(SCRUB_EOTHER, "scrub walk had an error: %s", err)
+	}
+	atomic.StoreUint64(&_lastScrubObjectCount, objectCount)
 
 	close(dispatch)
-	err := errg.Wait()
+	err = errg.Wait()
 	if err != nil {
 		logScrubError(SCRUB_EOTHER, "scrub worker had an error: %s", err)
 	}
@@ -720,11 +727,13 @@ func Scrub(opts ScrubOpts) {
 }
 
 var rebalanceTrigger chan struct{} = make(chan struct{})
-var _scrubReplicationErrorCount uint64 = 0
-var _scrubCorruptionErrorCount uint64 = 0
-var _scrubOtherErrorCount uint64 = 0
-var _scrubsCompleted uint64 = 0
-var _scrubInProgress uint64 = 0
+var _scrubReplicationErrorCount uint64
+var _scrubCorruptionErrorCount uint64
+var _scrubOtherErrorCount uint64
+var _scrubsCompleted uint64
+var _scrubInProgress uint64
+var _lastScrubObjectCount uint64
+var _totalScrubbedObjectCount uint64
 
 const (
 	SCRUB_EOTHER = iota
@@ -768,6 +777,36 @@ func ScrubForever() {
 			full = false
 		}
 	}
+}
+
+func nodeInfoHandler(w http.ResponseWriter, req *http.Request) {
+
+	counters := struct {
+		ScrubReplicationErrorCount uint64
+		ScrubCorruptionErrorCount  uint64
+		ScrubOtherErrorCount       uint64
+		ScrubsCompleted            uint64
+		LastScrubObjectCount       uint64
+		TotalScrubbedObjectCount   uint64
+		ScrubInProgress            uint64
+	}{
+		ScrubReplicationErrorCount: atomic.LoadUint64(&_scrubReplicationErrorCount),
+		ScrubCorruptionErrorCount:  atomic.LoadUint64(&_scrubCorruptionErrorCount),
+		ScrubOtherErrorCount:       atomic.LoadUint64(&_scrubOtherErrorCount),
+		ScrubsCompleted:            atomic.LoadUint64(&_scrubsCompleted),
+
+		LastScrubObjectCount:     atomic.LoadUint64(&_lastScrubObjectCount),
+		TotalScrubbedObjectCount: atomic.LoadUint64(&_totalScrubbedObjectCount),
+		ScrubInProgress:          uint64(atomic.LoadUint64(&_scrubInProgress)),
+	}
+
+	buf, err := json.Marshal(&counters)
+	if err != nil {
+		panic(err)
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	w.Write(buf)
 }
 
 func main() {
@@ -844,6 +883,7 @@ func main() {
 	http.HandleFunc("/get", getHandler)
 	http.HandleFunc("/check", checkHandler)
 	http.HandleFunc("/delete", deleteHandler)
+	http.HandleFunc("/node_info", nodeInfoHandler)
 
 	log.Printf("serving on %s", *ListenAddress)
 
