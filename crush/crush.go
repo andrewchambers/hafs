@@ -5,8 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 
+	"github.com/google/shlex"
 	"github.com/xlab/treeprint"
 )
 
@@ -27,7 +27,7 @@ type Node interface {
 	Select(input int64, round int64) Node
 }
 
-type Location [][2]string
+type Location []string
 
 func (l Location) Equals(other Location) bool {
 	if len(l) != len(other) {
@@ -44,18 +44,7 @@ func (l Location) Equals(other Location) bool {
 }
 
 func (l Location) String() string {
-	var buf bytes.Buffer
-	for i, kv := range l {
-		sep := ""
-		if i != 0 {
-			sep = " "
-		}
-		_, err := fmt.Fprintf(&buf, "%s%s=%s", sep, kv[0], kv[1])
-		if err != nil {
-			panic(err)
-		}
-	}
-	return buf.String()
+	return fmt.Sprintf("%v", []string(l))
 }
 
 type StorageNodeInfo struct {
@@ -157,8 +146,14 @@ type StorageHierarchy struct {
 }
 
 func NewStorageHierarchyFromSpec(s string) (*StorageHierarchy, error) {
+
+	types, err := shlex.Split(s)
+	if err != nil {
+		return nil, fmt.Errorf("unable to split types: %s", err)
+	}
+
 	h := &StorageHierarchy{
-		Types:     strings.Split(s, " "),
+		Types:     types,
 		TypeToIdx: make(map[string]int),
 		IdxToType: make(map[int]string),
 		Root: &InternalNode{
@@ -166,9 +161,6 @@ func NewStorageHierarchyFromSpec(s string) (*StorageHierarchy, error) {
 		},
 	}
 	for i, t := range h.Types {
-		if strings.Contains(t, "=") {
-			return nil, fmt.Errorf("storage type %s cannot contain '='", t)
-		}
 		if _, ok := h.TypeToIdx[t]; ok {
 			return nil, fmt.Errorf("duplicate type %s in spec", t)
 		}
@@ -178,6 +170,26 @@ func NewStorageHierarchyFromSpec(s string) (*StorageHierarchy, error) {
 	return h, nil
 }
 
+func (h *StorageHierarchy) ContainsStorageNodeAtLocation(location Location) bool {
+	if len(h.Types) != len(location) {
+		return false
+	}
+	n := h.Root
+	for _, name := range location {
+		child, ok := n.NameToChild[name]
+		if !ok {
+			return false
+		}
+		switch child := child.(type) {
+		case *StorageNode:
+			return true
+		case *InternalNode:
+			n = child
+		}
+	}
+	return false
+}
+
 func (h *StorageHierarchy) AddStorageNode(ni *StorageNodeInfo) error {
 
 	n := &StorageNode{
@@ -185,29 +197,27 @@ func (h *StorageHierarchy) AddStorageNode(ni *StorageNodeInfo) error {
 	}
 
 	// Validate compatible.
-	for i, kv := range n.Location {
-		ty, _ := kv[0], kv[1]
-		if h.Types[i] != ty {
-			return fmt.Errorf(
-				"location '%s' is not compatible with type '%s'",
-				n.Location,
-				strings.Join(h.Types, " "),
-			)
-		}
+	if len(n.Location) != len(h.Types) {
+		return fmt.Errorf(
+			"location %v is not compatible with type schema %v, expected %d members",
+			n.Location,
+			h.Types,
+			len(h.Types),
+		)
 	}
 
 	idBuf := bytes.Buffer{}
 
 	node := h.Root
-	for i, kv := range n.Location {
-		ty, loc := kv[0], kv[1]
+	for i, loc := range n.Location {
+		ty := h.Types[i]
 
 		_, err := idBuf.WriteString(loc)
 		if err != nil {
 			panic(err)
 		}
 		if i != 0 {
-			_, err := idBuf.WriteString("/")
+			_, err := idBuf.WriteString(" ")
 			if err != nil {
 				panic(err)
 			}
@@ -445,7 +455,7 @@ func (h *StorageHierarchy) AsciiTree() string {
 				if child.Failed {
 					status = "!"
 				}
-				meta := fmt.Sprintf("%d/%d %s", child.UsedSpace, child.TotalSpace, status)
+				meta := fmt.Sprintf("%d %s", child.TotalSpace, status)
 				t.AddBranch(name).SetMetaValue(meta)
 			}
 		}

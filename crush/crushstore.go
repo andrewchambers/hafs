@@ -16,45 +16,21 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"time"
 
+	"github.com/google/shlex"
 	"golang.org/x/sync/errgroup"
+	"gopkg.in/yaml.v3"
 	"lukechampine.com/blake3"
 )
 
 var (
-	ListenAddress = flag.String("listen-address", "", "Address to listen on.")
-	DataDir       = flag.String("data-dir", "./data", "data to store objects")
-)
-
-var (
+	DataDir      string
 	ThisLocation Location
 )
-
-type PlacementConfig struct {
-	hierarchy *StorageHierarchy
-	selectors []CrushSelection
-}
-
-func (cfg *PlacementConfig) Crush(k string) ([]Location, error) {
-	return cfg.hierarchy.Crush(k, cfg.selectors)
-}
-
-var _placementConfig atomic.Value
-
-func SetPlacementConfig(cfg *PlacementConfig) {
-	_placementConfig.Store(cfg)
-	select {
-	case rebalanceTrigger <- struct{}{}:
-	default:
-	}
-}
-
-func GetPlacementConfig() *PlacementConfig {
-	return _placementConfig.Load().(*PlacementConfig)
-}
 
 func replicateObj(server string, k string, f *os.File) error {
 	r, w := io.Pipe()
@@ -173,7 +149,7 @@ func checkHandler(w http.ResponseWriter, req *http.Request) {
 	if k == "" {
 		panic("TODO")
 	}
-	f, err := os.Open(filepath.Join(*DataDir, k))
+	f, err := os.Open(filepath.Join(DataDir, k))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			w.WriteHeader(http.StatusNotFound)
@@ -215,7 +191,7 @@ func getHandler(w http.ResponseWriter, req *http.Request) {
 	if k == "" {
 		panic("TODO")
 	}
-	f, err := os.Open(filepath.Join(*DataDir, k))
+	f, err := os.Open(filepath.Join(DataDir, k))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			w.WriteHeader(http.StatusNotFound)
@@ -251,9 +227,9 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	if k == "" {
 		panic("XXX")
 	}
-	objPath := filepath.Join(*DataDir, k)
+	objPath := filepath.Join(DataDir, k)
 
-	locs, err := GetPlacementConfig().Crush(k)
+	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
 		panic(err)
 	}
@@ -281,7 +257,7 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	defer dataFile.Close()
 
 	// Write object.
-	tmpF, err := os.CreateTemp(*DataDir, "obj.*.tmp")
+	tmpF, err := os.CreateTemp(DataDir, "obj.*.tmp")
 	if err != nil {
 		panic(err)
 	}
@@ -417,7 +393,7 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 				continue
 			}
 
-			server := loc[len(loc)-1][1]
+			server := loc[len(loc)-1]
 			if isReplication {
 				meta, ok, err := checkObj(server, k)
 				if err != nil {
@@ -453,9 +429,9 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	if k == "" {
 		panic("XXX")
 	}
-	objPath := filepath.Join(*DataDir, k)
+	objPath := filepath.Join(DataDir, k)
 
-	locs, err := GetPlacementConfig().Crush(k)
+	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
 		panic(err)
 	}
@@ -479,7 +455,7 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	copy(obj[32:40], objStampBytes[:])
 
 	// Write object.
-	tmpF, err := os.CreateTemp(*DataDir, "obj.*.tmp")
+	tmpF, err := os.CreateTemp(DataDir, "obj.*.tmp")
 	if err != nil {
 		panic(err)
 	}
@@ -520,7 +496,7 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	// XXX do in parallel.
 	for i := 1; i < len(locs); i++ {
 		loc := locs[i]
-		server := loc[len(loc)-1][1]
+		server := loc[len(loc)-1]
 		objF, err := os.Open(objPath)
 		if err != nil {
 			panic(err)
@@ -535,10 +511,10 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func ScrubObject(objPath string, opts ScrubOpts) {
-	log.Printf("scrubbing %q", objPath)
+	log.Printf("scrubbing object stored at %q", objPath)
 	k := filepath.Base(objPath)
 
-	locs, err := GetPlacementConfig().Crush(k)
+	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
 		logScrubError(SCRUB_EOTHER, "scrubber unable to place %q: %s", objPath, err)
 		return
@@ -551,6 +527,14 @@ func ScrubObject(objPath string, opts ScrubOpts) {
 		return
 	}
 	defer objF.Close()
+
+	stat, err := objF.Stat()
+	if err != nil {
+		logScrubError(SCRUB_EOTHER, "scrubber unable to stat %q: %s", objPath, err)
+	}
+	if err == nil {
+		atomic.AddUint64(&_totalScrubbedBytes, uint64(stat.Size()))
+	}
 
 	stampBytes := [8]byte{}
 	_, err = objF.ReadAt(stampBytes[:], 32)
@@ -590,7 +574,7 @@ func ScrubObject(objPath string, opts ScrubOpts) {
 			return
 		}
 
-		// We only expire tombstones on full scrubs.
+		// We only trust a tombstone after it has been fully scrubbed.
 		const TOMBSTONE_EXPIRY = 120 * time.Second // TODO a real/configurable value.
 		if stamp.IsExpired(time.Now(), TOMBSTONE_EXPIRY) {
 			log.Printf("scrubber removing %q, it has expired", objPath)
@@ -605,7 +589,7 @@ func ScrubObject(objPath string, opts ScrubOpts) {
 
 	if ThisLocation.Equals(primaryLoc) {
 		for i := 1; i < len(locs); i++ {
-			server := locs[i][len(locs[i])-1][1]
+			server := locs[i][len(locs[i])-1]
 			meta, ok, err := checkObj(server, k)
 			if err != nil {
 				logScrubError(SCRUB_EREPL, "scrubber check failed: %s", err)
@@ -629,7 +613,7 @@ func ScrubObject(objPath string, opts ScrubOpts) {
 			}
 		}
 	} else {
-		primaryServer := primaryLoc[len(primaryLoc)-1][1]
+		primaryServer := primaryLoc[len(primaryLoc)-1]
 		meta, ok, err := checkObj(primaryServer, k)
 		if err != nil {
 			logScrubError(SCRUB_EREPL, "scrubber was unable to verify primary placement of %q: %s", k, err)
@@ -669,16 +653,24 @@ func Scrub(opts ScrubOpts) {
 	log.Printf("scrub started, full=%v", opts.Full)
 	atomic.StoreUint64(&_scrubInProgress, 1)
 
-	startReplicationErrorCount := atomic.LoadUint64(&_scrubReplicationErrorCount)
-	startCorruptionErrorCount := atomic.LoadUint64(&_scrubCorruptionErrorCount)
-	startOtherErrorCount := atomic.LoadUint64(&_scrubOtherErrorCount)
+	startTotalScrubbedObjects := atomic.LoadUint64(&_totalScrubbedObjects)
+	startTotalScrubbedBytes := atomic.LoadUint64(&_totalScrubbedBytes)
+	startTotalReplicationErrorCount := atomic.LoadUint64(&_totalScrubReplicationErrorCount)
+	startTotalCorruptionErrorCount := atomic.LoadUint64(&_totalScrubCorruptionErrorCount)
+	startTotalOtherErrorCount := atomic.LoadUint64(&_totalScrubOtherErrorCount)
 
 	defer func() {
-		replicationErrorCount := atomic.LoadUint64(&_scrubReplicationErrorCount) - startReplicationErrorCount
-		corruptionErrorCount := atomic.LoadUint64(&_scrubCorruptionErrorCount) - startCorruptionErrorCount
-		otherErrorCount := atomic.LoadUint64(&_scrubOtherErrorCount) - startOtherErrorCount
+		scrubbedObjects := atomic.LoadUint64(&_totalScrubbedObjects) - startTotalScrubbedObjects
+		scrubbedBytes := atomic.LoadUint64(&_totalScrubbedBytes) - startTotalScrubbedBytes
+		replicationErrorCount := atomic.LoadUint64(&_totalScrubReplicationErrorCount) - startTotalReplicationErrorCount
+		corruptionErrorCount := atomic.LoadUint64(&_totalScrubCorruptionErrorCount) - startTotalCorruptionErrorCount
+		otherErrorCount := atomic.LoadUint64(&_totalScrubOtherErrorCount) - startTotalOtherErrorCount
 		errorCount := replicationErrorCount + corruptionErrorCount + otherErrorCount
-		log.Printf("scrub finished with %d errors", errorCount)
+		log.Printf("scrubbed %d object(s), %d byte(s) with %d error(s)", scrubbedObjects, scrubbedBytes, errorCount)
+		atomic.StoreUint64(&_lastScrubReplicationErrorCount, replicationErrorCount)
+		atomic.StoreUint64(&_lastScrubCorruptionErrorCount, corruptionErrorCount)
+		atomic.StoreUint64(&_lastScrubOtherErrorCount, otherErrorCount)
+		atomic.StoreUint64(&_lastScrubbedBytes, scrubbedBytes)
 		atomic.StoreUint64(&_scrubInProgress, 0)
 	}()
 
@@ -694,13 +686,13 @@ func Scrub(opts ScrubOpts) {
 					return nil
 				}
 				ScrubObject(path, opts)
-				atomic.AddUint64(&_totalScrubbedObjectCount, 1)
+				atomic.AddUint64(&_totalScrubbedObjects, 1)
 			}
 		})
 	}
 
 	objectCount := uint64(0)
-	err := filepath.WalkDir(*DataDir, func(path string, e fs.DirEntry, err error) error {
+	err := filepath.WalkDir(DataDir, func(path string, e fs.DirEntry, err error) error {
 		if e.IsDir() {
 			return nil
 		}
@@ -715,7 +707,7 @@ func Scrub(opts ScrubOpts) {
 	if err != nil {
 		logScrubError(SCRUB_EOTHER, "scrub walk had an error: %s", err)
 	}
-	atomic.StoreUint64(&_lastScrubObjectCount, objectCount)
+	atomic.StoreUint64(&_lastScrubbedObjects, objectCount)
 
 	close(dispatch)
 	err = errg.Wait()
@@ -726,14 +718,22 @@ func Scrub(opts ScrubOpts) {
 	atomic.AddUint64(&_scrubsCompleted, 1)
 }
 
-var rebalanceTrigger chan struct{} = make(chan struct{})
-var _scrubReplicationErrorCount uint64
-var _scrubCorruptionErrorCount uint64
-var _scrubOtherErrorCount uint64
-var _scrubsCompleted uint64
-var _scrubInProgress uint64
-var _lastScrubObjectCount uint64
-var _totalScrubbedObjectCount uint64
+var (
+	rebalanceTrigger chan struct{} = make(chan struct{})
+
+	_lastScrubbedBytes               uint64
+	_lastScrubbedObjects             uint64
+	_lastScrubCorruptionErrorCount   uint64
+	_lastScrubOtherErrorCount        uint64
+	_lastScrubReplicationErrorCount  uint64
+	_totalScrubbedBytes              uint64
+	_totalScrubbedObjects            uint64
+	_totalScrubCorruptionErrorCount  uint64
+	_totalScrubOtherErrorCount       uint64
+	_totalScrubReplicationErrorCount uint64
+	_scrubInProgress                 uint64
+	_scrubsCompleted                 uint64
+)
 
 const (
 	SCRUB_EOTHER = iota
@@ -744,11 +744,11 @@ const (
 func logScrubError(class int, format string, a ...interface{}) {
 	switch class {
 	case SCRUB_EREPL:
-		atomic.AddUint64(&_scrubReplicationErrorCount, 1)
+		atomic.AddUint64(&_totalScrubReplicationErrorCount, 1)
 	case SCRUB_ECORRUPT:
-		atomic.AddUint64(&_scrubCorruptionErrorCount, 1)
+		atomic.AddUint64(&_totalScrubCorruptionErrorCount, 1)
 	default:
-		atomic.AddUint64(&_scrubOtherErrorCount, 1)
+		atomic.AddUint64(&_totalScrubOtherErrorCount, 1)
 	}
 	log.Printf(format, a...)
 }
@@ -759,9 +759,9 @@ func ScrubForever() {
 	fullScrubTicker := time.NewTicker(5 * time.Minute)
 	fastScrubTicker := time.NewTicker(30 * time.Second)
 	for {
-		startCfg := GetPlacementConfig()
+		startCfg := GetClusterConfig()
 		Scrub(ScrubOpts{Full: full}) // XXX config full and not.
-		endCfg := GetPlacementConfig()
+		endCfg := GetClusterConfig()
 		if startCfg != endCfg {
 			// The config changed while scrubbing, we must scrub again with
 			// the new config to handle any placement changes.
@@ -782,22 +782,32 @@ func ScrubForever() {
 func nodeInfoHandler(w http.ResponseWriter, req *http.Request) {
 
 	counters := struct {
-		ScrubReplicationErrorCount uint64
-		ScrubCorruptionErrorCount  uint64
-		ScrubOtherErrorCount       uint64
-		ScrubsCompleted            uint64
-		LastScrubObjectCount       uint64
-		TotalScrubbedObjectCount   uint64
-		ScrubInProgress            uint64
-	}{
-		ScrubReplicationErrorCount: atomic.LoadUint64(&_scrubReplicationErrorCount),
-		ScrubCorruptionErrorCount:  atomic.LoadUint64(&_scrubCorruptionErrorCount),
-		ScrubOtherErrorCount:       atomic.LoadUint64(&_scrubOtherErrorCount),
-		ScrubsCompleted:            atomic.LoadUint64(&_scrubsCompleted),
+		LastScrubCorruptionErrorCount  uint64
+		LastScrubOtherErrorCount       uint64
+		LastScrubReplicationErrorCount uint64
+		LastScrubbedBytes              uint64
+		LastScrubbedObjects            uint64
 
-		LastScrubObjectCount:     atomic.LoadUint64(&_lastScrubObjectCount),
-		TotalScrubbedObjectCount: atomic.LoadUint64(&_totalScrubbedObjectCount),
-		ScrubInProgress:          uint64(atomic.LoadUint64(&_scrubInProgress)),
+		TotalScrubCorruptionErrorCount  uint64
+		TotalScrubOtherErrorCount       uint64
+		TotalScrubReplicationErrorCount uint64
+		TotalScrubbedBytes              uint64
+		TotalScrubbedObjects            uint64
+		ScrubInProgress                 uint64
+		ScrubsCompleted                 uint64
+	}{
+		LastScrubCorruptionErrorCount:   atomic.LoadUint64(&_lastScrubCorruptionErrorCount),
+		LastScrubOtherErrorCount:        atomic.LoadUint64(&_lastScrubOtherErrorCount),
+		LastScrubReplicationErrorCount:  atomic.LoadUint64(&_lastScrubReplicationErrorCount),
+		LastScrubbedBytes:               atomic.LoadUint64(&_lastScrubbedBytes),
+		LastScrubbedObjects:             atomic.LoadUint64(&_lastScrubbedObjects),
+		TotalScrubCorruptionErrorCount:  atomic.LoadUint64(&_totalScrubCorruptionErrorCount),
+		TotalScrubOtherErrorCount:       atomic.LoadUint64(&_totalScrubOtherErrorCount),
+		TotalScrubReplicationErrorCount: atomic.LoadUint64(&_totalScrubReplicationErrorCount),
+		TotalScrubbedBytes:              atomic.LoadUint64(&_totalScrubbedBytes),
+		TotalScrubbedObjects:            atomic.LoadUint64(&_totalScrubbedObjects),
+		ScrubInProgress:                 uint64(atomic.LoadUint64(&_scrubInProgress)),
+		ScrubsCompleted:                 atomic.LoadUint64(&_scrubsCompleted),
 	}
 
 	buf, err := json.Marshal(&counters)
@@ -809,75 +819,195 @@ func nodeInfoHandler(w http.ResponseWriter, req *http.Request) {
 	w.Write(buf)
 }
 
-func main() {
+type ClusterConfig struct {
+	ConfigYaml       []byte
+	ClusterSecret    string
+	PlacementRules   []CrushSelection
+	StorageHierarchy *StorageHierarchy
+}
 
-	flag.Parse()
+func (cfg *ClusterConfig) Crush(k string) ([]Location, error) {
+	return cfg.StorageHierarchy.Crush(k, cfg.PlacementRules)
+}
 
-	if *ListenAddress == "" {
-		log.Fatalf("-listen-address not specified")
+var _clusterConfig atomic.Value
+
+func SetClusterConfig(cfg *ClusterConfig) {
+	_clusterConfig.Store(cfg)
+	select {
+	case rebalanceTrigger <- struct{}{}:
+	default:
+	}
+}
+
+func GetClusterConfig() *ClusterConfig {
+	return _clusterConfig.Load().(*ClusterConfig)
+}
+
+func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
+
+	newConfig := &ClusterConfig{
+		ConfigYaml: configYamlBytes,
 	}
 
-	hostName, err := os.Hostname()
+	rawConfig := struct {
+		ClusterSecret  string   `yaml:"cluster-secret"`
+		StorageSchema  string   `yaml:"storage-schema"`
+		PlacementRules []string `yaml:"placement-rules"`
+		StorageNodes   []string `yaml:"storage-nodes"`
+	}{}
+
+	decoder := yaml.NewDecoder(bytes.NewReader(configYamlBytes))
+	decoder.KnownFields(true)
+	err := decoder.Decode(&rawConfig)
 	if err != nil {
-		panic(err)
+		return nil, fmt.Errorf("unable to load yaml config: %w", err)
 	}
 
-	_, err = os.Stat(*DataDir)
+	newConfig.ClusterSecret = rawConfig.ClusterSecret
+
+	// TODO - rename to FromSchema
+	newConfig.StorageHierarchy, err = NewStorageHierarchyFromSpec(rawConfig.StorageSchema)
 	if err != nil {
-		log.Fatalf("error checking -data-dir: %s", err)
+		return nil, fmt.Errorf("unable parse storage-schema %q: %w", rawConfig.StorageSchema, err)
 	}
 
-	ThisLocation = Location{
-		{"host", hostName},
-		{"server", fmt.Sprintf("http://%s", *ListenAddress)},
-	}
-
-	storageHierarchy, err := NewStorageHierarchyFromSpec("host server")
-	if err != nil {
-		panic(err)
-	}
-
-	nodes := []*StorageNodeInfo{
-		&StorageNodeInfo{
-			Location: Location{
-				{"host", "black"},
-				{"server", "http://127.0.0.1:5000"},
-			},
-			TotalSpace: 100,
-		},
-		&StorageNodeInfo{
-			Location: Location{
-				{"host", "black"},
-				{"server", "http://127.0.0.1:5001"},
-			},
-			TotalSpace: 100,
-		},
-	}
-
-	for _, ni := range nodes {
-		err := storageHierarchy.AddStorageNode(ni)
+	parseNodeInfo := func(s string) (*StorageNodeInfo, error) {
+		parts, err := shlex.Split(s)
 		if err != nil {
-			log.Fatalf("unable to configure storage hierarchy: %s", err)
+			return nil, fmt.Errorf("unable to split storage node spec %q into components: %w", err)
+		}
+		if len(parts) < 3 {
+			return nil, fmt.Errorf("storage node needs at least 3 components")
+		}
+
+		weight, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			return nil, fmt.Errorf("error parsing weight %q: %w", parts[0], err)
+		}
+
+		var defunct bool
+		switch parts[1] {
+		case "+":
+			defunct = false
+		case "!":
+			defunct = true
+		default:
+			return nil, fmt.Errorf("unknown node status %q, expected '+' or '!'", parts[1])
+		}
+
+		return &StorageNodeInfo{
+			TotalSpace: weight, // XXX rename to weight.
+			Failed:     defunct,
+			Location:   Location(parts[2:]),
+		}, nil
+	}
+
+	// TODO rename CrushSelection to PlacementRule
+	parsePlacementRule := func(s string) (CrushSelection, error) {
+		parts, err := shlex.Split(s)
+		if err != nil {
+			return CrushSelection{}, fmt.Errorf("unable to split placement rule %q into components: %w", err)
+		}
+		if len(parts) < 1 {
+			return CrushSelection{}, fmt.Errorf("unexpected empty placement rule")
+		}
+		switch parts[0] {
+		case "select":
+			if len(parts) != 3 {
+				return CrushSelection{}, fmt.Errorf("select placement rules require 2 arguments")
+			}
+			typeName := parts[1]
+			count, err := strconv.Atoi(parts[2])
+			if err != nil {
+				return CrushSelection{}, fmt.Errorf("unable to parse select count %q: %w", err)
+			}
+			return CrushSelection{
+				Type:  typeName,
+				Count: count,
+			}, nil
+		default:
+			return CrushSelection{}, fmt.Errorf("unexpected placement operator %q", parts[0])
 		}
 	}
 
-	storageHierarchy.Finish()
+	for _, placementRuleString := range rawConfig.PlacementRules {
+		placementRule, err := parsePlacementRule(placementRuleString)
+		if err != nil {
+			return nil, fmt.Errorf("unable parse placement rule %q: %w", placementRuleString, err)
+		}
+		newConfig.PlacementRules = append(newConfig.PlacementRules, placementRule)
+	}
 
-	log.Printf("serving hierarchy:\n%s\n", storageHierarchy.AsciiTree())
+	for _, storageNodeString := range rawConfig.StorageNodes {
+		nodeInfo, err := parseNodeInfo(storageNodeString)
+		if err != nil {
+			return nil, fmt.Errorf("unable parse %q storage-schema: %w", storageNodeString, err)
+		}
+		err = newConfig.StorageHierarchy.AddStorageNode(nodeInfo)
+		if err != nil {
+			return nil, fmt.Errorf("unable add %q to storage hierarchy: %w", storageNodeString, err)
+		}
+	}
+	newConfig.StorageHierarchy.Finish()
 
-	SetPlacementConfig(&PlacementConfig{
-		hierarchy: storageHierarchy,
-		selectors: []CrushSelection{
-			CrushSelection{
-				Type:  "host",
-				Count: 1,
-			},
-			CrushSelection{
-				Type:  "server",
-				Count: 2,
-			},
-		},
-	})
+	return newConfig, nil
+}
+
+func main() {
+
+	listenAddress := flag.String("listen-address", "", "Address to listen on.")
+	location := flag.String("location", "", "Storage location specification, defaults to http://${listen-address}.")
+	dataDir := flag.String("data-dir", "", "Directory to store objects under.")
+
+	flag.Parse()
+
+	if *dataDir == "" {
+		log.Fatalf("-data-dir not specified.")
+	}
+
+	_, err := os.Stat(*dataDir)
+	if err != nil {
+		log.Fatalf("error checking -data-dir: %s", err)
+	}
+	DataDir = *dataDir
+
+	if *listenAddress == "" {
+		log.Fatalf("-listen-address not specified.")
+	}
+
+	if *location == "" {
+		*location = fmt.Sprintf("http://%s", *listenAddress)
+	}
+	parsedLocation, err := shlex.Split(*location)
+	if err != nil {
+		log.Fatalf("error parsing -location: %s", err)
+	}
+	ThisLocation = Location(parsedLocation)
+
+	log.Printf("serving location %v", ThisLocation)
+
+	clusterConfig, err := ParseClusterConfig([]byte(`
+cluster-secret: abc
+storage-schema: host
+placement-rules:
+    - select host 1
+    - select port 2
+storage-nodes:
+    - 100 + http://127.0.0.1:5000
+    - 100 ! http://127.0.0.1:5001
+`))
+	if err != nil {
+		log.Fatalf("error parsing config: %s", err)
+	}
+
+	if !clusterConfig.StorageHierarchy.ContainsStorageNodeAtLocation(ThisLocation) {
+		log.Printf("WARNING: config storage hierarchy does not contain %s.", ThisLocation)
+	}
+
+	log.Printf("serving hierarchy:\n%s\n", clusterConfig.StorageHierarchy.AsciiTree())
+
+	SetClusterConfig(clusterConfig)
 
 	http.HandleFunc("/put", putHandler)
 	http.HandleFunc("/get", getHandler)
@@ -885,8 +1015,8 @@ func main() {
 	http.HandleFunc("/delete", deleteHandler)
 	http.HandleFunc("/node_info", nodeInfoHandler)
 
-	log.Printf("serving on %s", *ListenAddress)
+	log.Printf("serving on %s", *listenAddress)
 
 	go ScrubForever()
-	http.ListenAndServe(*ListenAddress, nil)
+	http.ListenAndServe(*listenAddress, nil)
 }
