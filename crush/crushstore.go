@@ -892,12 +892,12 @@ func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 
 		var defunct bool
 		switch parts[1] {
-		case "+":
+		case "healthy":
 			defunct = false
-		case "!":
+		case "defunct":
 			defunct = true
 		default:
-			return nil, fmt.Errorf("unknown node status %q, expected '+' or '!'", parts[1])
+			return nil, fmt.Errorf("unknown node status %q, expected 'healthy' or 'defunct'", parts[1])
 		}
 
 		return &StorageNodeInfo{
@@ -990,7 +990,9 @@ func WatchClusterConfigForever(configPath string) {
 			log.Printf("detected config change, reloading.")
 			err = ReloadClusterConfigFromFile(configPath)
 			if err != nil {
-				log.Fatalf("error reloading config: %s", err)
+				log.Printf("error reloading config: %s", err)
+				time.Sleep(1 * time.Second)
+				continue
 			}
 			lastUpdate = stat.ModTime()
 		}

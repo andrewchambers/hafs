@@ -279,7 +279,7 @@ func (h *StorageHierarchy) Finish() {
 			}
 		}
 
-		n.Selector = NewHashingSelector(n.Children)
+		n.Selector = NewStrawSelector(n.Children)
 	}
 	recurse(h.Root)
 }
