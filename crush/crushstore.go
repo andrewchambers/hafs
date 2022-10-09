@@ -525,7 +525,7 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	copy(obj[32:40], objStampBytes[:])
 
 	// Write object.
-	tmpF, err := os.CreateTemp(DataDir, "obj.*.tmp")
+	tmpF, err := os.CreateTemp(DataDir, "obj*$tmp") // Use a suffix that our key escape handles.
 	if err != nil {
 		internalError(w, "io error creating temporary file: %s", err)
 		return
@@ -786,8 +786,23 @@ func Scrub(opts ScrubOpts) {
 		if e.IsDir() {
 			return nil
 		}
-		if strings.HasSuffix(path, ".tmp") {
-			// TODO cleanup old tmp files.
+		if strings.HasSuffix(path, "$tmp") {
+			stat, err := os.Stat(path)
+			if err != nil {
+				if errors.Is(err, os.ErrNotExist) {
+					return nil
+				}
+				logScrubError(SCRUB_EOTHER, "error stating temporary file: %s", err)
+				return nil
+			}
+			// Cleanup interrupted puts after a long delay.
+			if stat.ModTime().Add(24 * 90 * time.Hour).Before(time.Now()) {
+				log.Printf("scrubber removing expired temporary file %q", path)
+				err := os.Remove(path)
+				if err != nil {
+					logScrubError(SCRUB_EOTHER, "error removing %q: %s", path, err)
+				}
+			}
 			return nil
 		}
 		dispatch <- path
