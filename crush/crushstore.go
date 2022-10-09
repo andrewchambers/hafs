@@ -141,6 +141,12 @@ type ObjMeta struct {
 	CreatedAtUnixMicro uint64
 }
 
+func internalError(w http.ResponseWriter, format string, a ...interface{}) {
+	log.Printf(format, a...)
+	w.WriteHeader(http.StatusInternalServerError)
+	w.Write([]byte("internal server error"))
+}
+
 func checkHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "GET" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -149,27 +155,31 @@ func checkHandler(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
-		panic("TODO")
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
-	f, err := os.Open(filepath.Join(DataDir, k))
+	objPath := filepath.Join(DataDir, k)
+	f, err := os.Open(objPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
-		// XXX
-		panic(err)
+		internalError(w, "io error opening %q: %s", objPath, err)
+		return
 	}
 	defer f.Close()
 	stat, err := f.Stat()
 	if err != nil {
-		panic(err)
+		internalError(w, "io error stating %q: %s", objPath, err)
+		return
 	}
 
 	stampBytes := [8]byte{}
 	_, err = f.ReadAt(stampBytes[:], 32)
 	if err != nil {
-		panic(err)
+		internalError(w, "io error reading %q: %s", objPath, err)
+		return
 	}
 	stamp := ObjStampFromBytes(stampBytes[:])
 	buf, err := json.Marshal(ObjMeta{
@@ -178,7 +188,8 @@ func checkHandler(w http.ResponseWriter, req *http.Request) {
 		CreatedAtUnixMicro: stamp.CreatedAtUnixMicro,
 	})
 	if err != nil {
-		panic(err)
+		internalError(w, "error marshalling response: %s", err)
+		return
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.Write(buf)
@@ -204,14 +215,17 @@ func getHandler(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
-		panic("TODO")
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
+	objPath := filepath.Join(DataDir, k)
 	f, err := os.Open(filepath.Join(DataDir, k))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			locs, err := GetClusterConfig().Crush(k)
 			if err != nil {
-				panic(err)
+				internalError(w, "error placing %q: %s", k, err)
+				return
 			}
 			primaryLoc := locs[0]
 			if ThisLocation.Equals(primaryLoc) {
@@ -223,15 +237,15 @@ func getHandler(w http.ResponseWriter, req *http.Request) {
 			http.Redirect(w, req, endpoint, http.StatusTemporaryRedirect)
 			return
 		}
-		// XXX
-		panic(err)
+		internalError(w, "io error opening %q: %s", objPath, err)
+		return
 	}
 	defer f.Close()
 
 	stat, err := f.Stat()
 	if err != nil {
-		// XXX
-		panic(err)
+		internalError(w, "io error statting %q: %s", objPath, err)
+		return
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()-40))
@@ -247,13 +261,15 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
-		panic("XXX")
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 	objPath := filepath.Join(DataDir, k)
 
 	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
-		panic(err)
+		internalError(w, "error placing %q: %s", k, err)
+		return
 	}
 	primaryLoc := locs[0]
 	isPrimary := primaryLoc.Equals(ThisLocation)
@@ -269,25 +285,32 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 	err = req.ParseMultipartForm(16 * 1024 * 1024)
 	if err != nil {
-		panic(err)
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 
 	dataFile, _, err := req.FormFile("data")
 	if err != nil {
-		panic(err)
+		w.WriteHeader(http.StatusBadRequest)
+		w.Write([]byte("missing data field"))
+		return
 	}
 	defer dataFile.Close()
 
 	// Write object.
 	tmpF, err := os.CreateTemp(DataDir, "obj.*.tmp")
 	if err != nil {
-		panic(err)
+		internalError(w, "io error creating temporary file: %s", err)
+		return
 	}
 
 	removeTmp := true
 	defer func() {
 		if removeTmp {
-			_ = os.Remove(tmpF.Name())
+			err := os.Remove(tmpF.Name())
+			if err != nil {
+				log.Printf("io error removing %q", tmpF.Name())
+			}
 		}
 	}()
 
@@ -312,11 +335,13 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		stamp.FieldsFromBytes(header[32:40])
 		_, err = hasher.Write(header[32:40])
 		if err != nil {
-			panic(err)
+			internalError(w, "error hashing: %s", err)
+			return
 		}
 		_, err = tmpF.Write(header[:])
 		if err != nil {
-			panic(err)
+			internalError(w, "io error writing %q: %s", tmpF.Name(), err)
+			return
 		}
 	} else {
 		header := [40]byte{}
@@ -325,48 +350,60 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		stampBytes := stamp.ToBytes()
 		_, err = hasher.Write(stampBytes[:])
 		if err != nil {
-			panic(err)
+			internalError(w, "error hashing: %s", err)
+			return
 		}
 		copy(header[32:], stampBytes[:])
 		_, err := tmpF.Write(header[:])
 		if err != nil {
-			panic(err)
+			internalError(w, "io error writing %q: %s", tmpF.Name(), err)
+			return
 		}
 	}
 
 	_, err = io.Copy(io.MultiWriter(tmpF, hasher), dataFile)
 	if err != nil {
-		panic(err)
+		internalError(w, "io error writing %q: %s", tmpF.Name(), err)
+		return
 	}
 
 	if isReplication {
 		actualHash := [32]byte{}
 		copy(actualHash[:], hasher.Sum(nil))
 		if hash != actualHash {
-			panic(fmt.Errorf(
-				"sent hash %s did not equal computed hash %s",
-				hex.EncodeToString(hash[:]),
-				hex.EncodeToString(actualHash[:])))
+			w.WriteHeader(http.StatusBadRequest)
+			io.WriteString(w,
+				fmt.Sprintf(
+					"sent hash %s did not equal computed hash %s",
+					hex.EncodeToString(hash[:]),
+					hex.EncodeToString(actualHash[:]),
+				),
+			)
+			return
+
 		}
 	} else {
 		copy(hash[:], hasher.Sum(nil))
 		_, err = tmpF.WriteAt(hash[:], 0)
 		if err != nil {
-			panic(err)
+			internalError(w, "io error writing %q: %s", tmpF.Name(), err)
+			return
 		}
 	}
 
 	existingF, err := os.Open(objPath)
 	if err != nil {
 		if !errors.Is(err, fs.ErrNotExist) {
-			panic(err)
+			internalError(w, "io error opening %q: %s", objPath, err)
+			return
 		}
 	}
 	if existingF != nil {
 		existingHeader := [40]byte{}
 		_, err := existingF.ReadAt(existingHeader[:], 0)
 		if err != nil {
-			panic(err)
+			internalError(w, "io error reading %q: %s", objPath, err)
+			return
 		}
 
 		existingStamp := ObjStampFromBytes(existingHeader[32:])
@@ -388,17 +425,20 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 	err = tmpF.Sync()
 	if err != nil {
-		panic(err)
+		internalError(w, "io error syncing %q: %s", tmpF.Name(), err)
+		return
 	}
 
 	err = tmpF.Close()
 	if err != nil {
-		panic(err)
+		internalError(w, "io error closing %q: %s", tmpF.Name(), err)
+		return
 	}
 
 	err = os.Rename(tmpF.Name(), objPath)
 	if err != nil {
-		panic(err)
+		internalError(w, "io overwriting %q: %s", objPath, err)
+		return
 	}
 	// XXX TODO
 	// FlushDirectory()
@@ -419,7 +459,9 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 			if isReplication {
 				meta, ok, err := checkObj(server, k)
 				if err != nil {
-					panic(err)
+					log.Printf("error checking %q@%s: %s", k, server, err)
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
 				}
 				if ok && stamp.Tombstone == meta.Tombstone {
 					// Don't need to replicate, the remote is up to date.
@@ -429,13 +471,16 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 			objF, err := os.Open(objPath)
 			if err != nil {
-				panic(err)
+				internalError(w, "io error opening %q: %s", objPath, err)
+				return
 			}
 			defer objF.Close()
 			log.Printf("replicating %q to %s", k, server)
 			err = replicateObj(server, k, objF)
 			if err != nil {
-				panic(err)
+				log.Printf("error replicating %q: %s", objPath, err)
+				w.WriteHeader(http.StatusServiceUnavailable)
+				return
 			}
 		}
 	}
@@ -450,13 +495,15 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	q := req.URL.Query()
 	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
-		panic("XXX")
+		w.WriteHeader(http.StatusBadRequest)
+		return
 	}
 	objPath := filepath.Join(DataDir, k)
 
 	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
-		panic(err)
+		internalError(w, "error placing %q: %s", k, err)
+		return
 	}
 	primaryLoc := locs[0]
 
@@ -480,34 +527,42 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	// Write object.
 	tmpF, err := os.CreateTemp(DataDir, "obj.*.tmp")
 	if err != nil {
-		panic(err)
+		internalError(w, "io error creating temporary file: %s", err)
+		return
 	}
 	defer tmpF.Close()
 	removeTmp := true
 	defer func() {
 		if removeTmp {
-			_ = os.Remove(tmpF.Name())
+			err := os.Remove(tmpF.Name())
+			if err != nil {
+				log.Printf("io removing %q: %s", tmpF.Name(), err)
+			}
 		}
 	}()
 
 	_, err = tmpF.Write(obj[:])
 	if err != nil {
-		panic(err)
+		internalError(w, "io error writing %q: %s", tmpF.Name(), err)
+		return
 	}
 
 	err = tmpF.Sync()
 	if err != nil {
-		panic(err)
+		internalError(w, "io error syncing %q: %s", tmpF.Name(), err)
+		return
 	}
 
 	err = tmpF.Close()
 	if err != nil {
-		panic(err)
+		internalError(w, "io error closing %q: %s", tmpF.Name(), err)
+		return
 	}
 
 	err = os.Rename(tmpF.Name(), objPath)
 	if err != nil {
-		panic(err)
+		internalError(w, "io overwriting %q: %s", objPath, err)
+		return
 	}
 	removeTmp = false
 
@@ -522,13 +577,16 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 		server := loc[len(loc)-1]
 		objF, err := os.Open(objPath)
 		if err != nil {
-			panic(err)
+			internalError(w, "io error opening %q: %s", objPath, err)
+			return
 		}
 		defer objF.Close()
 		log.Printf("replicating deletion of %q to %s", k, server)
 		err = replicateObj(server, k, objF)
 		if err != nil {
-			panic(err)
+			log.Printf("error replicating %q: %s", objPath, err)
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
 		}
 	}
 }
@@ -844,7 +902,8 @@ func nodeInfoHandler(w http.ResponseWriter, req *http.Request) {
 
 	buf, err := json.Marshal(&counters)
 	if err != nil {
-		panic(err)
+		internalError(w, "unable to marshal counters: %s", err)
+		return
 	}
 
 	w.Header().Set("Content-Type", "application/json")
