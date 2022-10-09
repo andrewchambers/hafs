@@ -19,6 +19,7 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -26,6 +27,10 @@ import (
 	"golang.org/x/sync/errgroup"
 	"gopkg.in/yaml.v3"
 	"lukechampine.com/blake3"
+)
+
+const (
+	TOMBSTONE_EXPIRY = 120 * time.Second // TODO a real/configurable value.
 )
 
 var (
@@ -316,7 +321,6 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 	hash := [32]byte{}
 	stamp := ObjStamp{}
-
 	hasher := blake3.New(32, nil)
 
 	if isReplication {
@@ -341,6 +345,10 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		_, err = tmpF.Write(header[:])
 		if err != nil {
 			internalError(w, "io error writing %q: %s", tmpF.Name(), err)
+			return
+		}
+
+		if stamp.IsExpired(time.Now(), TOMBSTONE_EXPIRY) {
 			return
 		}
 	} else {
@@ -445,33 +453,37 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	// Flush directory - can we batch these together with other requests?
 	removeTmp = false
 
-	if isPrimary {
-		// If this is primary, we must spread the
-		// data to all the other nodes in the placement.
-		// XXX do in parallel.
-		for i := 0; i < len(locs); i++ {
-			loc := locs[i]
-			if loc.Equals(ThisLocation) {
-				continue
-			}
+	if !isPrimary {
+		return
+	}
 
+	// We are the primary, we must spread the
+	// data to all the other nodes in the placement.
+	wg := &sync.WaitGroup{}
+	successfulReplications := new(uint64)
+	*successfulReplications = 1
+	for i := 1; i < len(locs); i++ {
+		loc := locs[i]
+		wg.Add(1)
+		go func() {
+			wg.Done()
 			server := loc[len(loc)-1]
 			if isReplication {
 				meta, ok, err := checkObj(server, k)
 				if err != nil {
 					log.Printf("error checking %q@%s: %s", k, server, err)
-					w.WriteHeader(http.StatusServiceUnavailable)
 					return
 				}
 				if ok && stamp.Tombstone == meta.Tombstone {
 					// Don't need to replicate, the remote is up to date.
-					continue
+					atomic.AddUint64(successfulReplications, 1)
+					return
 				}
 			}
 
 			objF, err := os.Open(objPath)
 			if err != nil {
-				internalError(w, "io error opening %q: %s", objPath, err)
+				log.Printf("io error opening %q: %s", objPath, err)
 				return
 			}
 			defer objF.Close()
@@ -479,10 +491,19 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 			err = replicateObj(server, k, objF)
 			if err != nil {
 				log.Printf("error replicating %q: %s", objPath, err)
-				w.WriteHeader(http.StatusServiceUnavailable)
 				return
 			}
-		}
+
+			atomic.AddUint64(successfulReplications, 1)
+		}()
+	}
+
+	wg.Wait()
+
+	minReplicas := uint64(len(locs))
+	if *successfulReplications < minReplicas { // XXX we could add a 'min replication param'
+		w.WriteHeader(http.StatusInternalServerError)
+		return
 	}
 }
 
@@ -584,8 +605,7 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 		log.Printf("replicating deletion of %q to %s", k, server)
 		err = replicateObj(server, k, objF)
 		if err != nil {
-			log.Printf("error replicating %q: %s", objPath, err)
-			w.WriteHeader(http.StatusServiceUnavailable)
+			internalError(w, "error replicating %q: %s", objPath, err)
 			return
 		}
 	}
@@ -665,7 +685,6 @@ func ScrubObject(objPath string, opts ScrubOpts) {
 		}
 
 		// We only trust a tombstone after it has been fully scrubbed.
-		const TOMBSTONE_EXPIRY = 120 * time.Second // TODO a real/configurable value.
 		if stamp.IsExpired(time.Now(), TOMBSTONE_EXPIRY) {
 			log.Printf("scrubber removing %q, it has expired", objPath)
 			err := os.Remove(objPath)
