@@ -145,7 +145,7 @@ type StorageHierarchy struct {
 	Root      *InternalNode
 }
 
-func NewStorageHierarchyFromSpec(s string) (*StorageHierarchy, error) {
+func NewStorageHierarchyFromSchema(s string) (*StorageHierarchy, error) {
 
 	types, err := shlex.Split(s)
 	if err != nil {
@@ -162,7 +162,7 @@ func NewStorageHierarchyFromSpec(s string) (*StorageHierarchy, error) {
 	}
 	for i, t := range h.Types {
 		if _, ok := h.TypeToIdx[t]; ok {
-			return nil, fmt.Errorf("duplicate type %s in spec", t)
+			return nil, fmt.Errorf("duplicate type %s in schema", t)
 		}
 		h.TypeToIdx[t] = i
 		h.IdxToType[i] = t

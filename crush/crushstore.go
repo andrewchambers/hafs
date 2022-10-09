@@ -14,6 +14,7 @@ import (
 	"log"
 	"mime/multipart"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -142,10 +143,11 @@ type ObjMeta struct {
 
 func checkHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "GET" {
-		panic("TODO")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
 	}
 	q := req.URL.Query()
-	k := q.Get("key")
+	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
 		panic("TODO")
 	}
@@ -182,19 +184,43 @@ func checkHandler(w http.ResponseWriter, req *http.Request) {
 	w.Write(buf)
 }
 
+type objectContentReadSeeker struct {
+	f *os.File
+}
+
+func (of *objectContentReadSeeker) Read(buf []byte) (int, error) {
+	return of.f.Read(buf)
+}
+
+func (of *objectContentReadSeeker) Seek(offset int64, whence int) (int64, error) {
+	return of.f.Seek(offset+40, whence)
+}
+
 func getHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "GET" {
-		panic("TODO")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
 	}
 	q := req.URL.Query()
-	k := q.Get("key")
+	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
 		panic("TODO")
 	}
 	f, err := os.Open(filepath.Join(DataDir, k))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			w.WriteHeader(http.StatusNotFound)
+			locs, err := GetClusterConfig().Crush(k)
+			if err != nil {
+				panic(err)
+			}
+			primaryLoc := locs[0]
+			if ThisLocation.Equals(primaryLoc) {
+				w.WriteHeader(http.StatusNotFound)
+				return
+			}
+			endpoint := fmt.Sprintf("%s/get?key=%s", primaryLoc[len(primaryLoc)-1], k)
+			log.Printf("redirecting get %q to %s", k, endpoint)
+			http.Redirect(w, req, endpoint, http.StatusTemporaryRedirect)
 			return
 		}
 		// XXX
@@ -202,28 +228,24 @@ func getHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	defer f.Close()
 
-	_, err = f.Seek(32, io.SeekStart)
-	if err != nil {
-		panic(err)
-	}
-
 	stat, err := f.Stat()
 	if err != nil {
 		// XXX
 		panic(err)
 	}
 	w.Header().Set("Content-Type", "application/octet-stream")
-	w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()-32))
-	http.ServeContent(w, req, k, stat.ModTime(), f)
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", stat.Size()-40))
+	http.ServeContent(w, req, k, stat.ModTime(), &objectContentReadSeeker{f})
 }
 
 func putHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "POST" {
-		panic("XXX")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
 	}
 
 	q := req.URL.Query()
-	k := q.Get("key")
+	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
 		panic("XXX")
 	}
@@ -421,11 +443,12 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "POST" {
-		panic("XXX")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
 	}
 
 	q := req.URL.Query()
-	k := q.Get("key")
+	k := url.QueryEscape(q.Get("key"))
 	if k == "" {
 		panic("XXX")
 	}
@@ -512,7 +535,16 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 
 func ScrubObject(objPath string, opts ScrubOpts) {
 	log.Printf("scrubbing object stored at %q", objPath)
-	k := filepath.Base(objPath)
+
+	k, err := url.QueryUnescape(filepath.Base(objPath))
+	if err != nil {
+		log.Printf("scrubber removing %q, not a valid object")
+		err = os.Remove(objPath)
+		if err != nil {
+			logScrubError(SCRUB_ECORRUPT, "io error removing %q: %s", objPath, err)
+		}
+		return
+	}
 
 	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
@@ -870,8 +902,7 @@ func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 
 	newConfig.ClusterSecret = rawConfig.ClusterSecret
 
-	// TODO - rename to FromSchema
-	newConfig.StorageHierarchy, err = NewStorageHierarchyFromSpec(rawConfig.StorageSchema)
+	newConfig.StorageHierarchy, err = NewStorageHierarchyFromSchema(rawConfig.StorageSchema)
 	if err != nil {
 		return nil, fmt.Errorf("unable parse storage-schema %q: %w", rawConfig.StorageSchema, err)
 	}
