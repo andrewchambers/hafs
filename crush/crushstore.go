@@ -212,6 +212,17 @@ func (of *objectContentReadSeeker) Seek(offset int64, whence int) (int64, error)
 	return of.f.Seek(offset+40, whence)
 }
 
+func flushDir(dirPath string) error {
+	// XXX possible cache opens?
+	d, err := os.Open(dirPath)
+	if err != nil {
+		return err
+	}
+	defer d.Close()
+	// XXX possible to batch syncs across goroutines?
+	return d.Sync()
+}
+
 func getHandler(w http.ResponseWriter, req *http.Request) {
 	if req.Method != "GET" {
 		w.WriteHeader(http.StatusMethodNotAllowed)
@@ -269,7 +280,9 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	objPath := filepath.Join(DataDir, k)
+
+	objDir := DataDir
+	objPath := filepath.Join(objDir, k)
 
 	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
@@ -448,12 +461,14 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		internalError(w, "io overwriting %q: %s", objPath, err)
 		return
 	}
-	// XXX TODO
-	// FlushDirectory()
-	// Flush directory - can we batch these together with other requests?
 	removeTmp = false
 
 	if !isPrimary {
+		err := flushDir(objDir)
+		if err != nil {
+			internalError(w, "io error flushing %q: %s", objDir, err)
+			return
+		}
 		return
 	}
 
@@ -461,7 +476,6 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 	// data to all the other nodes in the placement.
 	wg := &sync.WaitGroup{}
 	successfulReplications := new(uint64)
-	*successfulReplications = 1
 	for i := 1; i < len(locs); i++ {
 		loc := locs[i]
 		wg.Add(1)
@@ -474,8 +488,9 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 					log.Printf("error checking %q@%s: %s", k, server, err)
 					return
 				}
-				if ok && stamp.Tombstone == meta.Tombstone {
-					// Don't need to replicate, the remote is up to date.
+				if ok && (stamp.Tombstone == meta.Tombstone || meta.Tombstone) {
+					// We don't need to replicate if the remote has matching objects and
+					// the tombstones match or the remote node has already deleted this key.
 					atomic.AddUint64(successfulReplications, 1)
 					return
 				}
@@ -496,6 +511,14 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 
 			atomic.AddUint64(successfulReplications, 1)
 		}()
+	}
+
+	err = flushDir(objDir)
+	if err == nil {
+		atomic.AddUint64(successfulReplications, 1)
+	} else {
+		log.Printf("io error flushing %q: %s", objDir, err)
+		return
 	}
 
 	wg.Wait()
@@ -519,7 +542,9 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	objPath := filepath.Join(DataDir, k)
+
+	objDir := DataDir
+	objPath := filepath.Join(objDir, k)
 
 	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
@@ -587,28 +612,47 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 	}
 	removeTmp = false
 
-	// XXX TODO
-	// FlushDirectory()
-	// Flush directory - can we batch these together with other requests?
+	wg := &sync.WaitGroup{}
+	successfulReplications := new(uint64)
 
-	// Replicate the delete.
-	// XXX do in parallel.
 	for i := 1; i < len(locs); i++ {
 		loc := locs[i]
-		server := loc[len(loc)-1]
-		objF, err := os.Open(objPath)
-		if err != nil {
-			internalError(w, "io error opening %q: %s", objPath, err)
-			return
-		}
-		defer objF.Close()
-		log.Printf("replicating deletion of %q to %s", k, server)
-		err = replicateObj(server, k, objF)
-		if err != nil {
-			internalError(w, "error replicating %q: %s", objPath, err)
-			return
-		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			server := loc[len(loc)-1]
+			objF, err := os.Open(objPath)
+			if err != nil {
+				log.Printf("io error opening %q: %s", objPath, err)
+				return
+			}
+			defer objF.Close()
+			log.Printf("replicating deletion of %q to %s", k, server)
+			err = replicateObj(server, k, objF)
+			if err != nil {
+				log.Printf("error replicating %q: %s", objPath, err)
+				return
+			}
+			atomic.AddUint64(successfulReplications, 1)
+		}()
 	}
+
+	err = flushDir(objDir)
+	if err == nil {
+		atomic.AddUint64(successfulReplications, 1)
+	} else {
+		log.Printf("io error flushing %q: %s", objDir, err)
+		return
+	}
+
+	wg.Wait()
+
+	minReplicas := uint64(len(locs))
+	if *successfulReplications < minReplicas { // XXX we could add a 'min replication param'
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+
 }
 
 func ScrubObject(objPath string, opts ScrubOpts) {
