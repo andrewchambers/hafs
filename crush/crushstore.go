@@ -217,7 +217,20 @@ func (of *objectContentReadSeeker) Read(buf []byte) (int, error) {
 }
 
 func (of *objectContentReadSeeker) Seek(offset int64, whence int) (int64, error) {
-	return of.f.Seek(offset+40, whence)
+	const HDR = 40
+	switch whence {
+	case io.SeekCurrent:
+		o, err := of.f.Seek(offset, whence)
+		return o - HDR, err
+	case io.SeekStart:
+		o, err := of.f.Seek(offset+HDR, whence)
+		return o - HDR, err
+	case io.SeekEnd:
+		o, err := of.f.Seek(offset, whence)
+		return o - HDR, err
+	default:
+		panic("bad whence")
+	}
 }
 
 func flushDir(dirPath string) error {
@@ -1311,5 +1324,8 @@ func main() {
 	go WatchClusterConfigForever(*clusterConfigFile)
 	go ScrubForever()
 
-	http.ListenAndServe(*listenAddress, nil)
+	err = http.ListenAndServe(*listenAddress, nil)
+	if err != nil {
+		log.Fatalf("error serving requests: %s", err)
+	}
 }
