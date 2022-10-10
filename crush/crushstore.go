@@ -23,20 +23,28 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/google/shlex"
 	"golang.org/x/sync/errgroup"
+	"golang.org/x/sys/unix"
 	"gopkg.in/yaml.v3"
 	"lukechampine.com/blake3"
 )
 
 const (
 	TOMBSTONE_EXPIRY = 120 * time.Second // TODO a real/configurable value.
+	DATA_DIRSHARDS   = 4096
 )
 
 var (
 	DataDir      string
 	ThisLocation Location
 )
+
+func objPathFromKey(k string) string {
+	h := xxhash.Sum64String(k) % DATA_DIRSHARDS
+	return fmt.Sprintf("%s/obj/%03x/%s", DataDir, h, url.QueryEscape(k))
+}
 
 func replicateObj(server string, k string, f *os.File) error {
 	r, w := io.Pipe()
@@ -163,7 +171,7 @@ func checkHandler(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	objPath := filepath.Join(DataDir, k)
+	objPath := objPathFromKey(k)
 	f, err := os.Open(objPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -234,8 +242,8 @@ func getHandler(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusBadRequest)
 		return
 	}
-	objPath := filepath.Join(DataDir, k)
-	f, err := os.Open(filepath.Join(DataDir, k))
+	objPath := objPathFromKey(k)
+	f, err := os.Open(objPath)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			locs, err := GetClusterConfig().Crush(k)
@@ -281,8 +289,8 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	objDir := DataDir
-	objPath := filepath.Join(objDir, k)
+	objPath := objPathFromKey(k)
+	objDir := filepath.Dir(objPath)
 
 	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
@@ -542,8 +550,8 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	objDir := DataDir
-	objPath := filepath.Join(objDir, k)
+	objPath := objPathFromKey(k)
+	objDir := filepath.Dir(objPath)
 
 	locs, err := GetClusterConfig().Crush(k)
 	if err != nil {
@@ -843,7 +851,7 @@ func Scrub(opts ScrubOpts) {
 	}
 
 	objectCount := uint64(0)
-	err := filepath.WalkDir(DataDir, func(path string, e fs.DirEntry, err error) error {
+	err := filepath.WalkDir(filepath.Join(DataDir, "obj"), func(path string, e fs.DirEntry, err error) error {
 		if e.IsDir() {
 			return nil
 		}
@@ -1180,6 +1188,76 @@ func WatchClusterConfigForever(configPath string) {
 	}
 }
 
+var _storeLockF *os.File
+
+func OpenDataDir(location Location, dataDir string) error {
+	_, err := os.Stat(dataDir)
+	if err != nil {
+		return err
+	}
+
+	// TODO grab lock.
+	_storeLockF, err = os.Create(filepath.Join(dataDir, "store.lock"))
+	if err != nil {
+		return err
+	}
+	flockT := unix.Flock_t{
+		Type:   unix.F_WRLCK,
+		Whence: 0,
+		Start:  0,
+		Len:    0,
+	}
+	err = unix.FcntlFlock(_storeLockF.Fd(), unix.F_SETLK, &flockT)
+	if err != nil {
+		return fmt.Errorf("unable to acquire lock: %w", err)
+	}
+
+	locationFile := filepath.Join(dataDir, "location")
+
+	locationBytes, err := json.Marshal(location)
+	if err != nil {
+		return err
+	}
+
+	_, err = os.Stat(locationFile)
+	if err == nil {
+		expectedLocationBytes, err := os.ReadFile(locationFile)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(locationBytes, expectedLocationBytes) {
+			return fmt.Errorf(
+				"store was last served at location %s, but now is at %s (manually remove %q to allow).",
+				string(expectedLocationBytes),
+				string(locationBytes),
+				locationFile,
+			)
+		}
+	} else if errors.Is(err, os.ErrNotExist) {
+		os.WriteFile(locationFile, locationBytes, 0o755)
+	} else {
+		return err
+	}
+
+	// TODO load lastscrub.json
+	for i := 0; i < DATA_DIRSHARDS; i++ {
+		p := filepath.Join(dataDir, fmt.Sprintf("obj/%03x", i))
+		_, err := os.Stat(p)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				err := os.MkdirAll(p, 0o755)
+				if err != nil {
+					return err
+				}
+			} else {
+				return err
+			}
+		}
+	}
+	DataDir = dataDir
+	return nil
+}
+
 func main() {
 
 	listenAddress := flag.String("listen-address", "", "Address to listen on.")
@@ -1188,16 +1266,6 @@ func main() {
 	clusterConfigFile := flag.String("cluster-config", "./crushstore-cluster.conf", "Directory to store objects under.")
 
 	flag.Parse()
-
-	if *dataDir == "" {
-		log.Fatalf("-data-dir not specified.")
-	}
-
-	_, err := os.Stat(*dataDir)
-	if err != nil {
-		log.Fatalf("error checking -data-dir: %s", err)
-	}
-	DataDir = *dataDir
 
 	if *listenAddress == "" {
 		log.Fatalf("-listen-address not specified.")
@@ -1210,9 +1278,20 @@ func main() {
 	if err != nil {
 		log.Fatalf("error parsing -location: %s", err)
 	}
+
+	if len(parsedLocation) == 0 {
+		log.Fatalf("-location must have at least one component")
+	}
+
 	ThisLocation = Location(parsedLocation)
 
-	log.Printf("serving location %v", ThisLocation)
+	if *dataDir == "" {
+		log.Fatalf("-data-dir not specified.")
+	}
+	err = OpenDataDir(ThisLocation, *dataDir)
+	if err != nil {
+		log.Fatalf("error preparing -data-dir: %s", err)
+	}
 
 	err = ReloadClusterConfigFromFile(*clusterConfigFile)
 	if err != nil {
@@ -1220,16 +1299,16 @@ func main() {
 	}
 	log.Printf("serving hierarchy:\n%s\n", GetClusterConfig().StorageHierarchy.AsciiTree())
 
-	go WatchClusterConfigForever(*clusterConfigFile)
-
 	http.HandleFunc("/put", putHandler)
 	http.HandleFunc("/get", getHandler)
 	http.HandleFunc("/check", checkHandler)
 	http.HandleFunc("/delete", deleteHandler)
 	http.HandleFunc("/node_info", nodeInfoHandler)
 
+	log.Printf("serving location %v", ThisLocation)
 	log.Printf("serving on %s", *listenAddress)
 
+	go WatchClusterConfigForever(*clusterConfigFile)
 	go ScrubForever()
 
 	http.ListenAndServe(*listenAddress, nil)
