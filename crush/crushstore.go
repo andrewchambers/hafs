@@ -1088,9 +1088,9 @@ func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 		}
 
 		return &StorageNodeInfo{
-			TotalSpace: weight, // XXX rename to weight.
-			Failed:     defunct,
-			Location:   Location(parts[2:]),
+			Weight:   weight,
+			Defunct:  defunct,
+			Location: Location(parts[2:]),
 		}, nil
 	}
 

@@ -22,7 +22,7 @@ type Node interface {
 	GetTypeIdx() int
 	GetChildren() []Node
 	GetWeight() int64
-	IsFailed() bool
+	IsDefunct() bool
 	GetParent() Node
 	IsLeaf() bool
 	Select(input int64, round int64) Node
@@ -49,10 +49,9 @@ func (l Location) String() string {
 }
 
 type StorageNodeInfo struct {
-	Location   Location
-	Failed     bool
-	UsedSpace  int64
-	TotalSpace int64
+	Location Location
+	Defunct  bool
+	Weight   int64
 }
 
 type StorageNode struct {
@@ -66,12 +65,12 @@ func (n *StorageNode) GetChildren() []Node {
 	return []Node{}
 }
 
-func (n *StorageNode) IsFailed() bool {
-	return n.Failed
+func (n *StorageNode) IsDefunct() bool {
+	return n.Defunct
 }
 
 func (n *StorageNode) GetWeight() int64 {
-	return n.TotalSpace
+	return n.Weight
 }
 
 func (n *StorageNode) GetTypeIdx() int {
@@ -101,9 +100,9 @@ type InternalNode struct {
 	Children    []Node
 	ChildNames  []string
 	NameToChild map[string]Node
-	Failed      bool
+	Defunct     bool
 	UsedSpace   int64
-	TotalSpace  int64
+	Weight      int64
 	Selector    Selector
 }
 
@@ -111,12 +110,12 @@ func (n *InternalNode) GetChildren() []Node {
 	return n.Children
 }
 
-func (n *InternalNode) IsFailed() bool {
-	return n.Failed
+func (n *InternalNode) IsDefunct() bool {
+	return n.Defunct
 }
 
 func (n *InternalNode) GetWeight() int64 {
-	return n.TotalSpace
+	return n.Weight
 }
 
 func (n *InternalNode) GetId() string {
@@ -258,11 +257,9 @@ func (h *StorageHierarchy) Finish() {
 			switch child := child.(type) {
 			case *InternalNode:
 				recurse(child)
-				n.UsedSpace += child.UsedSpace
-				n.TotalSpace += child.TotalSpace
+				n.Weight += child.Weight
 			case *StorageNode:
-				n.UsedSpace += child.UsedSpace
-				n.TotalSpace += child.TotalSpace
+				n.Weight += child.Weight
 			}
 		}
 		sort.Strings(n.ChildNames)
@@ -272,10 +269,10 @@ func (h *StorageHierarchy) Finish() {
 		}
 
 		if len(n.Children) != 0 {
-			n.Failed = true
+			n.Defunct = true
 			for _, child := range n.Children {
-				if !child.IsFailed() {
-					n.Failed = false
+				if !child.IsDefunct() {
+					n.Defunct = false
 				}
 			}
 		}
@@ -436,7 +433,7 @@ func contains(s []Node, n Node) bool {
 }
 
 func isDefunct(n Node) bool {
-	if n.IsLeaf() && n.IsFailed() {
+	if n.IsLeaf() && n.IsDefunct() {
 		return true
 	}
 	return false
@@ -452,11 +449,11 @@ func (h *StorageHierarchy) AsciiTree() string {
 				childT := t.AddBranch(name)
 				recurse(childT, child)
 			case *StorageNode:
-				status := "+"
-				if child.Failed {
-					status = "!"
+				status := "healthy"
+				if child.Defunct {
+					status = "defunct"
 				}
-				meta := fmt.Sprintf("%d %s", child.TotalSpace, status)
+				meta := fmt.Sprintf("%d %s", child.Weight, status)
 				t.AddBranch(name).SetMetaValue(meta)
 			}
 		}
