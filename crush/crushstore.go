@@ -675,7 +675,7 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 }
 
 func ScrubObject(objPath string, opts ScrubOpts) {
-	log.Printf("scrubbing object stored at %q", objPath)
+	log.Printf("scrubbing object at %q", objPath)
 
 	k, err := url.QueryUnescape(filepath.Base(objPath))
 	if err != nil {
