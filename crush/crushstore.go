@@ -518,7 +518,6 @@ func putHandler(w http.ResponseWriter, req *http.Request) {
 		atomic.AddUint64(successfulReplications, 1)
 	} else {
 		log.Printf("io error flushing %q: %s", objDir, err)
-		return
 	}
 
 	wg.Wait()
@@ -642,7 +641,6 @@ func deleteHandler(w http.ResponseWriter, req *http.Request) {
 		atomic.AddUint64(successfulReplications, 1)
 	} else {
 		log.Printf("io error flushing %q: %s", objDir, err)
-		return
 	}
 
 	wg.Wait()
