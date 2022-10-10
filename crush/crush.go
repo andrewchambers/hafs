@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sort"
 
+	"github.com/cespare/xxhash/v2"
 	"github.com/google/shlex"
 	"github.com/xlab/treeprint"
 )
@@ -298,7 +299,7 @@ func (h *StorageHierarchy) Crush(input string, selections []CrushSelection) ([]L
 	expectedCount := 1
 
 	nodes := []Node{h.Root}
-	hashedInput := btoi(digestString(input))
+	hashedInput := int64(xxhash.Sum64String(input))
 
 	for _, sel := range selections {
 		nodeType, ok := h.TypeToIdx[sel.Type]

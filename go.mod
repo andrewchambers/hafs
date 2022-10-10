@@ -4,6 +4,7 @@ go 1.17
 
 require (
 	github.com/apple/foundationdb/bindings/go v0.0.0-20200504101018-dabcd52bcec5
+	github.com/cespare/xxhash/v2 v2.1.2
 	github.com/cheynewallace/tabby v1.1.1
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510
 	github.com/hanwen/go-fuse/v2 v2.1.0

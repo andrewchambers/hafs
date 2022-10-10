@@ -1,9 +1,11 @@
 package main
 
 import (
-	"bytes"
 	"encoding/binary"
+	"io"
 	"math"
+
+	"github.com/cespare/xxhash/v2"
 )
 
 type StrawSelector struct {
@@ -53,6 +55,28 @@ func NewStrawSelector(nodes []Node) *StrawSelector {
 	return s
 }
 
+func weightedScore(child Node, straw int64, input int64, round int64) int64 {
+
+	digest := xxhash.Digest{}
+
+	err := binary.Write(&digest, binary.LittleEndian, input)
+	if err != nil {
+		panic(err)
+	}
+	err = binary.Write(&digest, binary.LittleEndian, round)
+	if err != nil {
+		panic(err)
+	}
+	_, err = io.WriteString(&digest, child.GetId())
+	if err != nil {
+		panic(err)
+	}
+	hash := int64(digest.Sum64())
+	hash = hash & 0xFFFF
+	var weightedScore = hash * straw
+	return weightedScore
+}
+
 func (s *StrawSelector) Select(input int64, round int64) Node {
 	var result Node
 	var hiScore = int64(-1)
@@ -67,24 +91,4 @@ func (s *StrawSelector) Select(input int64, round int64) Node {
 		panic("Illegal state")
 	}
 	return result
-}
-
-func weightedScore(child Node, straw int64, input int64, round int64) int64 {
-	var buf bytes.Buffer
-	err := binary.Write(&buf, binary.LittleEndian, input)
-	if err != nil {
-		panic(err)
-	}
-	err = binary.Write(&buf, binary.LittleEndian, round)
-	if err != nil {
-		panic(err)
-	}
-	_, err = buf.WriteString(child.GetId())
-	if err != nil {
-		panic(err)
-	}
-	hash := btoi(digestBytes(buf.Bytes()))
-	hash = hash & 0xFFFF
-	var weightedScore = hash * straw
-	return weightedScore
 }

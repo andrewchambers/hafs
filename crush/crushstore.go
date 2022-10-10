@@ -69,7 +69,7 @@ func replicateObj(server string, k string, f *os.File) error {
 	defer resp.Body.Close()
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return fmt.Errorf("unable to read response: %s", endpoint, err)
+		return fmt.Errorf("unable to read response from %s: %s", endpoint, err)
 	}
 
 	if resp.StatusCode != 200 {
@@ -658,7 +658,7 @@ func ScrubObject(objPath string, opts ScrubOpts) {
 
 	k, err := url.QueryUnescape(filepath.Base(objPath))
 	if err != nil {
-		log.Printf("scrubber removing %q, not a valid object")
+		log.Printf("scrubber removing %q, not a valid object", objPath)
 		err = os.Remove(objPath)
 		if err != nil {
 			logScrubError(SCRUB_ECORRUPT, "io error removing %q: %s", objPath, err)
@@ -1045,7 +1045,7 @@ func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 	parseNodeInfo := func(s string) (*StorageNodeInfo, error) {
 		parts, err := shlex.Split(s)
 		if err != nil {
-			return nil, fmt.Errorf("unable to split storage node spec %q into components: %w", err)
+			return nil, fmt.Errorf("unable to split storage node spec %q into components: %w", s, err)
 		}
 		if len(parts) < 3 {
 			return nil, fmt.Errorf("storage node needs at least 3 components")
@@ -1077,7 +1077,7 @@ func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 	parsePlacementRule := func(s string) (CrushSelection, error) {
 		parts, err := shlex.Split(s)
 		if err != nil {
-			return CrushSelection{}, fmt.Errorf("unable to split placement rule %q into components: %w", err)
+			return CrushSelection{}, fmt.Errorf("unable to split placement rule %q into components: %w", s, err)
 		}
 		if len(parts) < 1 {
 			return CrushSelection{}, fmt.Errorf("unexpected empty placement rule")
@@ -1090,7 +1090,7 @@ func ParseClusterConfig(configYamlBytes []byte) (*ClusterConfig, error) {
 			typeName := parts[1]
 			count, err := strconv.Atoi(parts[2])
 			if err != nil {
-				return CrushSelection{}, fmt.Errorf("unable to parse select count %q: %w", err)
+				return CrushSelection{}, fmt.Errorf("unable to parse select count %q: %w", parts[2], err)
 			}
 			return CrushSelection{
 				Type:  typeName,
