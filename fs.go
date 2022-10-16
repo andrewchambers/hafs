@@ -376,6 +376,7 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 			return currentIno, nil
 		})
 		if err != nil {
+			// XXX TODO log to a better place.
 			log.Printf("unable to allocate inode batch: %s", err)
 			time.Sleep(1 * time.Second)
 			continue
@@ -964,6 +965,9 @@ func (f *externalStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32
 
 func (f *externalStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 	n, err := f.storageObject.ReadAt(buf, int64(offset))
+	if err != nil && err != io.EOF {
+		log.Printf("error reading data from external storage: %s", err)
+	}
 	return uint32(n), err
 }
 
@@ -1004,11 +1008,6 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 
 	f.flushLock.Lock()
 	defer f.flushLock.Unlock()
-
-	_, err := f.tmpFile.Seek(0, 0)
-	if err != nil {
-		return err
-	}
 
 	size, err := storageWrite(f.storage, f.ino, f.tmpFile)
 	if err != nil {
@@ -1089,13 +1088,18 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			if err != nil {
 				return nil, Stat{}, err
 			}
+			dirty := uint32(0)
+			if opts.Truncate {
+				dirty = 1
+			}
 			f = &externalStoreReadWriteFile{
 				fs:      fs,
 				ino:     stat.Ino,
-				dirty:   atomicBool{1},
+				dirty:   atomicBool{dirty},
 				storage: stat.Storage,
 				tmpFile: tmpFile,
 			}
+
 		} else {
 			storageObject, err := storageOpen(stat.Storage, stat.Ino)
 			if err != nil {

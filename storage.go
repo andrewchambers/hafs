@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 
+	crushstore "github.com/andrewchambers/crushstore/client"
 	"github.com/minio/minio-go/v7"
 	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
 )
@@ -166,14 +167,117 @@ func (s *s3StorageEngine) Close() error {
 	return nil
 }
 
+type crushStoreStorageEngine struct {
+	client *crushstore.Client
+}
+
+type crushStoreObjectReader struct {
+	lock          sync.Mutex
+	obj           *crushstore.ObjectReader
+	currentOffset int64
+}
+
+func (r *crushStoreObjectReader) ReadAt(buf []byte, offset int64) (int, error) {
+	r.lock.Lock()
+	defer r.lock.Unlock()
+	if offset != r.currentOffset {
+		return 0, ErrNotSupported
+	}
+	n, err := io.ReadFull(r.obj, buf)
+	r.currentOffset += int64(n)
+	if err == io.ErrUnexpectedEOF {
+		err = io.EOF
+	}
+	return n, err
+}
+
+func (r *crushStoreObjectReader) Close() error {
+	return r.obj.Close()
+}
+
+func (s *crushStoreStorageEngine) Open(inode uint64) (readerAtCloser, error) {
+	obj, ok, err := s.client.Get(
+		fmt.Sprintf("%d.hafs", inode),
+		crushstore.GetOptions{},
+	)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, ErrNotExist
+	}
+	return &crushStoreObjectReader{
+		obj:           obj,
+		currentOffset: 0,
+	}, nil
+}
+
+func (s *crushStoreStorageEngine) Write(inode uint64, data *os.File) (int64, error) {
+	stat, err := data.Stat()
+	if err != nil {
+		return 0, err
+	}
+	err = s.client.Put(
+		fmt.Sprintf("%d.hafs", inode),
+		data,
+		crushstore.PutOptions{},
+	)
+	return stat.Size(), err
+}
+
+func (s *crushStoreStorageEngine) Remove(inode uint64) error {
+	err := s.client.Delete(
+		fmt.Sprintf("%d.hafs", inode),
+		crushstore.DeleteOptions{},
+	)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (s *crushStoreStorageEngine) Validate() error {
+	return nil
+}
+
+func (s *crushStoreStorageEngine) Close() error {
+	return s.client.Close()
+}
+
 func newStorageEngine(storage string) (storageEngine, error) {
-	if strings.HasPrefix(storage, "file://") {
+	if strings.HasPrefix(storage, "crushstore:") {
+		u, err := url.Parse(storage)
+		if err != nil {
+			return nil, err
+		}
+		cfg := u.Query().Get("cluster_config")
+		if cfg == "" {
+			cfg = os.Getenv("CRUSHSTORE_CLUSTER_CONFIG")
+			if cfg == "" {
+				_, err := os.Stat("./crushstore-cluster.conf")
+				if err == nil {
+					cfg = "./crushstore-cluster.conf"
+				} else {
+					cfg = "/etc/crushstore/crushstore-cluster.conf"
+				}
+			}
+			client, err := crushstore.New(cfg, crushstore.ClientOptions{})
+			if err != nil {
+				return nil, err
+			}
+			return &crushStoreStorageEngine{
+				client: client,
+			}, nil
+		}
+	}
+
+	if strings.HasPrefix(storage, "file:") {
 		return &fileStorageEngine{
-			path: storage[7:],
+			path: storage[5:],
 		}, nil
 	}
 
-	if strings.HasPrefix(storage, "s3://") {
+	if strings.HasPrefix(storage, "s3:") {
 		var creds *miniocredentials.Credentials
 
 		u, err := url.Parse(storage)
