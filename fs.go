@@ -57,26 +57,47 @@ const (
 )
 
 type DirEnt struct {
-	Name string `json:"-"`
-	Mode uint32 `json:",omitempty"` // Mode & S_IFMT
-	Ino  uint64 `json:",omitempty"`
+	Name string
+	Mode uint32
+	Ino  uint64
+}
+
+func (e *DirEnt) MarshalBinary() ([]byte, error) {
+	if S_IFMT != 0xf000 {
+		// This check should be removed by the compiler.
+		panic("encoding assumption violated")
+	}
+	bufsz := 2 * binary.MaxVarintLen64
+	buf := make([]byte, bufsz, bufsz)
+	b := buf
+	b = b[binary.PutUvarint(b, uint64(e.Mode)>>12):]
+	b = b[binary.PutUvarint(b, e.Ino):]
+	return buf[:len(buf)-len(b)], nil
+}
+
+func (e *DirEnt) UnmarshalBinary(buf []byte) error {
+	r := bytes.NewReader(buf)
+	mode, _ := binary.ReadUvarint(r)
+	e.Mode = uint32(mode << 12)
+	e.Ino, _ = binary.ReadUvarint(r)
+	return nil
 }
 
 type Stat struct {
-	Ino       uint64 `json:"-"`
-	Size      uint64 `json:",omitempty"`
-	Atimesec  uint64 `json:",omitempty"`
-	Mtimesec  uint64 `json:",omitempty"`
-	Ctimesec  uint64 `json:",omitempty"`
-	Atimensec uint32 `json:",omitempty"`
-	Mtimensec uint32 `json:",omitempty"`
-	Ctimensec uint32 `json:",omitempty"`
-	Mode      uint32 `json:",omitempty"`
-	Nlink     uint32 `json:",omitempty"`
-	Uid       uint32 `json:",omitempty"`
-	Gid       uint32 `json:",omitempty"`
-	Rdev      uint32 `json:",omitempty"`
-	Storage   string `json:",omitempty"`
+	Ino       uint64
+	Size      uint64
+	Atimesec  uint64
+	Mtimesec  uint64
+	Ctimesec  uint64
+	Atimensec uint32
+	Mtimensec uint32
+	Ctimensec uint32
+	Mode      uint32
+	Nlink     uint32
+	Uid       uint32
+	Gid       uint32
+	Rdev      uint32
+	Storage   string
 }
 
 func (s *Stat) MarshalBinary() ([]byte, error) {
@@ -108,21 +129,21 @@ func (s *Stat) UnmarshalBinary(buf []byte) error {
 	s.Ctimesec, _ = binary.ReadUvarint(r)
 	v, _ := binary.ReadUvarint(r)
 	s.Atimensec = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	s.Mtimensec = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	s.Ctimensec = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	s.Mode = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	s.Nlink = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	s.Uid = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	s.Gid = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	s.Rdev = uint32(v)
-	v, _ =  binary.ReadUvarint(r)
+	v, _ = binary.ReadUvarint(r)
 	var sb strings.Builder
 	sb.Grow(int(v))
 	io.CopyN(&sb, r, int64(v))
@@ -555,7 +576,7 @@ func (fut futureGetDirEnt) Get() (DirEnt, error) {
 		return DirEnt{}, ErrNotExist
 	}
 	dirEnt := DirEnt{}
-	err := json.Unmarshal(dirEntBytes, &dirEnt)
+	err := dirEnt.UnmarshalBinary(dirEntBytes)
 	dirEnt.Name = fut.name
 	return dirEnt, err
 }
@@ -568,7 +589,7 @@ func (fs *Fs) txGetDirEnt(tx fdb.ReadTransaction, dirIno uint64, name string) fu
 }
 
 func (fs *Fs) txSetDirEnt(tx fdb.Transaction, dirIno uint64, ent DirEnt) {
-	dirEntBytes, err := json.Marshal(ent)
+	dirEntBytes, err := ent.MarshalBinary()
 	if err != nil {
 		panic(err)
 	}
@@ -1543,7 +1564,7 @@ func (di *DirIter) fill() error {
 		}
 		name := keyTuple[len(keyTuple)-1].(string)
 		dirEnt := DirEnt{}
-		err = json.Unmarshal(kv.Value, &dirEnt)
+		err = dirEnt.UnmarshalBinary(kv.Value)
 		if err != nil {
 			return err
 		}

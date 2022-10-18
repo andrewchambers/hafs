@@ -41,21 +41,34 @@ func tmpFs(t *testing.T) *Fs {
 	return fs
 }
 
+func TestDirEntMarshalAndUnmarshal(t *testing.T) {
+	e1 := DirEnt{
+		Mode: S_IFDIR,
+		Ino:  12345,
+	}
+	e2 := DirEnt{}
+	buf, _ := e1.MarshalBinary()
+	_ = e2.UnmarshalBinary(buf)
+	if e1 != e2 {
+		t.Fatalf("%v != %v", e1, e2)
+	}
+}
+
 func TestStatMarshalAndUnmarshal(t *testing.T) {
 	s1 := Stat{
-		Size: 1,
-		Atimesec  : 2,
-		Mtimesec  : 3,
-		Ctimesec  : 4,
-		Atimensec : 5,
-		Mtimensec : 6,
-		Ctimensec : 7,
-		Mode      : 8,
-		Nlink     : 9,
-		Uid       : 10,
-		Gid       : 11,
-		Rdev      : 12,
-		Storage   : "foobar",
+		Size:      1,
+		Atimesec:  2,
+		Mtimesec:  3,
+		Ctimesec:  4,
+		Atimensec: 5,
+		Mtimensec: 6,
+		Ctimensec: 7,
+		Mode:      8,
+		Nlink:     9,
+		Uid:       10,
+		Gid:       11,
+		Rdev:      12,
+		Storage:   "foobar",
 	}
 	s2 := Stat{}
 	buf, _ := s1.MarshalBinary()
