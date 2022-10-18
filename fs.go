@@ -443,15 +443,7 @@ func (fs *Fs) Close() error {
 }
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
-	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
-	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		attachCheck := tx.Get(attachKey)
-		v, err := f(tx)
-		if attachCheck.MustGet() == nil {
-			return v, ErrDetached
-		}
-		return v, err
-	})
+	return fs.db.ReadTransact(f)
 }
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
@@ -1856,12 +1848,13 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 				now := time.Now()
 				for _, futureStat := range futureStats {
 					stat, err := futureStat.Get()
-					if err != nil {
-						return nil, err
-					}
 					if errors.Is(err, ErrNotExist) {
 						continue
 					}
+					if err != nil {
+						return nil, err
+					}
+					
 					if now.After(stat.Ctime().Add(removalDelay)) {
 						expiredStats = append(expiredStats, stat)
 					}

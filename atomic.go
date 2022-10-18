@@ -24,8 +24,8 @@ type atomicUint64 struct {
 	v uint64
 }
 
-func (b *atomicUint64) Add(uint64) uint64 {
-	return atomic.AddUint64(&b.v, 1)
+func (b *atomicUint64) Add(n uint64) uint64 {
+	return atomic.AddUint64(&b.v, n)
 }
 
 func (b *atomicUint64) Load() uint64 {
