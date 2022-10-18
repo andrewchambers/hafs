@@ -4,11 +4,11 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/valyala/fastjson"
 	"io"
 	"log"
 	"os"
@@ -18,6 +18,7 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/valyala/fastjson"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
 )
@@ -57,25 +58,76 @@ const (
 
 type DirEnt struct {
 	Name string `json:"-"`
-	Mode uint32 // Mode & S_IFMT
-	Ino  uint64
+	Mode uint32 `json:",omitempty"` // Mode & S_IFMT
+	Ino  uint64 `json:",omitempty"`
 }
 
 type Stat struct {
 	Ino       uint64 `json:"-"`
-	Size      uint64
-	Atimesec  uint64
-	Mtimesec  uint64
-	Ctimesec  uint64
-	Atimensec uint32
-	Mtimensec uint32
-	Ctimensec uint32
-	Mode      uint32
-	Nlink     uint32
-	Uid       uint32
-	Gid       uint32
-	Rdev      uint32
+	Size      uint64 `json:",omitempty"`
+	Atimesec  uint64 `json:",omitempty"`
+	Mtimesec  uint64 `json:",omitempty"`
+	Ctimesec  uint64 `json:",omitempty"`
+	Atimensec uint32 `json:",omitempty"`
+	Mtimensec uint32 `json:",omitempty"`
+	Ctimensec uint32 `json:",omitempty"`
+	Mode      uint32 `json:",omitempty"`
+	Nlink     uint32 `json:",omitempty"`
+	Uid       uint32 `json:",omitempty"`
+	Gid       uint32 `json:",omitempty"`
+	Rdev      uint32 `json:",omitempty"`
 	Storage   string `json:",omitempty"`
+}
+
+func (s *Stat) MarshalBinary() ([]byte, error) {
+	bufsz := 13*binary.MaxVarintLen64 + len(s.Storage)
+	buf := make([]byte, bufsz, bufsz)
+	b := buf
+	b = b[binary.PutUvarint(b, s.Size):]
+	b = b[binary.PutUvarint(b, s.Atimesec):]
+	b = b[binary.PutUvarint(b, s.Mtimesec):]
+	b = b[binary.PutUvarint(b, s.Ctimesec):]
+	b = b[binary.PutUvarint(b, uint64(s.Atimensec)):]
+	b = b[binary.PutUvarint(b, uint64(s.Mtimensec)):]
+	b = b[binary.PutUvarint(b, uint64(s.Ctimensec)):]
+	b = b[binary.PutUvarint(b, uint64(s.Mode)):]
+	b = b[binary.PutUvarint(b, uint64(s.Nlink)):]
+	b = b[binary.PutUvarint(b, uint64(s.Uid)):]
+	b = b[binary.PutUvarint(b, uint64(s.Gid)):]
+	b = b[binary.PutUvarint(b, uint64(s.Rdev)):]
+	b = b[binary.PutUvarint(b, uint64(len(s.Storage))):]
+	b = b[copy(b, s.Storage):]
+	return buf[:len(buf)-len(b)], nil
+}
+
+func (s *Stat) UnmarshalBinary(buf []byte) error {
+	r := bytes.NewReader(buf)
+	s.Size, _ = binary.ReadUvarint(r)
+	s.Atimesec, _ = binary.ReadUvarint(r)
+	s.Mtimesec, _ = binary.ReadUvarint(r)
+	s.Ctimesec, _ = binary.ReadUvarint(r)
+	v, _ := binary.ReadUvarint(r)
+	s.Atimensec = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	s.Mtimensec = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	s.Ctimensec = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	s.Mode = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	s.Nlink = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	s.Uid = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	s.Gid = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	s.Rdev = uint32(v)
+	v, _ =  binary.ReadUvarint(r)
+	var sb strings.Builder
+	sb.Grow(int(v))
+	io.CopyN(&sb, r, int64(v))
+	s.Storage = sb.String()
+	return nil
 }
 
 func (stat *Stat) setTime(t time.Time, secs *uint64, nsecs *uint32) {
@@ -159,7 +211,7 @@ func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 		rootStat.SetCtime(now)
 		rootStat.SetAtime(now)
 
-		rootStatBytes, err := json.Marshal(rootStat)
+		rootStatBytes, err := rootStat.MarshalBinary()
 		if err != nil {
 			return nil, err
 		}
@@ -469,8 +521,7 @@ func (fut futureStat) Get() (Stat, error) {
 	if statBytes == nil {
 		return stat, ErrNotExist
 	}
-
-	err := json.Unmarshal(statBytes, &stat)
+	err := stat.UnmarshalBinary(statBytes)
 	if err != nil {
 		return stat, err
 	}
@@ -486,7 +537,7 @@ func (fs *Fs) txGetStat(tx fdb.ReadTransaction, ino uint64) futureStat {
 }
 
 func (fs *Fs) txSetStat(tx fdb.Transaction, stat Stat) {
-	statBytes, err := json.Marshal(stat)
+	statBytes, err := stat.MarshalBinary()
 	if err != nil {
 		panic(err)
 	}
@@ -1854,7 +1905,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 					if err != nil {
 						return nil, err
 					}
-					
+
 					if now.After(stat.Ctime().Add(removalDelay)) {
 						expiredStats = append(expiredStats, stat)
 					}
@@ -2132,14 +2183,12 @@ func (fs *Fs) CollectGarbage(opts CollectGarbageOpts) (CollectGarbageStats, erro
 
 type ClientInfo struct {
 	Id             string `json:",omitempty"`
-	Description    string
-	Hostname       string
-	Pid            int64
-	Exe            string
-	AttachTimeUnix uint64    `json:",omitempty"`
-	AttachTime     time.Time `json:"-"`
-	HeartBeatUnix  uint64    `json:",omitempty"`
-	HeartBeat      time.Time `json:"-"`
+	Description    string `json:",omitempty"`
+	Hostname       string `json:",omitempty"`
+	Pid            int64  `json:",omitempty"`
+	Exe            string `json:",omitempty"`
+	AttachTimeUnix uint64 `json:",omitempty"`
+	HeartBeatUnix  uint64 `json:",omitempty"`
 }
 
 func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
@@ -2171,8 +2220,6 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 		return nil, nil
 	})
 
-	info.HeartBeat = time.Unix(int64(info.HeartBeatUnix), 0)
-	info.AttachTime = time.Unix(int64(info.AttachTimeUnix), 0)
 	return info, ok, err
 }
 

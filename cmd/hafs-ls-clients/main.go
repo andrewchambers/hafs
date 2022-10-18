@@ -25,7 +25,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	sort.Slice(clients, func(i, j int) bool { return clients[i].AttachTime.After(clients[j].AttachTime) })
+	sort.Slice(clients, func(i, j int) bool { return clients[i].AttachTimeUnix > clients[j].AttachTimeUnix })
 
 	t := tabby.New()
 	t.AddHeader("ID", "DESCRIPTION", "HOSTNAME", "PID", "ATTACHED", "HEARTBEAT")
@@ -35,8 +35,8 @@ func main() {
 			info.Description,
 			info.Hostname,
 			fmt.Sprintf("%d", info.Pid),
-			info.AttachTime.Format(time.Stamp),
-			time.Now().Sub(info.HeartBeat).Round(time.Second).String()+" ago",
+			time.Unix(int64(info.AttachTimeUnix), 0).Format(time.Stamp),
+			time.Now().Sub(time.Unix(int64(info.HeartBeatUnix), 0)).Round(time.Second).String()+" ago",
 		)
 	}
 	t.Print()

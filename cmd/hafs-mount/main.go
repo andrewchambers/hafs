@@ -16,12 +16,10 @@ func usage() {
 }
 
 func main() {
-	
-
 
 	cli.RegisterDefaultFlags()
 	debugFuse := flag.Bool("debug-fuse", false, "Log fuse messages.")
-	
+
 	flag.Parse()
 
 	if len(flag.Args()) != 1 {
@@ -39,13 +37,13 @@ func main() {
 		hafs.NewFuseFs(fs),
 		mntDir,
 		&fuse.MountOptions{
-			Name:    "hafs",
-			Options: []string{},
+			Name:                 "hafs",
+			Options:              []string{},
 			AllowOther:           false, // XXX option?
 			EnableLocks:          true,
 			IgnoreSecurityLabels: true, // option?
 			Debug:                *debugFuse,
-			MaxWrite: fuse.MAX_KERNEL_WRITE,
+			MaxWrite:             fuse.MAX_KERNEL_WRITE,
 		})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create fuse server: %s\n", err)

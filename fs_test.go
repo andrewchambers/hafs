@@ -41,6 +41,30 @@ func tmpFs(t *testing.T) *Fs {
 	return fs
 }
 
+func TestStatMarshalAndUnmarshal(t *testing.T) {
+	s1 := Stat{
+		Size: 1,
+		Atimesec  : 2,
+		Mtimesec  : 3,
+		Ctimesec  : 4,
+		Atimensec : 5,
+		Mtimensec : 6,
+		Ctimensec : 7,
+		Mode      : 8,
+		Nlink     : 9,
+		Uid       : 10,
+		Gid       : 11,
+		Rdev      : 12,
+		Storage   : "foobar",
+	}
+	s2 := Stat{}
+	buf, _ := s1.MarshalBinary()
+	_ = s2.UnmarshalBinary(buf)
+	if s1 != s2 {
+		t.Fatalf("%v != %v", s1, s2)
+	}
+}
+
 func TestMkfsAndAttach(t *testing.T) {
 	fs := tmpFs(t)
 	stat, err := fs.GetStat(ROOT_INO)
