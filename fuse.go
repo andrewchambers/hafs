@@ -37,8 +37,9 @@ func errToFuseStatus(err error) fuse.Status {
 }
 
 type openFile struct {
-	di *DirIter
-	f  HafsFile
+	maybeHasPosixLock atomicBool
+	di                *DirIter
+	f                 HafsFile
 }
 
 type HafsFuseOptions struct {
@@ -55,18 +56,16 @@ type FuseFs struct {
 
 	fileHandleCounter uint64
 
-	lock           sync.Mutex
-	fh2OpenFile    map[uint64]*openFile
-	ino2LockOwners map[uint64]map[uint64]struct{}
+	lock        sync.Mutex
+	fh2OpenFile map[uint64]*openFile
 }
 
 func NewFuseFs(fs *Fs, opts HafsFuseOptions) *FuseFs {
 	return &FuseFs{
-		RawFileSystem:  fuse.NewDefaultRawFileSystem(),
-		opts:           opts,
-		fs:             fs,
-		fh2OpenFile:    make(map[uint64]*openFile),
-		ino2LockOwners: make(map[uint64]map[uint64]struct{}),
+		RawFileSystem: fuse.NewDefaultRawFileSystem(),
+		opts:          opts,
+		fs:            fs,
+		fh2OpenFile:   make(map[uint64]*openFile),
 	}
 }
 
@@ -287,17 +286,24 @@ func (fs *FuseFs) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
 
 func (fs *FuseFs) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 	fs.lock.Lock()
-	f := fs.fh2OpenFile[in.Fh].f
-	_, hasLock := fs.ino2LockOwners[in.NodeId]
+	f := fs.fh2OpenFile[in.Fh]
 	fs.lock.Unlock()
 
-	fsyncErr := f.Fsync()
+	fsyncErr := f.f.Fsync()
 
-	// Release locks *AFTER* the above flush call.
-	if hasLock {
+	if f.maybeHasPosixLock.Load() {
+		// Note, this this behavior intentionally violates posix lock semantics:
+		//
+		// Normally posix locks are associated with a process id, so any file descriptor
+		// that opens are closes a file will release the lock - here we only are releasing
+		// it if the file that created the lock is closed.
+		//
+		// We *could* implement the full semantics, but at increased complexity, reduced
+		// performance, and mainly to support potentially questionable use cases. For now
+		// we will instead document our semantics and keep it simple.
+		f.maybeHasPosixLock.Store(false)
 		fs.releaseLocks(in.NodeId, in.LockOwner)
 	}
-
 	return errToFuseStatus(fsyncErr)
 }
 
@@ -305,13 +311,12 @@ func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 	fs.lock.Lock()
 	f := fs.fh2OpenFile[in.Fh]
 	delete(fs.fh2OpenFile, in.Fh)
-	_, hasLock := fs.ino2LockOwners[in.NodeId]
 	fs.lock.Unlock()
 
 	_ = f.f.Close()
 
-	// Release locks *AFTER* the close call.
-	if hasLock {
+	const FUSE_RELEASE_FLOCK_UNLOCK = (1 << 1) // XXX remove once constant is in upstream go-fuse.
+	if in.ReleaseFlags&FUSE_RELEASE_FLOCK_UNLOCK != 0 {
 		fs.releaseLocks(in.NodeId, in.LockOwner)
 	}
 }
@@ -499,17 +504,6 @@ func (fs *FuseFs) RemoveXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr st
 }
 
 func (fs *FuseFs) releaseLocks(ino uint64, lockOwner uint64) {
-
-	fs.lock.Lock()
-	lockOwners, hasLock := fs.ino2LockOwners[ino]
-	if hasLock {
-		delete(lockOwners, lockOwner)
-		if len(lockOwners) == 0 {
-			delete(fs.ino2LockOwners, ino)
-		}
-	}
-	fs.lock.Unlock()
-
 	for {
 		_, err := fs.fs.TrySetLock(ino, SetLockOpts{
 			Typ:   LOCK_NONE,
@@ -518,15 +512,17 @@ func (fs *FuseFs) releaseLocks(ino uint64, lockOwner uint64) {
 		if err == nil {
 			break
 		}
-		time.Sleep(1 * time.Second)
-		log.Printf("unable to release lock ino=%d owner=%d", ino, lockOwner)
-		// XXX Abort process on too many retries? Not much else we can do.
-		// XXX cancellation.
-	}
+		// XXX log to a better place.
+		log.Printf("unable to release lock ino=%d owner=%d: %s", ino, lockOwner, err)
 
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
+	fs.lock.Lock()
+	f := fs.fh2OpenFile[in.Fh]
+	fs.lock.Unlock()
 
 	var lockType LockType
 
@@ -553,17 +549,9 @@ func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 		Owner: in.Owner,
 	})
 
-	// Unconditionally mark this inode as having an active lock regardless
-	// of if an error occured, releaseLocks() is guaranteed to be called for this ino
-	// when the current file gets released.
-	fs.lock.Lock()
-	lockOwners, hasLock := fs.ino2LockOwners[in.NodeId]
-	if !hasLock {
-		lockOwners = make(map[uint64]struct{})
-		fs.ino2LockOwners[in.NodeId] = lockOwners
+	if in.LkFlags&fuse.FUSE_LK_FLOCK == 0 {
+		f.maybeHasPosixLock.Store(true)
 	}
-	lockOwners[in.Owner] = struct{}{}
-	fs.lock.Unlock()
 
 	if err != nil {
 		return errToFuseStatus(err)
