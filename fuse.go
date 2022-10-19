@@ -36,7 +36,41 @@ func errToFuseStatus(err error) fuse.Status {
 	return fuse.Status(fuse.EIO)
 }
 
-func fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
+type openFile struct {
+	di *DirIter
+	f  HafsFile
+}
+
+type HafsFuseOptions struct {
+	CacheDentries   time.Duration
+	CacheAttributes time.Duration
+}
+
+type FuseFs struct {
+	fuse.RawFileSystem
+	server *fuse.Server
+
+	opts HafsFuseOptions
+	fs   *Fs
+
+	fileHandleCounter uint64
+
+	lock           sync.Mutex
+	fh2OpenFile    map[uint64]*openFile
+	ino2LockOwners map[uint64]map[uint64]struct{}
+}
+
+func NewFuseFs(fs *Fs, opts HafsFuseOptions) *FuseFs {
+	return &FuseFs{
+		RawFileSystem:  fuse.NewDefaultRawFileSystem(),
+		opts:           opts,
+		fs:             fs,
+		fh2OpenFile:    make(map[uint64]*openFile),
+		ino2LockOwners: make(map[uint64]map[uint64]struct{}),
+	}
+}
+
+func (fs *FuseFs) fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
 	out.Ino = stat.Ino
 	out.Size = stat.Size
 	out.Blocks = stat.Size / 512
@@ -54,37 +88,22 @@ func fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
 	out.Rdev = stat.Rdev
 }
 
-func fillFuseEntryOutFromStat(stat *Stat, out *fuse.EntryOut) {
+func (fs *FuseFs) fillFuseAttrOutFromStat(stat *Stat, out *fuse.AttrOut) {
+	fs.fillFuseAttrFromStat(stat, &out.Attr)
+	out.AttrValid = uint64(fs.opts.CacheAttributes.Nanoseconds() / 1_000_000_000)
+	out.AttrValidNsec = uint32(uint64(fs.opts.CacheAttributes.Nanoseconds()) - out.AttrValid*1_000_000_000)
+}
+
+func (fs *FuseFs) fillFuseEntryOutFromStat(stat *Stat, out *fuse.EntryOut) {
 	out.Generation = 0
 	out.NodeId = stat.Ino
-	fillFuseAttrFromStat(stat, &out.Attr)
-}
+	fs.fillFuseAttrFromStat(stat, &out.Attr)
+	out.AttrValid = uint64(fs.opts.CacheAttributes.Nanoseconds() / 1_000_000_000)
+	out.AttrValidNsec = uint32(uint64(fs.opts.CacheAttributes.Nanoseconds()) - out.AttrValid*1_000_000_000)
 
-type openFile struct {
-	di *DirIter
-	f  HafsFile
-}
+	out.EntryValid = uint64(fs.opts.CacheDentries.Nanoseconds() / 1_000_000_000)
+	out.EntryValidNsec = uint32(uint64(fs.opts.CacheDentries.Nanoseconds()) - out.EntryValid*1_000_000_000)
 
-type FuseFs struct {
-	fuse.RawFileSystem
-	server *fuse.Server
-
-	fs *Fs
-
-	fileHandleCounter uint64
-
-	lock           sync.Mutex
-	fh2OpenFile    map[uint64]*openFile
-	ino2LockOwners map[uint64]map[uint64]struct{}
-}
-
-func NewFuseFs(fs *Fs) *FuseFs {
-	return &FuseFs{
-		RawFileSystem:  fuse.NewDefaultRawFileSystem(),
-		fs:             fs,
-		fh2OpenFile:    make(map[uint64]*openFile),
-		ino2LockOwners: make(map[uint64]map[uint64]struct{}),
-	}
 }
 
 func (fs *FuseFs) nextFileHandle() uint64 {
@@ -100,7 +119,7 @@ func (fs *FuseFs) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name str
 	if err != nil {
 		return errToFuseStatus(err)
 	}
-	fillFuseEntryOutFromStat(&stat, out)
+	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
 }
 
@@ -113,7 +132,7 @@ func (fs *FuseFs) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.
 	if err != nil {
 		return errToFuseStatus(err)
 	}
-	fillFuseAttrFromStat(&stat, &out.Attr)
+	fs.fillFuseAttrOutFromStat(&stat, out)
 	return fuse.OK
 }
 
@@ -153,7 +172,7 @@ func (fs *FuseFs) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.
 		return errToFuseStatus(err)
 	}
 
-	fillFuseAttrFromStat(&stat, &out.Attr)
+	fs.fillFuseAttrOutFromStat(&stat, out)
 	return fuse.OK
 }
 
@@ -187,7 +206,7 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 	if err != nil {
 		return errToFuseStatus(err)
 	}
-	fillFuseEntryOutFromStat(&stat, &out.EntryOut)
+	fs.fillFuseEntryOutFromStat(&stat, &out.EntryOut)
 
 	out.Fh = fs.nextFileHandle()
 	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
@@ -312,7 +331,7 @@ func (fs *FuseFs) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out
 	if err != nil {
 		return errToFuseStatus(err)
 	}
-	fillFuseEntryOutFromStat(&stat, out)
+	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
 }
 
@@ -326,7 +345,7 @@ func (fs *FuseFs) Symlink(cancel <-chan struct{}, in *fuse.InHeader, pointedTo s
 	if err != nil {
 		return errToFuseStatus(err)
 	}
-	fillFuseEntryOutFromStat(&stat, out)
+	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
 }
 
@@ -347,7 +366,7 @@ func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, o
 	if err != nil {
 		return errToFuseStatus(err)
 	}
-	fillFuseEntryOutFromStat(&stat, out)
+	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
 }
 
@@ -401,7 +420,7 @@ func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 				if err != nil {
 					return errToFuseStatus(err)
 				}
-				fillFuseEntryOutFromStat(&stat, entryOut)
+				fs.fillFuseEntryOutFromStat(&stat, entryOut)
 			} else {
 				d.di.Unget(ent)
 				break

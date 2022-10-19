@@ -737,6 +737,7 @@ func (fs *Fs) HardLink(dirIno, ino uint64, name string) (Stat, error) {
 		if stat.Mode&S_IFMT == S_IFDIR {
 			return Stat{}, ErrPermission
 		}
+
 		if stat.Nlink == 0 {
 			// Don't resurrect inodes.
 			return Stat{}, ErrInvalid
@@ -1118,6 +1119,12 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 		}
 		stat = existingStat
 
+		// Might happen as a result of client side caching.
+		if stat.Nlink == 0 {
+			// N.B. don't return ErrNotExist, the file might exist but the cache is out of date.
+			return nil, ErrInvalid
+		}
+
 		if stat.Mode&S_IFMT != S_IFREG {
 			return nil, ErrInvalid
 		}
@@ -1186,20 +1193,15 @@ type CreateFileOpts struct {
 }
 
 func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsFile, Stat, error) {
-	var stat Stat
-	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		newStat, err := fs.Mknod(dirIno, name, MknodOpts{
-			Truncate: opts.Truncate,
-			Mode:     (^S_IFMT & opts.Mode) | S_IFREG,
-			Uid:      opts.Uid,
-			Gid:      opts.Gid,
-		})
-		if err != nil {
-			return nil, err
-		}
-		stat = newStat
-		return nil, nil
+	stat, err := fs.Mknod(dirIno, name, MknodOpts{
+		Truncate: opts.Truncate,
+		Mode:     (^S_IFMT & opts.Mode) | S_IFREG,
+		Uid:      opts.Uid,
+		Gid:      opts.Gid,
 	})
+	if err != nil {
+		return nil, Stat{}, err
+	}
 
 	var f HafsFile
 	if stat.Storage == "" {

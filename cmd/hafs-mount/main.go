@@ -19,6 +19,8 @@ func main() {
 
 	cli.RegisterDefaultFlags()
 	debugFuse := flag.Bool("debug-fuse", false, "Log fuse messages.")
+	cacheDentries := flag.Duration("cache-dentries", 0, "Duration to cache dentry lookups, use with great care.")
+	cacheAttributes := flag.Duration("cache-attributes", 0, "Duration to cache file attribute lookups, use with great care.")
 
 	flag.Parse()
 
@@ -34,7 +36,10 @@ func main() {
 	cli.RegisterDefaultSignalHandlers(fs)
 
 	server, err := fuse.NewServer(
-		hafs.NewFuseFs(fs),
+		hafs.NewFuseFs(fs, hafs.HafsFuseOptions{
+			CacheDentries:   *cacheDentries,
+			CacheAttributes: *cacheAttributes,
+		}),
 		mntDir,
 		&fuse.MountOptions{
 			Name:                 "hafs",
