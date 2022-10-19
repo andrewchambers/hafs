@@ -14,7 +14,51 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func errToFuseStatus(err error) fuse.Status {
+type openFile struct {
+	maybeHasPosixLock atomicBool
+	di                *DirIter
+	f                 HafsFile
+}
+
+type HafsFuseOptions struct {
+	CacheDentries   time.Duration
+	CacheAttributes time.Duration
+	Logf            func(string, ...interface{})
+}
+
+type FuseFs struct {
+	fuse.RawFileSystem
+	server *fuse.Server
+
+	cacheDentries   time.Duration
+	cacheAttributes time.Duration
+	logf            func(string, ...interface{})
+
+	fs *Fs
+
+	fileHandleCounter uint64
+
+	lock        sync.Mutex
+	fh2OpenFile map[uint64]*openFile
+}
+
+func NewFuseFs(fs *Fs, opts HafsFuseOptions) *FuseFs {
+
+	if opts.Logf == nil {
+		opts.Logf = log.Printf
+	}
+
+	return &FuseFs{
+		RawFileSystem:   fuse.NewDefaultRawFileSystem(),
+		cacheDentries:   opts.CacheDentries,
+		cacheAttributes: opts.CacheAttributes,
+		logf:            opts.Logf,
+		fs:              fs,
+		fh2OpenFile:     make(map[uint64]*openFile),
+	}
+}
+
+func (fs *FuseFs) errToFuseStatus(err error) fuse.Status {
 	if err == nil {
 		return fuse.OK
 	}
@@ -33,40 +77,9 @@ func errToFuseStatus(err error) fuse.Status {
 		return fuse.Status(unix.EINVAL)
 	}
 
+	// Log all io errors that don't have a clear cause.
+	fs.logf("io error: %s", err)
 	return fuse.Status(fuse.EIO)
-}
-
-type openFile struct {
-	maybeHasPosixLock atomicBool
-	di                *DirIter
-	f                 HafsFile
-}
-
-type HafsFuseOptions struct {
-	CacheDentries   time.Duration
-	CacheAttributes time.Duration
-}
-
-type FuseFs struct {
-	fuse.RawFileSystem
-	server *fuse.Server
-
-	opts HafsFuseOptions
-	fs   *Fs
-
-	fileHandleCounter uint64
-
-	lock        sync.Mutex
-	fh2OpenFile map[uint64]*openFile
-}
-
-func NewFuseFs(fs *Fs, opts HafsFuseOptions) *FuseFs {
-	return &FuseFs{
-		RawFileSystem: fuse.NewDefaultRawFileSystem(),
-		opts:          opts,
-		fs:            fs,
-		fh2OpenFile:   make(map[uint64]*openFile),
-	}
 }
 
 func (fs *FuseFs) fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
@@ -89,19 +102,19 @@ func (fs *FuseFs) fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
 
 func (fs *FuseFs) fillFuseAttrOutFromStat(stat *Stat, out *fuse.AttrOut) {
 	fs.fillFuseAttrFromStat(stat, &out.Attr)
-	out.AttrValid = uint64(fs.opts.CacheAttributes.Nanoseconds() / 1_000_000_000)
-	out.AttrValidNsec = uint32(uint64(fs.opts.CacheAttributes.Nanoseconds()) - out.AttrValid*1_000_000_000)
+	out.AttrValid = uint64(fs.cacheAttributes.Nanoseconds() / 1_000_000_000)
+	out.AttrValidNsec = uint32(uint64(fs.cacheAttributes.Nanoseconds()) - out.AttrValid*1_000_000_000)
 }
 
 func (fs *FuseFs) fillFuseEntryOutFromStat(stat *Stat, out *fuse.EntryOut) {
 	out.Generation = 0
 	out.NodeId = stat.Ino
 	fs.fillFuseAttrFromStat(stat, &out.Attr)
-	out.AttrValid = uint64(fs.opts.CacheAttributes.Nanoseconds() / 1_000_000_000)
-	out.AttrValidNsec = uint32(uint64(fs.opts.CacheAttributes.Nanoseconds()) - out.AttrValid*1_000_000_000)
+	out.AttrValid = uint64(fs.cacheAttributes.Nanoseconds() / 1_000_000_000)
+	out.AttrValidNsec = uint32(uint64(fs.cacheAttributes.Nanoseconds()) - out.AttrValid*1_000_000_000)
 
-	out.EntryValid = uint64(fs.opts.CacheDentries.Nanoseconds() / 1_000_000_000)
-	out.EntryValidNsec = uint32(uint64(fs.opts.CacheDentries.Nanoseconds()) - out.EntryValid*1_000_000_000)
+	out.EntryValid = uint64(fs.cacheDentries.Nanoseconds() / 1_000_000_000)
+	out.EntryValidNsec = uint32(uint64(fs.cacheDentries.Nanoseconds()) - out.EntryValid*1_000_000_000)
 
 }
 
@@ -116,7 +129,7 @@ func (fs *FuseFs) Init(server *fuse.Server) {
 func (fs *FuseFs) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
 	stat, err := fs.fs.Lookup(header.NodeId, name)
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
@@ -129,7 +142,7 @@ func (fs *FuseFs) Forget(nodeId, nlookup uint64) {
 func (fs *FuseFs) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
 	stat, err := fs.fs.GetStat(in.NodeId)
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	fs.fillFuseAttrOutFromStat(&stat, out)
 	return fuse.OK
@@ -168,7 +181,7 @@ func (fs *FuseFs) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.
 
 	stat, err := fs.fs.ModStat(in.NodeId, modStat)
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 
 	fs.fillFuseAttrOutFromStat(&stat, out)
@@ -180,7 +193,7 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 		Truncate: in.Flags&unix.O_TRUNC != 0,
 	})
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 
 	out.Fh = fs.nextFileHandle()
@@ -203,7 +216,7 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 		Gid:      in.Owner.Gid,
 	})
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	fs.fillFuseEntryOutFromStat(&stat, &out.EntryOut)
 
@@ -222,7 +235,7 @@ func (fs *FuseFs) Rename(cancel <-chan struct{}, in *fuse.RenameIn, fromName str
 	toDir := in.Newdir
 	err := fs.fs.Rename(fromDir, toDir, fromName, toName)
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	return fuse.OK
 }
@@ -240,7 +253,7 @@ func (fs *FuseFs) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fus
 			break
 		}
 		if err != nil {
-			return nil, errToFuseStatus(err)
+			return nil, fs.errToFuseStatus(err)
 		}
 	}
 
@@ -257,7 +270,7 @@ func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (u
 		n, err := f.WriteData(buf[nTotal:], uint64(in.Offset)+uint64(nTotal))
 		nTotal += uint32(n)
 		if err != nil {
-			return nTotal, errToFuseStatus(err)
+			return nTotal, fs.errToFuseStatus(err)
 		}
 	}
 
@@ -278,7 +291,7 @@ func (fs *FuseFs) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
 
 	err := f.Fsync()
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	// XXX are we supposed to release locks here or in release.
 	return fuse.OK
@@ -304,7 +317,7 @@ func (fs *FuseFs) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 		f.maybeHasPosixLock.Store(false)
 		fs.releaseLocks(in.NodeId, in.LockOwner)
 	}
-	return errToFuseStatus(fsyncErr)
+	return fs.errToFuseStatus(fsyncErr)
 }
 
 func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
@@ -323,18 +336,18 @@ func (fs *FuseFs) Release(cancel <-chan struct{}, in *fuse.ReleaseIn) {
 
 func (fs *FuseFs) Unlink(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
 	err := fs.fs.Unlink(in.NodeId, name)
-	return errToFuseStatus(err)
+	return fs.errToFuseStatus(err)
 }
 
 func (fs *FuseFs) Rmdir(cancel <-chan struct{}, in *fuse.InHeader, name string) fuse.Status {
 	err := fs.fs.Unlink(in.NodeId, name)
-	return errToFuseStatus(err)
+	return fs.errToFuseStatus(err)
 }
 
 func (fs *FuseFs) Link(cancel <-chan struct{}, in *fuse.LinkIn, name string, out *fuse.EntryOut) fuse.Status {
 	stat, err := fs.fs.HardLink(in.NodeId, in.Oldnodeid, name)
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
@@ -348,7 +361,7 @@ func (fs *FuseFs) Symlink(cancel <-chan struct{}, in *fuse.InHeader, pointedTo s
 		LinkTarget: []byte(pointedTo),
 	})
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
@@ -357,7 +370,7 @@ func (fs *FuseFs) Symlink(cancel <-chan struct{}, in *fuse.InHeader, pointedTo s
 func (fs *FuseFs) Readlink(cancel <-chan struct{}, in *fuse.InHeader) ([]byte, fuse.Status) {
 	l, err := fs.fs.ReadSymlink(in.NodeId)
 	if err != nil {
-		return nil, errToFuseStatus(err)
+		return nil, fs.errToFuseStatus(err)
 	}
 	return l, fuse.OK
 }
@@ -369,7 +382,7 @@ func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, o
 		Gid:  in.Owner.Gid,
 	})
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 	fs.fillFuseEntryOutFromStat(&stat, out)
 	return fuse.OK
@@ -378,7 +391,7 @@ func (fs *FuseFs) Mkdir(cancel <-chan struct{}, in *fuse.MkdirIn, name string, o
 func (fs *FuseFs) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
 	dirIter, err := fs.fs.IterDirEnts(in.NodeId)
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 
 	out.Fh = fs.nextFileHandle()
@@ -410,7 +423,7 @@ func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 			if errors.Is(err, io.EOF) {
 				break
 			}
-			return errToFuseStatus(err)
+			return fs.errToFuseStatus(err)
 		}
 		fuseDirEnt := fuse.DirEntry{
 			Name: ent.Name,
@@ -423,7 +436,7 @@ func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 			if entryOut != nil {
 				stat, err := fs.fs.GetStat(ent.Ino)
 				if err != nil {
-					return errToFuseStatus(err)
+					return fs.errToFuseStatus(err)
 				}
 				fs.fillFuseEntryOutFromStat(&stat, entryOut)
 			} else {
@@ -461,7 +474,7 @@ func (fs *FuseFs) ReleaseDir(in *fuse.ReleaseIn) {
 func (fs *FuseFs) GetXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr string, dest []byte) (uint32, fuse.Status) {
 	x, err := fs.fs.GetXAttr(in.NodeId, attr)
 	if err != nil {
-		return 0, errToFuseStatus(err)
+		return 0, fs.errToFuseStatus(err)
 	}
 	if len(dest) < len(x) {
 		return uint32(len(x)), fuse.ERANGE
@@ -473,7 +486,7 @@ func (fs *FuseFs) GetXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr strin
 func (fs *FuseFs) ListXAttr(cancel <-chan struct{}, in *fuse.InHeader, dest []byte) (uint32, fuse.Status) {
 	xattrs, err := fs.fs.ListXAttr(in.NodeId)
 	if err != nil {
-		return 0, errToFuseStatus(err)
+		return 0, fs.errToFuseStatus(err)
 	}
 
 	nNeeded := uint32(0)
@@ -495,12 +508,12 @@ func (fs *FuseFs) ListXAttr(cancel <-chan struct{}, in *fuse.InHeader, dest []by
 
 func (fs *FuseFs) SetXAttr(cancel <-chan struct{}, in *fuse.SetXAttrIn, attr string, data []byte) fuse.Status {
 	err := fs.fs.SetXAttr(in.NodeId, attr, data)
-	return errToFuseStatus(err)
+	return fs.errToFuseStatus(err)
 }
 
 func (fs *FuseFs) RemoveXAttr(cancel <-chan struct{}, in *fuse.InHeader, attr string) fuse.Status {
 	err := fs.fs.RemoveXAttr(in.NodeId, attr)
-	return errToFuseStatus(err)
+	return fs.errToFuseStatus(err)
 }
 
 func (fs *FuseFs) releaseLocks(ino uint64, lockOwner uint64) {
@@ -512,9 +525,7 @@ func (fs *FuseFs) releaseLocks(ino uint64, lockOwner uint64) {
 		if err == nil {
 			break
 		}
-		// XXX log to a better place.
-		log.Printf("unable to release lock ino=%d owner=%d: %s", ino, lockOwner, err)
-
+		fs.logf("unable to release lock ino=%d owner=%d: %s", ino, lockOwner, err)
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -554,7 +565,7 @@ func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 	}
 
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 
 	if !ok {
@@ -584,7 +595,7 @@ func (fs *FuseFs) SetLkw(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 		}
 		err := fs.fs.AwaitExclusiveLockRelease(cancel, in.NodeId)
 		if err != nil {
-			return errToFuseStatus(err)
+			return fs.errToFuseStatus(err)
 		}
 		nAttempts += 1
 	}
@@ -594,7 +605,7 @@ func (fs *FuseFs) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.St
 
 	stats, err := fs.fs.FsStats()
 	if err != nil {
-		return errToFuseStatus(err)
+		return fs.errToFuseStatus(err)
 	}
 
 	out.Bsize = CHUNK_SIZE

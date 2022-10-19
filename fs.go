@@ -181,16 +181,17 @@ func (stat *Stat) Ctime() time.Time {
 }
 
 type Fs struct {
-	db                  fdb.Database
-	fsName              string
-	clientId            string
-	onEviction          func(fs *Fs)
-	clientDetached      atomicBool
-	txCounter           atomicUint64
-	inoChan             chan uint64
-	dirRelMtimeDuration time.Duration // TODO XXX make an option.
-	workerWg            *sync.WaitGroup
-	cancelWorkers       func()
+	db             fdb.Database
+	fsName         string
+	clientId       string
+	onEviction     func(fs *Fs)
+	clientDetached atomicBool
+	txCounter      atomicUint64
+	inoChan        chan uint64
+	relMtime       time.Duration
+	workerWg       *sync.WaitGroup
+	cancelWorkers  func()
+	logf           func(string, ...interface{})
 }
 
 func init() {
@@ -307,11 +308,22 @@ func ListFilesystems(db fdb.Database) ([]string, error) {
 type AttachOpts struct {
 	ClientDescription string
 	OnEviction        func(fs *Fs)
+	Logf              func(string, ...interface{})
+	RelMtime          *time.Duration
 }
 
 func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
-	hostname, _ := os.Hostname()
 
+	if opts.RelMtime == nil {
+		defaultRelMtime := 24 * time.Hour
+		opts.RelMtime = &defaultRelMtime
+	}
+
+	if opts.Logf == nil {
+		opts.Logf = log.Printf
+	}
+
+	hostname, _ := os.Hostname()
 	exe, _ := os.Executable()
 
 	if opts.ClientDescription == "" {
@@ -377,14 +389,15 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 
 	fs := &Fs{
-		db:                  db,
-		fsName:              fsName,
-		onEviction:          opts.OnEviction,
-		dirRelMtimeDuration: 24 * time.Hour,
-		clientId:            clientId,
-		cancelWorkers:       cancelWorkers,
-		workerWg:            &sync.WaitGroup{},
-		inoChan:             make(chan uint64, _INO_CHAN_SIZE),
+		db:            db,
+		fsName:        fsName,
+		onEviction:    opts.OnEviction,
+		logf:          opts.Logf,
+		relMtime:      *opts.RelMtime,
+		clientId:      clientId,
+		cancelWorkers: cancelWorkers,
+		workerWg:      &sync.WaitGroup{},
+		inoChan:       make(chan uint64, _INO_CHAN_SIZE),
 	}
 
 	fs.workerWg.Add(1)
@@ -449,8 +462,7 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 			return currentIno, nil
 		})
 		if err != nil {
-			// XXX TODO log to a better place.
-			log.Printf("unable to allocate inode batch: %s", err)
+			fs.logf("unable to allocate inode batch: %s", err)
 			time.Sleep(1 * time.Second)
 			continue
 		}
@@ -690,7 +702,7 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 		Ino:  stat.Ino,
 	})
 
-	if dirStat.Mtime().Before(now.Add(-fs.dirRelMtimeDuration)) {
+	if dirStat.Mtime().Before(now.Add(-fs.relMtime)) {
 		dirStat.SetMtime(now)
 		dirStat.SetAtime(now)
 		fs.txSetStat(tx, dirStat)
@@ -764,7 +776,7 @@ func (fs *Fs) HardLink(dirIno, ino uint64, name string) (Stat, error) {
 			Ino:  stat.Ino,
 		})
 
-		if dirStat.Mtime().Before(now.Add(-fs.dirRelMtimeDuration)) {
+		if dirStat.Mtime().Before(now.Add(-fs.relMtime)) {
 			dirStat.SetMtime(now)
 			dirStat.SetAtime(now)
 			fs.txSetStat(tx, dirStat)
@@ -1030,9 +1042,6 @@ func (f *externalStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32
 
 func (f *externalStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 	n, err := f.storageObject.ReadAt(buf, int64(offset))
-	if err != nil && err != io.EOF {
-		log.Printf("error reading data from external storage: %s", err)
-	}
 	return uint32(n), err
 }
 
@@ -1665,9 +1674,7 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 			stat.Storage = string(data)
 			err := storageValidate(stat.Storage)
 			if err != nil {
-				// XXX TODO log to a better place.
-				log.Printf("unable to validate storage specification: %s", err)
-				return nil, ErrInvalid
+				return nil, fmt.Errorf("unable to validate storage specification: %s", err)
 			}
 			fs.txSetStat(tx, stat)
 		default:
