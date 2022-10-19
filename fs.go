@@ -1738,8 +1738,29 @@ type SetLockOpts struct {
 }
 
 type exclusiveLockRecord struct {
-	ClientId string
 	Owner    uint64
+	ClientId string
+}
+
+func (lr *exclusiveLockRecord) MarshalBinary() ([]byte, error) {
+	bufsz := 2*binary.MaxVarintLen64 + len(lr.ClientId)
+	buf := make([]byte, bufsz, bufsz)
+	b := buf
+	b = b[binary.PutUvarint(b, lr.Owner):]
+	b = b[binary.PutUvarint(b, uint64(len(lr.ClientId))):]
+	b = b[copy(b, lr.ClientId):]
+	return buf[:len(buf)-len(b)], nil
+}
+
+func (lr *exclusiveLockRecord) UnmarshalBinary(buf []byte) error {
+	r := bytes.NewReader(buf)
+	lr.Owner, _ = binary.ReadUvarint(r)
+	v, _ := binary.ReadUvarint(r)
+	var sb strings.Builder
+	sb.Grow(int(v))
+	io.CopyN(&sb, r, int64(v))
+	lr.ClientId = sb.String()
+	return nil
 }
 
 func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
@@ -1760,7 +1781,7 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 			exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
 			if exclusiveLockBytes != nil {
 				exclusiveLock := exclusiveLockRecord{}
-				err := json.Unmarshal(exclusiveLockBytes, &exclusiveLock)
+				err := exclusiveLock.UnmarshalBinary(exclusiveLockBytes)
 				if err != nil {
 					return false, err
 				}
@@ -1798,10 +1819,11 @@ func (fs *Fs) TrySetLock(ino uint64, opts SetLockOpts) (bool, error) {
 			if len(sharedLocks) > 0 {
 				return false, nil
 			}
-			exclusiveLockBytes, err := json.Marshal(exclusiveLockRecord{
+			exclusiveLock := exclusiveLockRecord{
 				ClientId: fs.clientId,
 				Owner:    opts.Owner,
-			})
+			}
+			exclusiveLockBytes, err := exclusiveLock.MarshalBinary()
 			if err != nil {
 				return false, err
 			}
@@ -1990,7 +2012,7 @@ func (fs *Fs) txBreakLock(tx fdb.Transaction, clientId string, ino uint64, owner
 	exclusiveLockBytes := tx.Get(exclusiveLockKey).MustGet()
 	if exclusiveLockBytes != nil {
 		exclusiveLock := exclusiveLockRecord{}
-		err := json.Unmarshal(exclusiveLockBytes, &exclusiveLock)
+		err := exclusiveLock.UnmarshalBinary(exclusiveLockBytes)
 		if err != nil {
 			return err
 		}

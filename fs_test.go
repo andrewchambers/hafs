@@ -41,6 +41,19 @@ func tmpFs(t *testing.T) *Fs {
 	return fs
 }
 
+func TestExclusiveLockRecordMarshalAndUnmarshal(t *testing.T) {
+	lr1 := exclusiveLockRecord{
+		Owner:    0xffffffffffffffff,
+		ClientId: "foobar",
+	}
+	lr2 := exclusiveLockRecord{}
+	buf, _ := lr1.MarshalBinary()
+	_ = lr2.UnmarshalBinary(buf)
+	if lr1 != lr2 {
+		t.Fatalf("%v != %v", lr1, lr2)
+	}
+}
+
 func TestDirEntMarshalAndUnmarshal(t *testing.T) {
 	e1 := DirEnt{
 		Mode: S_IFDIR,
