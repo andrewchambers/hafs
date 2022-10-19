@@ -308,8 +308,8 @@ func (fs *FuseFs) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 		// Note, this this behavior intentionally violates posix lock semantics:
 		//
 		// Normally posix locks are associated with a process id, so any file descriptor
-		// that opens are closes a file will release the lock - here we only are releasing
-		// it if the file that created the lock is closed.
+		// that opens and closes a file will release the lock for all files, but here we only
+		// are only releasing it if the file that created the lock is closed.
 		//
 		// We *could* implement the full semantics, but at increased complexity, reduced
 		// performance, and mainly to support potentially questionable use cases. For now

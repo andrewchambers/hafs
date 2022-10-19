@@ -237,6 +237,10 @@ func (s *crushStoreStorageEngine) Remove(inode uint64) error {
 }
 
 func (s *crushStoreStorageEngine) Validate() error {
+	_, _, err := s.client.Head("test-key", crushstore.HeadOptions{})
+	if err != nil {
+		return fmt.Errorf("unable to check test key: %w", err)
+	}
 	return nil
 }
 
