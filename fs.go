@@ -181,17 +181,19 @@ func (stat *Stat) Ctime() time.Time {
 }
 
 type Fs struct {
-	db             fdb.Database
-	fsName         string
-	clientId       string
-	onEviction     func(fs *Fs)
-	clientDetached atomicBool
-	txCounter      atomicUint64
-	inoChan        chan uint64
-	relMtime       time.Duration
-	workerWg       *sync.WaitGroup
-	cancelWorkers  func()
-	logf           func(string, ...interface{})
+	db              fdb.Database
+	fsName          string
+	clientId        string
+	onEviction      func(fs *Fs)
+	clientDetached  atomicBool
+	txCounter       atomicUint64
+	inoChan         chan uint64
+	relMtime        time.Duration
+	externalStorage *StorageEngineCache
+
+	workerWg      *sync.WaitGroup
+	cancelWorkers func()
+	logf          func(string, ...interface{})
 }
 
 func init() {
@@ -306,13 +308,18 @@ func ListFilesystems(db fdb.Database) ([]string, error) {
 }
 
 type AttachOpts struct {
-	ClientDescription string
-	OnEviction        func(fs *Fs)
-	Logf              func(string, ...interface{})
-	RelMtime          *time.Duration
+	ClientDescription  string
+	OnEviction         func(fs *Fs)
+	Logf               func(string, ...interface{})
+	RelMtime           *time.Duration
+	StorageEngineCache *StorageEngineCache
 }
 
 func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
+
+	if opts.StorageEngineCache == nil {
+		opts.StorageEngineCache = &DefaultStorageEngineCache
+	}
 
 	if opts.RelMtime == nil {
 		defaultRelMtime := 24 * time.Hour
@@ -1033,7 +1040,7 @@ func (f *invalidFile) Fsync() error                                        { ret
 func (f *invalidFile) Close() error                                        { return nil }
 
 type externalStoreReadOnlyFile struct {
-	storageObject readerAtCloser
+	storageObject ReaderAtCloser
 }
 
 func (f *externalStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
@@ -1054,12 +1061,12 @@ func (f *externalStoreReadOnlyFile) Close() error {
 }
 
 type externalStoreReadWriteFile struct {
-	fs        *Fs
-	ino       uint64
-	dirty     atomicBool
-	storage   string
-	flushLock sync.Mutex
-	tmpFile   *os.File
+	fs              *Fs
+	ino             uint64
+	dirty           atomicBool
+	externalStorage StorageEngine
+	flushLock       sync.Mutex
+	tmpFile         *os.File
 }
 
 func (f *externalStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
@@ -1083,7 +1090,7 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 	f.flushLock.Lock()
 	defer f.flushLock.Unlock()
 
-	size, err := storageWrite(f.storage, f.ino, f.tmpFile)
+	size, err := f.externalStorage.Write(f.ino, f.tmpFile)
 	if err != nil {
 		return err
 	}
@@ -1172,16 +1179,28 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			if opts.Truncate {
 				dirty = 1
 			}
+
+			externalStorage, err := fs.externalStorage.Get(stat.Storage)
+			if err != nil {
+				return nil, Stat{}, err
+			}
+
 			f = &externalStoreReadWriteFile{
-				fs:      fs,
-				ino:     stat.Ino,
-				dirty:   atomicBool{dirty},
-				storage: stat.Storage,
-				tmpFile: tmpFile,
+				fs:              fs,
+				ino:             stat.Ino,
+				dirty:           atomicBool{dirty},
+				externalStorage: externalStorage,
+				tmpFile:         tmpFile,
 			}
 
 		} else {
-			storageObject, err := storageOpen(stat.Storage, stat.Ino)
+
+			externalStorage, err := fs.externalStorage.Get(stat.Storage)
+			if err != nil {
+				return nil, Stat{}, err
+			}
+
+			storageObject, err := externalStorage.Open(stat.Ino)
 			if err != nil {
 				return nil, Stat{}, err
 			}
@@ -1228,11 +1247,17 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 		if err != nil {
 			return nil, Stat{}, err
 		}
+
+		externalStorage, err := fs.externalStorage.Get(stat.Storage)
+		if err != nil {
+			return nil, Stat{}, err
+		}
+
 		f = &externalStoreReadWriteFile{
-			fs:      fs,
-			ino:     stat.Ino,
-			storage: stat.Storage,
-			tmpFile: tmpFile,
+			fs:              fs,
+			ino:             stat.Ino,
+			externalStorage: externalStorage,
+			tmpFile:         tmpFile,
 		}
 	}
 	return f, stat, err
@@ -1672,7 +1697,8 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 				return nil, ErrInvalid
 			}
 			stat.Storage = string(data)
-			err := storageValidate(stat.Storage)
+
+			err := fs.externalStorage.Validate(stat.Storage)
 			if err != nil {
 				return nil, fmt.Errorf("unable to validate storage specification: %s", err)
 			}
@@ -1981,7 +2007,11 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 				}
 
 				if stat.Storage != "" {
-					err := storageRemove(stat.Storage, stat.Ino)
+					externalStorage, err := fs.externalStorage.Get(stat.Storage)
+					if err != nil {
+						return err
+					}
+					err = externalStorage.Remove(stat.Ino)
 					if err != nil {
 						return err
 					}

@@ -16,13 +16,13 @@ import (
 	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-type readerAtCloser interface {
+type ReaderAtCloser interface {
 	io.ReaderAt
 	io.Closer
 }
 
-type storageEngine interface {
-	Open(inode uint64) (readerAtCloser, error)
+type StorageEngine interface {
+	Open(inode uint64) (ReaderAtCloser, error)
 	Write(inode uint64, data *os.File) (int64, error)
 	Remove(inode uint64) error
 	Validate() error
@@ -33,7 +33,7 @@ type fileStorageEngine struct {
 	path string
 }
 
-func (s *fileStorageEngine) Open(inode uint64) (readerAtCloser, error) {
+func (s *fileStorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
 	f, err := os.Open(fmt.Sprintf("%s/%d", s.path, inode))
 	return f, err
 }
@@ -105,7 +105,7 @@ func (r *s3Reader) Close() error {
 	return r.obj.Close()
 }
 
-func (s *s3StorageEngine) Open(inode uint64) (readerAtCloser, error) {
+func (s *s3StorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
 	obj, err := s.client.GetObject(
 		context.Background(),
 		s.bucket,
@@ -195,7 +195,7 @@ func (r *crushStoreObjectReader) Close() error {
 	return r.obj.Close()
 }
 
-func (s *crushStoreStorageEngine) Open(inode uint64) (readerAtCloser, error) {
+func (s *crushStoreStorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
 	obj, ok, err := s.client.Get(
 		fmt.Sprintf("%d.hafs", inode),
 		crushstore.GetOptions{},
@@ -248,7 +248,7 @@ func (s *crushStoreStorageEngine) Close() error {
 	return s.client.Close()
 }
 
-func newStorageEngine(storage string) (storageEngine, error) {
+func newStorageEngine(storage string) (StorageEngine, error) {
 	if strings.HasPrefix(storage, "crushstore:") {
 		u, err := url.Parse(storage)
 		if err != nil {
@@ -332,53 +332,33 @@ func newStorageEngine(storage string) (storageEngine, error) {
 	return nil, errors.New("unknown/invalid storage specification")
 }
 
-// This cache only ever grows - which is a good use for sync.Map.
-// it doesn't seem like the infinite growth ever be a practical problem,
-// but we can address that if it ever does.
-var storageEngineCache sync.Map
+var DefaultStorageEngineCache StorageEngineCache
 
-func getStorageEngine(storage string) (storageEngine, error) {
-	cached, ok := storageEngineCache.Load(storage)
+type StorageEngineCache struct {
+	// This cache only ever grows - which is a good use for sync.Map.
+	// it doesn't seem like the infinite growth ever be a practical problem,
+	// but we can address that if it ever does.
+	cache sync.Map
+}
+
+func (c *StorageEngineCache) Get(storage string) (StorageEngine, error) {
+	cached, ok := c.cache.Load(storage)
 	if !ok {
 		engine, err := newStorageEngine(storage)
 		if err != nil {
 			return nil, err
 		}
-		storageEngineCache.Store(storage, engine)
+		c.cache.Store(storage, engine)
 		return engine, nil
 	}
-	return cached.(storageEngine), nil
+	return cached.(StorageEngine), nil
 }
 
-func storageValidate(storage string) error {
+func (c *StorageEngineCache) Validate(storage string) error {
 	s, err := newStorageEngine(storage)
 	if err != nil {
 		return err
 	}
 	defer s.Close()
 	return s.Validate()
-}
-
-func storageOpen(storage string, inode uint64) (readerAtCloser, error) {
-	s, err := getStorageEngine(storage)
-	if err != nil {
-		return nil, err
-	}
-	return s.Open(inode)
-}
-
-func storageWrite(storage string, inode uint64, data *os.File) (int64, error) {
-	s, err := getStorageEngine(storage)
-	if err != nil {
-		return 0, err
-	}
-	return s.Write(inode, data)
-}
-
-func storageRemove(storage string, inode uint64) error {
-	s, err := getStorageEngine(storage)
-	if err != nil {
-		return err
-	}
-	return s.Remove(inode)
 }
