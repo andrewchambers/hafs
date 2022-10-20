@@ -205,6 +205,29 @@ type MkfsOpts struct {
 }
 
 func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
+
+	if len(fsName) > 256 {
+		return errors.New("filesystem name must be less than 256 bytes")
+	}
+
+	validNameRune := func(r rune) bool {
+		if r == '-' || r == '_' {
+			return true
+		} else if (r >= 'A' && r <= 'Z') || (r >= 'a' && r <= 'z') {
+			return true
+		} else if r >= '0' && r <= '9' {
+			return true
+		} else {
+			return false
+		}
+	}
+
+	for _, r := range fsName {
+		if !validNameRune(r) {
+			return errors.New("filesystem names must only contain 'a-z', 'A-Z', '0-9', '-' and _'")
+		}
+	}
+
 	_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 
 		if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() != nil {
@@ -1090,7 +1113,7 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 	f.flushLock.Lock()
 	defer f.flushLock.Unlock()
 
-	size, err := f.externalStorage.Write(f.ino, f.tmpFile)
+	size, err := f.externalStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
 	if err != nil {
 		return err
 	}
@@ -1200,7 +1223,7 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 				return nil, Stat{}, err
 			}
 
-			storageObject, err := externalStorage.Open(stat.Ino)
+			storageObject, err := externalStorage.Open(fs.fsName, stat.Ino)
 			if err != nil {
 				return nil, Stat{}, err
 			}
@@ -2011,7 +2034,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 					if err != nil {
 						return err
 					}
-					err = externalStorage.Remove(stat.Ino)
+					err = externalStorage.Remove(fs.fsName, stat.Ino)
 					if err != nil {
 						return err
 					}

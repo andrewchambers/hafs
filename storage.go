@@ -22,9 +22,9 @@ type ReaderAtCloser interface {
 }
 
 type StorageEngine interface {
-	Open(inode uint64) (ReaderAtCloser, error)
-	Write(inode uint64, data *os.File) (int64, error)
-	Remove(inode uint64) error
+	Open(fs string, inode uint64) (ReaderAtCloser, error)
+	Write(fs string, inode uint64, data *os.File) (int64, error)
+	Remove(fs string, inode uint64) error
 	Validate() error
 	Close() error
 }
@@ -33,13 +33,13 @@ type fileStorageEngine struct {
 	path string
 }
 
-func (s *fileStorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
-	f, err := os.Open(fmt.Sprintf("%s/%d", s.path, inode))
+func (s *fileStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, error) {
+	f, err := os.Open(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
 	return f, err
 }
 
-func (s *fileStorageEngine) Write(inode uint64, data *os.File) (int64, error) {
-	f, err := os.Create(fmt.Sprintf("%s/%d", s.path, inode))
+func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
+	f, err := os.Create(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
 	if err != nil {
 		return 0, err
 	}
@@ -51,8 +51,8 @@ func (s *fileStorageEngine) Write(inode uint64, data *os.File) (int64, error) {
 	return n, f.Sync()
 }
 
-func (s *fileStorageEngine) Remove(inode uint64) error {
-	err := os.Remove(fmt.Sprintf("%s/%d", s.path, inode))
+func (s *fileStorageEngine) Remove(fs string, inode uint64) error {
+	err := os.Remove(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
 	if err != nil {
 		if err == iofs.ErrNotExist {
 			return nil
@@ -105,11 +105,11 @@ func (r *s3Reader) Close() error {
 	return r.obj.Close()
 }
 
-func (s *s3StorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
+func (s *s3StorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, error) {
 	obj, err := s.client.GetObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s/%d", s.path, inode),
+		fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
 		minio.GetObjectOptions{},
 	)
 	if err != nil {
@@ -121,7 +121,7 @@ func (s *s3StorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
 	}, nil
 }
 
-func (s *s3StorageEngine) Write(inode uint64, data *os.File) (int64, error) {
+func (s *s3StorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
 	stat, err := data.Stat()
 	if err != nil {
 		return 0, err
@@ -129,7 +129,7 @@ func (s *s3StorageEngine) Write(inode uint64, data *os.File) (int64, error) {
 	obj, err := s.client.PutObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s/%d", s.path, inode),
+		fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
 		data,
 		stat.Size(),
 		minio.PutObjectOptions{},
@@ -143,11 +143,11 @@ func (s *s3StorageEngine) Write(inode uint64, data *os.File) (int64, error) {
 	return obj.Size, nil
 }
 
-func (s *s3StorageEngine) Remove(inode uint64) error {
+func (s *s3StorageEngine) Remove(fs string, inode uint64) error {
 	err := s.client.RemoveObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s/%d", s.path, inode),
+		fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
 		minio.RemoveObjectOptions{},
 	)
 	if err != nil {
@@ -195,9 +195,9 @@ func (r *crushStoreObjectReader) Close() error {
 	return r.obj.Close()
 }
 
-func (s *crushStoreStorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
+func (s *crushStoreStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, error) {
 	obj, ok, err := s.client.Get(
-		fmt.Sprintf("%d.hafs", inode),
+		fmt.Sprintf("%d.%s", inode, fs),
 		crushstore.GetOptions{},
 	)
 	if err != nil {
@@ -212,22 +212,22 @@ func (s *crushStoreStorageEngine) Open(inode uint64) (ReaderAtCloser, error) {
 	}, nil
 }
 
-func (s *crushStoreStorageEngine) Write(inode uint64, data *os.File) (int64, error) {
+func (s *crushStoreStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
 	stat, err := data.Stat()
 	if err != nil {
 		return 0, err
 	}
 	err = s.client.Put(
-		fmt.Sprintf("%d.hafs", inode),
+		fmt.Sprintf("%d.%s", inode, fs),
 		data,
 		crushstore.PutOptions{},
 	)
 	return stat.Size(), err
 }
 
-func (s *crushStoreStorageEngine) Remove(inode uint64) error {
+func (s *crushStoreStorageEngine) Remove(fs string, inode uint64) error {
 	err := s.client.Delete(
-		fmt.Sprintf("%d.hafs", inode),
+		fmt.Sprintf("%d.%s", inode, fs),
 		crushstore.DeleteOptions{},
 	)
 	if err != nil {
