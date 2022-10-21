@@ -42,7 +42,6 @@ const (
 	CHUNK_SIZE              = 4096
 	_INO_BATCH_SIZE         = 65536
 	_INO_CHAN_SIZE          = 16384
-	_NATTACH_SHARDS         = 4 // One of these is read for each transaction, so spread load.
 )
 
 const (
@@ -390,10 +389,8 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 		return nil, err
 	}
 
-	initialHeartBeatBytes, err := json.Marshal(now.Unix())
-	if err != nil {
-		return nil, err
-	}
+	initialHeartBeatBytes := [8]byte{}
+	binary.BigEndian.PutUint64(initialHeartBeatBytes[:], uint64(now.Unix()))
 
 	_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		version := tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet()
@@ -405,10 +402,8 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 		}
 
 		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "info"}, clientInfoBytes)
-		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "heartbeat"}, initialHeartBeatBytes)
-		for i := 0; i < _NATTACH_SHARDS; i++ {
-			tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "attached", i}, []byte{})
-		}
+		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "heartbeat"}, initialHeartBeatBytes[:])
+		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "attached"}, []byte{})
 		tx.Set(tuple.Tuple{"hafs", fsName, "clients", clientId}, []byte{})
 		return nil, nil
 	})
@@ -419,15 +414,16 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 
 	fs := &Fs{
-		db:            db,
-		fsName:        fsName,
-		onEviction:    opts.OnEviction,
-		logf:          opts.Logf,
-		relMtime:      *opts.RelMtime,
-		clientId:      clientId,
-		cancelWorkers: cancelWorkers,
-		workerWg:      &sync.WaitGroup{},
-		inoChan:       make(chan uint64, _INO_CHAN_SIZE),
+		db:              db,
+		fsName:          fsName,
+		onEviction:      opts.OnEviction,
+		logf:            opts.Logf,
+		relMtime:        *opts.RelMtime,
+		clientId:        clientId,
+		cancelWorkers:   cancelWorkers,
+		externalStorage: opts.StorageEngineCache,
+		workerWg:        &sync.WaitGroup{},
+		inoChan:         make(chan uint64, _INO_CHAN_SIZE),
 	}
 
 	fs.workerWg.Add(1)
@@ -517,11 +513,9 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 func (fs *Fs) mountHeartBeat() error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		heartBeatKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "heartbeat"}
-		lastSeen, err := json.Marshal(time.Now().Unix())
-		if err != nil {
-			return nil, err
-		}
-		tx.Set(heartBeatKey, lastSeen)
+		lastSeenBytes := [8]byte{}
+		binary.BigEndian.PutUint64(lastSeenBytes[:], uint64(time.Now().Unix()))
+		tx.Set(heartBeatKey, lastSeenBytes[:])
 		return nil, nil
 	})
 	return err
@@ -558,11 +552,19 @@ func (fs *Fs) Close() error {
 }
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
-	return fs.db.ReadTransact(f)
+	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached"}
+	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		attachCheck := tx.Get(attachKey)
+		v, err := f(tx)
+		if attachCheck.MustGet() == nil {
+			return v, ErrDetached
+		}
+		return v, err
+	})
 }
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
-	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached", fs.txCounter.Add(1) % _NATTACH_SHARDS}
+	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached"}
 	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
@@ -1473,7 +1475,7 @@ func (fs *Fs) ModStat(ino uint64, opts ModStatOpts) (Stat, error) {
 }
 
 func (fs *Fs) Lookup(dirIno uint64, name string) (Stat, error) {
-	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
+	stat, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 		dirEnt, err := fs.txGetDirEnt(tx, dirIno, name).Get()
 		if err != nil {
 			return Stat{}, err
@@ -2170,17 +2172,12 @@ func (fs *Fs) EvictClient(clientId string) error {
 
 func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bool, error) {
 	timedOut, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		var heartBeat uint64
 		heatBeatKey := tuple.Tuple{"hafs", fs.fsName, "client", clientId, "heartbeat"}
 		heartBeatBytes := tx.Get(heatBeatKey).MustGet()
-		if heartBeatBytes == nil {
+		if len(heartBeatBytes) != 8 {
 			return true, nil
 		}
-		err := json.Unmarshal(heartBeatBytes, &heartBeat)
-		if err != nil {
-			return nil, err
-		}
-		lastSeen := time.Unix(int64(heartBeat), 0)
+		lastSeen := time.Unix(int64(binary.BigEndian.Uint64(heartBeatBytes)), 0)
 		timedOut := lastSeen.Add(clientTimeout).Before(time.Now())
 		return timedOut, nil
 	})
@@ -2316,10 +2313,10 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 		}
 
 		heartBeatBytes := tx.Get(tuple.Tuple{"hafs", fs.fsName, "client", clientId, "heartbeat"}).MustGet()
-		err = json.Unmarshal(heartBeatBytes, &info.HeartBeatUnix)
-		if err != nil {
-			return nil, err
+		if len(heartBeatBytes) != 8 {
+			return nil, errors.New("heart beat bytes are missing or corrupt")
 		}
+		info.HeartBeatUnix = binary.BigEndian.Uint64(heartBeatBytes)
 		info.Id = clientId
 		ok = true
 		return nil, nil

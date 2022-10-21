@@ -283,7 +283,7 @@ func TestUnlinkExternalStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	inodeDataPath := fmt.Sprintf("%s/%d", storageDir, stat.Ino)
+	inodeDataPath := fmt.Sprintf("%s/%d.%s", storageDir, stat.Ino, fs.fsName)
 	_, err = os.Stat(inodeDataPath)
 	if err != nil {
 		t.Fatal(err)
