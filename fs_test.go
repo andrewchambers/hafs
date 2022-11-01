@@ -227,7 +227,9 @@ func TestUnlink(t *testing.T) {
 		t.Fatal("expected unlinked")
 	}
 
-	nRemoved, err := fs.RemoveExpiredUnlinked(10 * time.Second)
+	nRemoved, err := fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 10 * time.Second,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -236,7 +238,9 @@ func TestUnlink(t *testing.T) {
 		t.Fatal("expected nothing to be removed")
 	}
 
-	nRemoved, err = fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err = fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 0,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -245,7 +249,9 @@ func TestUnlink(t *testing.T) {
 		t.Fatal("expected file to be removed")
 	}
 
-	nRemoved, err = fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err = fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 0,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -294,7 +300,9 @@ func TestUnlinkExternalStorage(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err := fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 0,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -392,7 +400,9 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", bar1Stat)
 	}
 
-	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err := fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 0,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -494,7 +504,9 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 		t.Fatalf("bar1 stat is bad: %#v", barStat)
 	}
 
-	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err := fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 0,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1099,7 +1111,9 @@ func TestHardLink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nRemoved, err := fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err := fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 0,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1112,7 +1126,9 @@ func TestHardLink(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	nRemoved, err = fs.RemoveExpiredUnlinked(time.Duration(0))
+	nRemoved, err = fs.RemoveExpiredUnlinked(RemoveExpiredUnlinkedOptions{
+		RemovalDelay: 0,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

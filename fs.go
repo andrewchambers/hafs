@@ -1945,7 +1945,12 @@ func (fs *Fs) AwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) erro
 	}
 }
 
-func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) {
+type RemoveExpiredUnlinkedOptions struct {
+	RemovalDelay time.Duration
+	OnRemoval    func(*Stat)
+}
+
+func (fs *Fs) RemoveExpiredUnlinked(opts RemoveExpiredUnlinkedOptions) (uint64, error) {
 
 	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "unlinked"}.FDBRangeKeys()
 
@@ -2009,7 +2014,7 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 						return nil, err
 					}
 
-					if now.After(stat.Ctime().Add(removalDelay)) {
+					if now.After(stat.Ctime().Add(opts.RemovalDelay)) {
 						expiredStats = append(expiredStats, stat)
 					}
 				}
@@ -2026,7 +2031,8 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 				return nil
 			}
 
-			for _, stat := range expiredStats {
+			for i := range expiredStats {
+				stat := &expiredStats[i]
 				if stat.Mode&S_IFMT != S_IFREG {
 					continue
 				}
@@ -2044,7 +2050,8 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 			}
 
 			_, err = fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-				for _, stat := range expiredStats {
+				for i := range expiredStats {
+					stat := &expiredStats[i]
 					tx.Clear(tuple.Tuple{"hafs", fs.fsName, "unlinked", stat.Ino})
 					tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino})
 				}
@@ -2052,6 +2059,12 @@ func (fs *Fs) RemoveExpiredUnlinked(removalDelay time.Duration) (uint64, error) 
 			})
 			if err != nil {
 				return err
+			}
+
+			if opts.OnRemoval != nil {
+				for i := range expiredStats {
+					opts.OnRemoval(&expiredStats[i])
+				}
 			}
 
 			nRemoved.Add(uint64(len(expiredStats)))
@@ -2189,7 +2202,12 @@ func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bo
 	return timedOut.(bool), nil
 }
 
-func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) {
+type EvictExpiredClientsOptions struct {
+	ClientExpiry time.Duration
+	OnEviction   func(string)
+}
+
+func (fs *Fs) EvictExpiredClients(opts EvictExpiredClientsOptions) (uint64, error) {
 
 	nEvicted := uint64(0)
 
@@ -2235,7 +2253,7 @@ func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) 
 
 			clientId := tup[len(tup)-1].(string)
 
-			shouldEvict, err := fs.IsClientTimedOut(clientId, clientTimeout)
+			shouldEvict, err := fs.IsClientTimedOut(clientId, opts.ClientExpiry)
 			if err != nil {
 				return nEvicted, err
 			}
@@ -2248,39 +2266,15 @@ func (fs *Fs) RemoveExpiredClients(clientTimeout time.Duration) (uint64, error) 
 			if err != nil {
 				return nEvicted, err
 			}
+			if opts.OnEviction != nil {
+				opts.OnEviction(clientId)
+			}
 
 			nEvicted += 1
 		}
 	}
 
 	return nEvicted, nil
-}
-
-type CollectGarbageOpts struct {
-	UnlinkedRemovalDelay time.Duration
-	ClientTimeout        time.Duration
-}
-
-type CollectGarbageStats struct {
-	UnlinkedRemovalCount uint64
-	ClientEvictionCount  uint64
-}
-
-func (fs *Fs) CollectGarbage(opts CollectGarbageOpts) (CollectGarbageStats, error) {
-	var err error
-	stats := CollectGarbageStats{}
-
-	stats.UnlinkedRemovalCount, err = fs.RemoveExpiredUnlinked(opts.UnlinkedRemovalDelay)
-	if err != nil {
-		return stats, err
-	}
-
-	stats.ClientEvictionCount, err = fs.RemoveExpiredClients(opts.ClientTimeout)
-	if err != nil {
-		return stats, err
-	}
-
-	return stats, nil
 }
 
 type ClientInfo struct {
