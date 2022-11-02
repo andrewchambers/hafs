@@ -390,7 +390,7 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	}
 
 	initialHeartBeatBytes := [8]byte{}
-	binary.BigEndian.PutUint64(initialHeartBeatBytes[:], uint64(now.Unix()))
+	binary.LittleEndian.PutUint64(initialHeartBeatBytes[:], uint64(now.Unix()))
 
 	_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		version := tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet()
@@ -514,7 +514,7 @@ func (fs *Fs) mountHeartBeat() error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		heartBeatKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "heartbeat"}
 		lastSeenBytes := [8]byte{}
-		binary.BigEndian.PutUint64(lastSeenBytes[:], uint64(time.Now().Unix()))
+		binary.LittleEndian.PutUint64(lastSeenBytes[:], uint64(time.Now().Unix()))
 		tx.Set(heartBeatKey, lastSeenBytes[:])
 		return nil, nil
 	})
@@ -2190,7 +2190,7 @@ func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bo
 		if len(heartBeatBytes) != 8 {
 			return true, nil
 		}
-		lastSeen := time.Unix(int64(binary.BigEndian.Uint64(heartBeatBytes)), 0)
+		lastSeen := time.Unix(int64(binary.LittleEndian.Uint64(heartBeatBytes)), 0)
 		timedOut := lastSeen.Add(clientTimeout).Before(time.Now())
 		return timedOut, nil
 	})
@@ -2310,7 +2310,7 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 		if len(heartBeatBytes) != 8 {
 			return nil, errors.New("heart beat bytes are missing or corrupt")
 		}
-		info.HeartBeatUnix = binary.BigEndian.Uint64(heartBeatBytes)
+		info.HeartBeatUnix = binary.LittleEndian.Uint64(heartBeatBytes)
 		info.Id = clientId
 		ok = true
 		return nil, nil
