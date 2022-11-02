@@ -3,8 +3,8 @@ package main
 import (
 	"os"
 	"runtime"
-	"time"
 	"syscall"
+	"time"
 )
 
 func checkBSDLocks() {
@@ -42,7 +42,7 @@ func checkBSDLocks() {
 	}
 	_ = f2.Close()
 	// XXX Fuse release seems to be done asynchronously - we must wait before we can see the unlock.
-	time.Sleep(10*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	err = syscall.Flock(int(f3.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		panic(err)
@@ -52,7 +52,7 @@ func checkBSDLocks() {
 		panic(err)
 	}
 	_ = f3.Close()
-	time.Sleep(10*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	err = syscall.Flock(int(f1.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		panic(err)
@@ -71,13 +71,13 @@ func checkBSDLocks() {
 		panic(err)
 	}
 	_ = f1.Close()
-	time.Sleep(10*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	err = syscall.Flock(int(f3.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err == nil {
 		panic(err)
 	}
 	_ = f2.Close()
-	time.Sleep(10*time.Millisecond)
+	time.Sleep(10 * time.Millisecond)
 	err = syscall.Flock(int(f3.Fd()), syscall.LOCK_EX|syscall.LOCK_NB)
 	if err != nil {
 		panic(err)

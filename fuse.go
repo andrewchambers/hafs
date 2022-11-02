@@ -150,7 +150,7 @@ func (fs *FuseFs) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.
 
 func (fs *FuseFs) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
 
-	modStat := ModStatOpts{}
+	modStat := ModStatOptions{}
 
 	if mtime, ok := in.GetMTime(); ok {
 		modStat.SetMtime(mtime)

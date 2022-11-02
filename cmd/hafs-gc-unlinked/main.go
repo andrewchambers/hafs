@@ -3,9 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"time"
-	"log"
 
 	"github.com/andrewchambers/hafs"
 	"github.com/andrewchambers/hafs/cli"
@@ -23,7 +23,7 @@ func main() {
 
 	nRemoved, err := fs.RemoveExpiredUnlinked(hafs.RemoveExpiredUnlinkedOptions{
 		RemovalDelay: *unlinkRemovalDelay,
-		OnRemoval: func (stat *hafs.Stat) {
+		OnRemoval: func(stat *hafs.Stat) {
 			if *verbose {
 				log.Printf("removing inode %d", stat.Ino)
 			}

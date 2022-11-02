@@ -3,9 +3,9 @@ package main
 import (
 	"flag"
 	"fmt"
+	"log"
 	"os"
 	"time"
-	"log"
 
 	"github.com/andrewchambers/hafs"
 	"github.com/andrewchambers/hafs/cli"
@@ -23,7 +23,7 @@ func main() {
 
 	nEvicted, err := fs.EvictExpiredClients(hafs.EvictExpiredClientsOptions{
 		ClientExpiry: *clientExpiry,
-		OnEviction: func (clientId string) {
+		OnEviction: func(clientId string) {
 			if *verbose {
 				log.Printf("evicting client %s", clientId)
 			}

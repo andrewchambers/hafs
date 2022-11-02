@@ -705,7 +705,7 @@ func TestTruncate(t *testing.T) {
 			nWritten += int(n)
 		}
 
-		_, err = fs.ModStat(stat.Ino, ModStatOpts{
+		_, err = fs.ModStat(stat.Ino, ModStatOptions{
 			Valid: MODSTAT_SIZE,
 			Size:  5,
 		})
@@ -1381,6 +1381,239 @@ func TestListFilesystems(t *testing.T) {
 
 	if !reflect.DeepEqual(filesystems, []string{"myfs", "testfs", "zzz"}) {
 		t.Fatalf("unexpected filesystem list")
+	}
+
+}
+
+func TestSubvolume(t *testing.T) {
+	fs := tmpFs(t)
+
+	dir, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := fs.Mknod(dir.Ino, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Subvolume != ROOT_INO {
+		t.Fatal("unexpected subvolume")
+	}
+
+	err = fs.SetXAttr(dir.Ino, "hafs.subvolume", []byte("true"))
+	if err != ErrInvalid {
+		t.Fatal(err)
+	}
+
+	err = fs.Unlink(dir.Ino, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.SetXAttr(dir.Ino, "hafs.subvolume", []byte("true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir, err = fs.GetStat(dir.Ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if dir.Flags&FLAG_SUBVOLUME != FLAG_SUBVOLUME {
+		t.Fatal("expected subvolume flag to be set")
+	}
+
+	f, err = fs.Mknod(dir.Ino, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if f.Subvolume != dir.Ino {
+		t.Fatal("unexpected subvolume")
+	}
+
+	err = fs.RemoveXAttr(dir.Ino, "hafs.subvolume")
+	if err == nil {
+		t.Fatal(err)
+	}
+
+	err = fs.RemoveXAttr(dir.Ino, "hafs.subvolume")
+	if err != ErrInvalid {
+		t.Fatal(err)
+	}
+
+	err = fs.Unlink(dir.Ino, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.RemoveXAttr(dir.Ino, "hafs.subvolume")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	dir, err = fs.GetStat(dir.Ino)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if dir.Flags&FLAG_SUBVOLUME != 0 {
+		t.Fatal("expected subvolume flag to be unset")
+	}
+
+}
+
+func TestSubvolumeNoCrossRenames(t *testing.T) {
+	fs := tmpFs(t)
+
+	dir, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.SetXAttr(dir.Ino, "hafs.subvolume", []byte("true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.Mknod(dir.Ino, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.Rename(dir.Ino, ROOT_INO, "f", "f")
+	if err != ErrInvalid {
+		t.Fatal(err)
+	}
+
+}
+
+func TestSubvolumeNoCrossHardlinks(t *testing.T) {
+	fs := tmpFs(t)
+
+	dir, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
+		Mode: S_IFDIR | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.SetXAttr(dir.Ino, "hafs.subvolume", []byte("true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f, err := fs.Mknod(dir.Ino, "f", MknodOpts{
+		Mode: S_IFREG | 0o777,
+		Uid:  0,
+		Gid:  0,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = fs.HardLink(ROOT_INO, f.Ino, "f")
+	if err != ErrInvalid {
+		t.Fatal(err)
+	}
+
+}
+
+func TestSubvolumeByteAccounting(t *testing.T) {
+	fs := tmpFs(t)
+
+	err := fs.SetXAttr(ROOT_INO, "hafs.track-usage", []byte("true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err := fs.SubvolumeByteUsage(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != 0 {
+		t.Fatal(b)
+	}
+
+	f, fstat, err := fs.CreateFile(ROOT_INO, "f", CreateFileOpts{
+		Mode: 0o777,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = f.WriteData([]byte{1, 2, 3, 4, 5}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err = fs.SubvolumeByteUsage(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != 5 {
+		t.Fatal(b)
+	}
+
+	usageXattr, err := fs.GetXAttr(ROOT_INO, "hafs.total-bytes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(usageXattr) != "5" {
+		t.Fatalf("unexpected usage xattr: %q", string(usageXattr))
+	}
+
+	fs.ModStat(fstat.Ino, ModStatOptions{
+		Valid: MODSTAT_SIZE,
+		Size:  3,
+	})
+
+	b, err = fs.SubvolumeByteUsage(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != 3 {
+		t.Fatal(b)
+	}
+
+	err = fs.Unlink(ROOT_INO, "f")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	b, err = fs.SubvolumeByteUsage(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b != 0 {
+		t.Fatal(b)
 	}
 
 }
