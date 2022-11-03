@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"math/bits"
 	"os"
 	"strings"
 	"sync"
@@ -32,16 +33,16 @@ var (
 	ErrNotSupported = unix.ENOTSUP
 	ErrPermission   = unix.EPERM
 	ErrIntr         = unix.EINTR
+	ErrNameTooLong  = unix.ENAMETOOLONG
 	ErrDetached     = errors.New("filesystem detached")
 )
 
 const (
+	NAME_MAX                = 4096
 	CURRENT_FDB_API_VERSION = 600
 	CURRENT_SCHEMA_VERSION  = 1
 	ROOT_INO                = 1
 	CHUNK_SIZE              = 4096
-	_INO_BATCH_SIZE         = 65536
-	_INO_CHAN_SIZE          = 16384
 )
 
 const (
@@ -250,7 +251,7 @@ func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 
 		rootStat := Stat{
 			Ino:       ROOT_INO,
-			Subvolume: ROOT_INO,       // Special case for the root ino.
+			Subvolume: 0,
 			Flags:     FLAG_SUBVOLUME, // The root inode is a subvolume of the filesystem.
 			Size:      0,
 			Atimesec:  0,
@@ -278,7 +279,7 @@ func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 		tx.ClearRange(tuple.Tuple{"hafs", fsName})
 		tx.Set(tuple.Tuple{"hafs", fsName, "version"}, []byte{CURRENT_SCHEMA_VERSION})
 		tx.Set(tuple.Tuple{"hafs", fsName, "ino", ROOT_INO, "stat"}, rootStatBytes)
-		tx.Set(tuple.Tuple{"hafs", fsName, "nextino"}, []byte("2"))
+		tx.Set(tuple.Tuple{"hafs", fsName, "inocntr"}, []byte{0, 0, 0, 0, 0, 0, 0, 1})
 		return nil, nil
 	})
 	return err
@@ -403,7 +404,7 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	}
 
 	initialHeartBeatBytes := [8]byte{}
-	binary.LittleEndian.PutUint64(initialHeartBeatBytes[:], uint64(now.Unix()))
+	binary.BigEndian.PutUint64(initialHeartBeatBytes[:], uint64(now.Unix()))
 
 	_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		version := tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet()
@@ -459,7 +460,7 @@ func reservedIno(ino uint64) bool {
 	const FUSE_UNKNOWN_INO = 0xFFFFFFFF
 	// XXX We currently reserve this inode too pending an answer to https://github.com/hanwen/go-fuse/issues/439.
 	const RESERVED_INO_1 = 0xFFFFFFFFFFFFFFFF
-	return ino == FUSE_UNKNOWN_INO || ino == RESERVED_INO_1
+	return ino == FUSE_UNKNOWN_INO || ino == RESERVED_INO_1 || ino == ROOT_INO || ino == 0
 }
 
 func (fs *Fs) nextIno() (uint64, error) {
@@ -475,30 +476,38 @@ func (fs *Fs) nextIno() (uint64, error) {
 	}
 }
 
+// We try to allocate inodes in an order that helps foundationDB distribute
+// writes. We do this by stepping over the key space in fairly large
+// chunks and allocating inodes in their reverse bit order, this hopefully
+// lets inodes be written to servers in a nice spread over the keyspace.
+const (
+	_INO_STEP      = 100271        // Large Prime, chosen so that ~100 bytes per stat * _INO_STEP covers a foundationdb range quickly to distribute load.
+	_INO_CHAN_SIZE = _INO_STEP - 1 // The channel is big enough so the first step blocks until one it taken.
+)
+
 func (fs *Fs) requestInosForever(ctx context.Context) {
-	nextInoKey := tuple.Tuple{"hafs", fs.fsName, "nextino"}
+	// Start with a small batch size, many clients  never allocate an inode.
+	inoBatchSize := uint64(_INO_STEP)
+	inoCounterKey := tuple.Tuple{"hafs", fs.fsName, "inocntr"}
 	for {
 		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-			nextInoBytes := tx.Get(nextInoKey).MustGet()
-			var currentIno uint64
-			err := json.Unmarshal(nextInoBytes, &currentIno)
-			if err != nil {
-				return nil, err
+			inoCounterBytes := tx.Get(inoCounterKey).MustGet()
+			if len(inoCounterBytes) != 8 {
+				panic("corrupt inode counter")
 			}
-			nextIno := currentIno + _INO_BATCH_SIZE
-			if nextIno >= 0x7FFFFFFFFFFFFFFF {
-				// Don't allow inodes to get into the range where
-				// they can't be represented by int64 or uint64 -
-				// We do this because FoundationDB encodes inodes
-				// in key tuples as int64.
+			currentCount := binary.BigEndian.Uint64(inoCounterBytes)
+			if (currentCount % _INO_STEP) != 0 {
+				// Realign the count with _INO_STEP if it has become out of sync.
+				currentCount += _INO_STEP - (currentCount % _INO_STEP)
+			}
+			nextInoCount := currentCount + inoBatchSize
+			if nextInoCount >= 0x7FFFFFFFFFFFFFFF {
+				// Avoid overflow and other strange cases.
 				panic("inodes exhausted")
 			}
-			nextInoBytes, err = json.Marshal(nextIno)
-			if err != nil {
-				return nil, err
-			}
-			tx.Set(nextInoKey, nextInoBytes)
-			return currentIno, nil
+			binary.BigEndian.PutUint64(inoCounterBytes, nextInoCount)
+			tx.Set(inoCounterKey, inoCounterBytes)
+			return currentCount, nil
 		})
 		if err != nil {
 			fs.logf("unable to allocate inode batch: %s", err)
@@ -506,19 +515,30 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 			continue
 		}
 
-		currentIno := v.(uint64)
-		for currentIno < currentIno+_INO_BATCH_SIZE {
-			select {
-			case fs.inoChan <- currentIno:
-			default:
+		inoBatchStart := v.(uint64)
+
+		for i := uint64(0); i < _INO_STEP; i++ {
+			for j := inoBatchStart; j < inoBatchStart+inoBatchSize; j += _INO_STEP {
+				// Reverse the bits of the counter for better write load balancing.
+				ino := bits.Reverse64(j + i)
 				select {
-				case fs.inoChan <- currentIno:
-				case <-ctx.Done():
-					close(fs.inoChan)
-					return
+				case fs.inoChan <- ino:
+				default:
+					select {
+					case fs.inoChan <- ino:
+					case <-ctx.Done():
+						close(fs.inoChan)
+						return
+					}
 				}
 			}
-			currentIno += 1
+		}
+
+		// Ramp up batch sizes.
+		inoBatchSize *= 2
+		const MAX_INO_BATCH = _INO_STEP * 64
+		if inoBatchSize >= MAX_INO_BATCH {
+			inoBatchSize = MAX_INO_BATCH
 		}
 	}
 }
@@ -527,7 +547,7 @@ func (fs *Fs) mountHeartBeat() error {
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		heartBeatKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "heartbeat"}
 		lastSeenBytes := [8]byte{}
-		binary.LittleEndian.PutUint64(lastSeenBytes[:], uint64(time.Now().Unix()))
+		binary.BigEndian.PutUint64(lastSeenBytes[:], uint64(time.Now().Unix()))
 		tx.Set(heartBeatKey, lastSeenBytes[:])
 		return nil, nil
 	})
@@ -681,6 +701,11 @@ type MknodOpts struct {
 }
 
 func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts MknodOpts) (Stat, error) {
+
+	if len(name) > NAME_MAX {
+		return Stat{}, ErrNameTooLong
+	}
+
 	dirStatFut := fs.txGetStat(tx, dirIno)
 	getDirEntFut := fs.txGetDirEnt(tx, dirIno, name)
 
@@ -741,6 +766,8 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 			// Only files inherit storage from the parent directory.
 			stat.Storage = dirStat.Storage
 		}
+
+		fs.txSubvolumeInodeDelta(tx, stat.Subvolume, 1)
 	}
 
 	now := time.Now()
@@ -816,7 +843,12 @@ func (fs *Fs) HardLink(dirIno, ino uint64, name string) (Stat, error) {
 		}
 
 		if dirStat.Subvolume != stat.Subvolume {
-			return Stat{}, ErrInvalid
+			if dirStat.Flags&FLAG_SUBVOLUME == 0 {
+				return Stat{}, ErrInvalid
+			}
+			if dirStat.Ino != stat.Subvolume {
+				return Stat{}, ErrInvalid
+			}
 		}
 
 		now := time.Now()
@@ -846,34 +878,58 @@ func (fs *Fs) HardLink(dirIno, ino uint64, name string) (Stat, error) {
 	return stat.(Stat), nil
 }
 
-func (fs *Fs) txSubvolumeByteDelta(tx fdb.Transaction, subvolume uint64, delta int64) {
+func (fs *Fs) txSubvolumeCountDelta(tx fdb.Transaction, subvolume uint64, counter string, delta int64) {
 	if delta == 0 {
 		return
 	}
 	const COUNTER_SHARDS = 32
 	counterShardIdx := uint64(time.Now().Nanosecond()) % COUNTER_SHARDS // XXX something better?
 	deltaBytes := [8]byte{}
-	binary.LittleEndian.PutUint64(deltaBytes[:], uint64(delta))
-	tx.Add(tuple.Tuple{"hafs", fs.fsName, "ino", subvolume, "bcnt", counterShardIdx}, deltaBytes[:])
+	binary.BigEndian.PutUint64(deltaBytes[:], uint64(delta))
+	tx.Add(tuple.Tuple{"hafs", fs.fsName, "ino", subvolume, counter, counterShardIdx}, deltaBytes[:])
 }
 
-func (fs *Fs) txSubvolumeByteUsage(tx fdb.ReadTransaction, subvolume uint64) (uint64, error) {
-	kvs := tx.GetRange(tuple.Tuple{"hafs", fs.fsName, "ino", subvolume, "bcnt"}, fdb.RangeOptions{
+func (fs *Fs) txSubvolumeByteDelta(tx fdb.Transaction, subvolume uint64, delta int64) {
+	fs.txSubvolumeCountDelta(tx, subvolume, "bcnt", delta)
+}
+
+func (fs *Fs) txSubvolumeInodeDelta(tx fdb.Transaction, subvolume uint64, delta int64) {
+	fs.txSubvolumeCountDelta(tx, subvolume, "icnt", delta)
+}
+
+func (fs *Fs) txSubvolumeCount(tx fdb.ReadTransaction, subvolume uint64, counter string) (uint64, error) {
+	kvs := tx.GetRange(tuple.Tuple{"hafs", fs.fsName, "ino", subvolume, counter}, fdb.RangeOptions{
 		Limit: 512, // Should be large enough to cover all counter shards.
 	}).GetSliceOrPanic()
-	tot := int64(0)
+	v := int64(0)
 	for _, kv := range kvs {
 		if len(kv.Value) != 8 {
 			return 0, errors.New("unexpected overflow or invalid counter value")
 		}
-		tot += int64(binary.LittleEndian.Uint64(kv.Value))
+		v += int64(binary.BigEndian.Uint64(kv.Value))
 	}
-	return uint64(tot), nil
+	return uint64(v), nil
 }
 
-func (fs *Fs) SubvolumeByteUsage(subvolume uint64) (uint64, error) {
+func (fs *Fs) txSubvolumeByteCount(tx fdb.ReadTransaction, subvolume uint64) (uint64, error) {
+	return fs.txSubvolumeCount(tx, subvolume, "bctr")
+}
+
+func (fs *Fs) txSubvolumeInodeCount(tx fdb.ReadTransaction, subvolume uint64) (uint64, error) {
+	return fs.txSubvolumeCount(tx, subvolume, "ictr")
+}
+
+func (fs *Fs) SubvolumeByteCount(subvolume uint64) (uint64, error) {
 	v, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		v, err := fs.txSubvolumeByteUsage(tx, subvolume)
+		v, err := fs.txSubvolumeByteCount(tx, subvolume)
+		return v, err
+	})
+	return v.(uint64), err
+}
+
+func (fs *Fs) SubvolumeInodeCount(subvolume uint64) (uint64, error) {
+	v, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		v, err := fs.txSubvolumeInodeCount(tx, subvolume)
 		return v, err
 	})
 	return v.(uint64), err
@@ -914,6 +970,7 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		if stat.Nlink == 0 {
 			if stat.Flags&FLAG_TRACK_USAGE != 0 {
 				fs.txSubvolumeByteDelta(tx, stat.Subvolume, -int64(stat.Size))
+				fs.txSubvolumeInodeDelta(tx, stat.Subvolume, -1)
 			}
 			tx.Set(tuple.Tuple{"hafs", fs.fsName, "unlinked", dirEnt.Ino}, []byte{})
 		}
@@ -1636,9 +1693,24 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 		}
 
 		if toDirIno != fromDirIno {
-			if toDirStat.Subvolume != fromDirStat.Subvolume {
+
+			// Enforce subvolume invariants.
+			if toDirStat.Flags&FLAG_SUBVOLUME != 0 && fromDirStat.Flags&FLAG_SUBVOLUME != 0 {
 				return nil, ErrInvalid
+			} else if toDirStat.Flags&FLAG_SUBVOLUME != 0 {
+				if toDirStat.Ino != fromDirStat.Subvolume {
+					return nil, ErrInvalid
+				}
+			} else if fromDirStat.Flags&FLAG_SUBVOLUME != 0 {
+				if fromDirStat.Ino != toDirStat.Subvolume {
+					return nil, ErrInvalid
+				}
+			} else { // Neither are subvolumes
+				if toDirStat.Subvolume != fromDirStat.Subvolume {
+					return nil, ErrInvalid
+				}
 			}
+
 			toDirStat.SetMtime(now)
 			toDirStat.SetCtime(now)
 			fs.txSetStat(tx, toDirStat)
@@ -1775,12 +1847,14 @@ func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
 
 func (fs *Fs) GetXAttr(ino uint64, name string) ([]byte, error) {
 	x, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-
 		switch name {
-		case "hafs.total-bytes":
-			// Synthetic xattr.
+		case "hafs.totals":
 			statFut := fs.txGetStat(tx, ino)
-			bu, err := fs.txSubvolumeByteUsage(tx, ino)
+			bcount, err := fs.txSubvolumeByteCount(tx, ino)
+			if err != nil {
+				return nil, err
+			}
+			icount, err := fs.txSubvolumeInodeCount(tx, ino)
 			if err != nil {
 				return nil, err
 			}
@@ -1791,7 +1865,33 @@ func (fs *Fs) GetXAttr(ino uint64, name string) ([]byte, error) {
 			if stat.Flags&FLAG_SUBVOLUME == 0 {
 				return nil, ErrInvalid
 			}
-			return []byte(fmt.Sprintf("%d", bu)), nil
+			return []byte(fmt.Sprintf(`{"bytes":%d,"inodes":%d}`, bcount, icount)), nil
+		case "hafs.total-bytes", "hafs.total-inodes":
+			var (
+				count uint64
+				err   error
+			)
+			statFut := fs.txGetStat(tx, ino)
+			switch name {
+			case "hafs.total-bytes":
+				count, err = fs.txSubvolumeByteCount(tx, ino)
+				if err != nil {
+					return nil, err
+				}
+			case "hafs.total-inodes":
+				count, err = fs.txSubvolumeInodeCount(tx, ino)
+				if err != nil {
+					return nil, err
+				}
+			}
+			stat, err := statFut.Get()
+			if err != nil {
+				return nil, err
+			}
+			if stat.Flags&FLAG_SUBVOLUME == 0 {
+				return nil, ErrInvalid
+			}
+			return []byte(fmt.Sprintf("%d", count)), nil
 		default:
 			statFut := fs.txGetStat(tx, ino)
 			xFut := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr", name})
@@ -1829,7 +1929,7 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 				return nil, fmt.Errorf("unable to validate storage specification: %s", err)
 			}
 			fs.txSetStat(tx, stat)
-		case "hafs.total-bytes":
+		case "hafs.total-bytes", "hafs.total-inodes", "hafs.totals":
 			return nil, ErrInvalid
 		case "hafs.subvolume", "hafs.track-usage":
 			if stat.Mode&S_IFMT != S_IFDIR {
@@ -1872,8 +1972,6 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			}
 			stat.Storage = ""
 			fs.txSetStat(tx, stat)
-		case "hafs.total-bytes":
-			return nil, ErrInvalid
 		case "hafs.subvolume", "hafs.track-usage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
@@ -2085,6 +2183,17 @@ func (fs *Fs) AwaitExclusiveLockRelease(cancel <-chan struct{}, ino uint64) erro
 	}
 }
 
+func tupleElem2u64(elem tuple.TupleElement) uint64 {
+	switch elem := elem.(type) {
+	case uint64:
+		return elem
+	case int64:
+		return uint64(elem)
+	default:
+		panic(elem)
+	}
+}
+
 type RemoveExpiredUnlinkedOptions struct {
 	RemovalDelay time.Duration
 	OnRemoval    func(*Stat)
@@ -2138,7 +2247,7 @@ func (fs *Fs) RemoveExpiredUnlinked(opts RemoveExpiredUnlinkedOptions) (uint64, 
 					if err != nil {
 						return nil, err
 					}
-					ino := uint64(keyTuple[len(keyTuple)-1].(int64))
+					ino := tupleElem2u64(keyTuple[len(keyTuple)-1])
 					futureStats = append(futureStats, fs.txGetStat(tx, ino))
 				}
 
@@ -2293,8 +2402,8 @@ func (fs *Fs) EvictClient(clientId string) error {
 				if len(tup) < 2 {
 					return nil, errors.New("corrupt lock entry")
 				}
-				owner := uint64(tup[len(tup)-1].(int64))
-				ino := uint64(tup[len(tup)-2].(int64))
+				owner := tupleElem2u64(tup[len(tup)-1])
+				ino := tupleElem2u64(tup[len(tup)-2])
 				err = fs.txBreakLock(tx, clientId, ino, owner)
 				if err != nil {
 					return nil, err
@@ -2330,7 +2439,7 @@ func (fs *Fs) IsClientTimedOut(clientId string, clientTimeout time.Duration) (bo
 		if len(heartBeatBytes) != 8 {
 			return true, nil
 		}
-		lastSeen := time.Unix(int64(binary.LittleEndian.Uint64(heartBeatBytes)), 0)
+		lastSeen := time.Unix(int64(binary.BigEndian.Uint64(heartBeatBytes)), 0)
 		timedOut := lastSeen.Add(clientTimeout).Before(time.Now())
 		return timedOut, nil
 	})
@@ -2450,7 +2559,7 @@ func (fs *Fs) ClientInfo(clientId string) (ClientInfo, bool, error) {
 		if len(heartBeatBytes) != 8 {
 			return nil, errors.New("heart beat bytes are missing or corrupt")
 		}
-		info.HeartBeatUnix = binary.LittleEndian.Uint64(heartBeatBytes)
+		info.HeartBeatUnix = binary.BigEndian.Uint64(heartBeatBytes)
 		info.Id = clientId
 		ok = true
 		return nil, nil

@@ -1041,14 +1041,13 @@ func TestWaitForLockWithPoll(t *testing.T) {
 
 func TestInodeAllocation(t *testing.T) {
 	fs := tmpFs(t)
-
 	seen := make(map[uint64]struct{})
-
-	for i := 0; i < _INO_BATCH_SIZE*3; i++ {
+	for i := uint64(0); i < _INO_STEP*10; i++ {
 		ino, err := fs.nextIno()
 		if err != nil {
 			t.Fatal(err)
 		}
+		//t.Logf("%016x %016x", ino, bits.Reverse64(ino))
 		_, seenBefore := seen[ino]
 		if seenBefore {
 			t.Fatal("repeated inode")
@@ -1549,7 +1548,7 @@ func TestSubvolumeByteAccounting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err := fs.SubvolumeByteUsage(ROOT_INO)
+	b, err := fs.SubvolumeByteCount(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1574,7 +1573,7 @@ func TestSubvolumeByteAccounting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err = fs.SubvolumeByteUsage(ROOT_INO)
+	b, err = fs.SubvolumeByteCount(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1595,7 +1594,7 @@ func TestSubvolumeByteAccounting(t *testing.T) {
 		Size:  3,
 	})
 
-	b, err = fs.SubvolumeByteUsage(ROOT_INO)
+	b, err = fs.SubvolumeByteCount(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1608,7 +1607,7 @@ func TestSubvolumeByteAccounting(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	b, err = fs.SubvolumeByteUsage(ROOT_INO)
+	b, err = fs.SubvolumeByteCount(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}
