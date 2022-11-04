@@ -19,6 +19,7 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"github.com/detailyang/fastrand-go"
 	"github.com/valyala/fastjson"
 	"golang.org/x/sync/errgroup"
 	"golang.org/x/sys/unix"
@@ -58,7 +59,6 @@ const (
 
 const (
 	FLAG_SUBVOLUME uint64 = 1 << iota
-	FLAG_TRACK_USAGE
 )
 
 type DirEnt struct {
@@ -283,6 +283,49 @@ func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 		return nil, nil
 	})
 	return err
+}
+
+type RmfsOpts struct {
+	Force bool
+}
+
+func Rmfs(db fdb.Database, fsName string, opts RmfsOpts) (bool, error) {
+	v, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		kvs := tx.GetRange(tuple.Tuple{"hafs", fsName}, fdb.RangeOptions{
+			Limit: 2,
+		}).GetSliceOrPanic()
+		if len(kvs) == 0 {
+			return false, nil
+		}
+		if !opts.Force {
+			kvs = tx.GetRange(tuple.Tuple{"hafs", fsName, "ino"}, fdb.RangeOptions{
+				Limit: 2,
+			}).GetSliceOrPanic()
+			if len(kvs) != 1 {
+				// The root inode is an exception.
+				return false, fmt.Errorf("filesystem is not empty")
+			}
+			kvs = tx.GetRange(tuple.Tuple{"hafs", fsName, "clients"}, fdb.RangeOptions{
+				Limit: 1,
+			}).GetSliceOrPanic()
+			if len(kvs) != 0 {
+				return false, fmt.Errorf("filesystem has connected clients")
+			}
+			kvs = tx.GetRange(tuple.Tuple{"hafs", fsName, "unlinked"}, fdb.RangeOptions{
+				Limit: 1,
+			}).GetSliceOrPanic()
+			if len(kvs) != 0 {
+				return false, fmt.Errorf("filesystem has inodes pending garbage collection")
+			}
+		}
+
+		tx.ClearRange(tuple.Tuple{"hafs", fsName})
+		return true, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return v.(bool), nil
 }
 
 func ListFilesystems(db fdb.Database) ([]string, error) {
@@ -514,7 +557,6 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 			time.Sleep(1 * time.Second)
 			continue
 		}
-
 		inoBatchStart := v.(uint64)
 
 		for i := uint64(0); i < _INO_STEP; i++ {
@@ -714,6 +756,10 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 		return Stat{}, err
 	}
 
+	if dirStat.Nlink == 0 {
+		return Stat{}, ErrNotExist
+	}
+
 	if dirStat.Mode&S_IFMT != S_IFDIR {
 		return Stat{}, ErrNotDir
 	}
@@ -728,7 +774,7 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 		if existingDirEnt.Mode&S_IFMT != S_IFREG {
 			return Stat{}, ErrInvalid
 		}
-		stat, err = fs.txModStat(tx, existingDirEnt.Ino, ModStatOptions{Valid: MODSTAT_SIZE, Size: 0})
+		stat, err = fs.txModStat(tx, existingDirEnt.Ino, ModStatOpts{Valid: MODSTAT_SIZE, Size: 0})
 		if err != nil {
 			return Stat{}, err
 		}
@@ -742,7 +788,7 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 		stat = Stat{
 			Ino:       newIno,
 			Subvolume: dirStat.Subvolume,
-			Flags:     dirStat.Flags & FLAG_TRACK_USAGE,
+			Flags:     0,
 			Size:      0,
 			Atimesec:  0,
 			Mtimesec:  0,
@@ -882,8 +928,8 @@ func (fs *Fs) txSubvolumeCountDelta(tx fdb.Transaction, subvolume uint64, counte
 	if delta == 0 {
 		return
 	}
-	const COUNTER_SHARDS = 32
-	counterShardIdx := uint64(time.Now().Nanosecond()) % COUNTER_SHARDS // XXX something better?
+	const COUNTER_SHARDS = 16
+	counterShardIdx := uint64(fastrand.FastRand() % COUNTER_SHARDS)
 	deltaBytes := [8]byte{}
 	binary.BigEndian.PutUint64(deltaBytes[:], uint64(delta))
 	tx.Add(tuple.Tuple{"hafs", fs.fsName, "ino", subvolume, counter, counterShardIdx}, deltaBytes[:])
@@ -912,11 +958,11 @@ func (fs *Fs) txSubvolumeCount(tx fdb.ReadTransaction, subvolume uint64, counter
 }
 
 func (fs *Fs) txSubvolumeByteCount(tx fdb.ReadTransaction, subvolume uint64) (uint64, error) {
-	return fs.txSubvolumeCount(tx, subvolume, "bctr")
+	return fs.txSubvolumeCount(tx, subvolume, "bcnt")
 }
 
 func (fs *Fs) txSubvolumeInodeCount(tx fdb.ReadTransaction, subvolume uint64) (uint64, error) {
-	return fs.txSubvolumeCount(tx, subvolume, "ictr")
+	return fs.txSubvolumeCount(tx, subvolume, "icnt")
 }
 
 func (fs *Fs) SubvolumeByteCount(subvolume uint64) (uint64, error) {
@@ -924,7 +970,10 @@ func (fs *Fs) SubvolumeByteCount(subvolume uint64) (uint64, error) {
 		v, err := fs.txSubvolumeByteCount(tx, subvolume)
 		return v, err
 	})
-	return v.(uint64), err
+	if err != nil {
+		return 0, err
+	}
+	return v.(uint64), nil
 }
 
 func (fs *Fs) SubvolumeInodeCount(subvolume uint64) (uint64, error) {
@@ -932,6 +981,9 @@ func (fs *Fs) SubvolumeInodeCount(subvolume uint64) (uint64, error) {
 		v, err := fs.txSubvolumeInodeCount(tx, subvolume)
 		return v, err
 	})
+	if err != nil {
+		return 0, err
+	}
 	return v.(uint64), err
 }
 
@@ -968,10 +1020,8 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 		stat.SetCtime(now)
 		fs.txSetStat(tx, stat)
 		if stat.Nlink == 0 {
-			if stat.Flags&FLAG_TRACK_USAGE != 0 {
-				fs.txSubvolumeByteDelta(tx, stat.Subvolume, -int64(stat.Size))
-				fs.txSubvolumeInodeDelta(tx, stat.Subvolume, -1)
-			}
+			fs.txSubvolumeByteDelta(tx, stat.Subvolume, -int64(stat.Size))
+			fs.txSubvolumeInodeDelta(tx, stat.Subvolume, -1)
 			tx.Set(tuple.Tuple{"hafs", fs.fsName, "unlinked", dirEnt.Ino}, []byte{})
 		}
 		tx.Clear(tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child", name})
@@ -1069,9 +1119,7 @@ func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 
 		if stat.Size < offset+nWritten {
 			newSize := offset + nWritten
-			if stat.Flags&FLAG_TRACK_USAGE != 0 {
-				f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(newSize)-int64(stat.Size))
-			}
+			f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(newSize)-int64(stat.Size))
 			stat.Size = newSize
 		}
 		stat.SetMtime(time.Now())
@@ -1081,7 +1129,6 @@ func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 	if err != nil {
 		return 0, err
 	}
-
 	return nWritten.(uint32), nil
 }
 func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
@@ -1167,7 +1214,6 @@ func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 
 		return uint32(nRead), nil
 	})
-
 	nReadInt, ok := nRead.(uint32)
 	if ok {
 		return nReadInt, err
@@ -1246,9 +1292,7 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 		if err != nil {
 			return nil, err
 		}
-		if stat.Flags&FLAG_TRACK_USAGE != 0 {
-			f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, size-int64(stat.Size))
-		}
+		f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, size-int64(stat.Size))
 		stat.Size = uint64(size)
 		f.fs.txSetStat(tx, stat)
 		return nil, nil
@@ -1295,7 +1339,7 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 		}
 
 		if opts.Truncate {
-			stat, err = fs.txModStat(tx, stat.Ino, ModStatOptions{
+			stat, err = fs.txModStat(tx, stat.Ino, ModStatOpts{
 				Valid: MODSTAT_SIZE,
 				Size:  0,
 			})
@@ -1452,7 +1496,7 @@ const (
 	MODSTAT_CTIME
 )
 
-type ModStatOptions struct {
+type ModStatOpts struct {
 	Valid     uint32
 	Size      uint64
 	Atimesec  uint64
@@ -1466,47 +1510,47 @@ type ModStatOptions struct {
 	Gid       uint32
 }
 
-func (opts *ModStatOptions) setTime(t time.Time, secs *uint64, nsecs *uint32) {
+func (opts *ModStatOpts) setTime(t time.Time, secs *uint64, nsecs *uint32) {
 	*secs = uint64(t.UnixNano() / 1_000_000_000)
 	*nsecs = uint32(t.UnixNano() % 1_000_000_000)
 }
 
-func (opts *ModStatOptions) SetMtime(t time.Time) {
+func (opts *ModStatOpts) SetMtime(t time.Time) {
 	opts.Valid |= MODSTAT_MTIME
 	opts.setTime(t, &opts.Mtimesec, &opts.Mtimensec)
 }
 
-func (opts *ModStatOptions) SetAtime(t time.Time) {
+func (opts *ModStatOpts) SetAtime(t time.Time) {
 	opts.Valid |= MODSTAT_ATIME
 	opts.setTime(t, &opts.Atimesec, &opts.Atimensec)
 }
 
-func (opts *ModStatOptions) SetCtime(t time.Time) {
+func (opts *ModStatOpts) SetCtime(t time.Time) {
 	opts.Valid |= MODSTAT_CTIME
 	opts.setTime(t, &opts.Ctimesec, &opts.Ctimensec)
 }
 
-func (opts *ModStatOptions) SetSize(size uint64) {
+func (opts *ModStatOpts) SetSize(size uint64) {
 	opts.Valid |= MODSTAT_SIZE
 	opts.Size = size
 }
 
-func (opts *ModStatOptions) SetMode(mode uint32) {
+func (opts *ModStatOpts) SetMode(mode uint32) {
 	opts.Valid |= MODSTAT_MODE
 	opts.Mode = mode
 }
 
-func (opts *ModStatOptions) SetUid(uid uint32) {
+func (opts *ModStatOpts) SetUid(uid uint32) {
 	opts.Valid |= MODSTAT_UID
 	opts.Uid = uid
 }
 
-func (opts *ModStatOptions) SetGid(gid uint32) {
+func (opts *ModStatOpts) SetGid(gid uint32) {
 	opts.Valid |= MODSTAT_GID
 	opts.Gid = gid
 }
 
-func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOptions) (Stat, error) {
+func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat, error) {
 	stat, err := fs.txGetStat(tx, ino).Get()
 	if err != nil {
 		return Stat{}, err
@@ -1547,9 +1591,7 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOptions) (St
 
 	if opts.Valid&MODSTAT_SIZE != 0 {
 
-		if stat.Flags&FLAG_TRACK_USAGE != 0 {
-			fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(opts.Size)-int64(stat.Size))
-		}
+		fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(opts.Size)-int64(stat.Size))
 		stat.Size = opts.Size
 
 		if stat.Mode&S_IFMT != S_IFREG {
@@ -1597,7 +1639,7 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOptions) (St
 	return stat, nil
 }
 
-func (fs *Fs) ModStat(ino uint64, opts ModStatOptions) (Stat, error) {
+func (fs *Fs) ModStat(ino uint64, opts ModStatOpts) (Stat, error) {
 	stat, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		stat, err := fs.txModStat(tx, ino, opts)
 		return stat, err
@@ -1931,20 +1973,14 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 			fs.txSetStat(tx, stat)
 		case "hafs.total-bytes", "hafs.total-inodes", "hafs.totals":
 			return nil, ErrInvalid
-		case "hafs.subvolume", "hafs.track-usage":
+		case "hafs.subvolume":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
 			if fs.txDirHasChildren(tx, stat.Ino) {
 				return nil, ErrInvalid
 			}
-			flag := uint64(0)
-			switch name {
-			case "hafs.subvolume":
-				flag = FLAG_SUBVOLUME
-			case "hafs.track-usage":
-				flag = FLAG_TRACK_USAGE
-			}
+			flag := FLAG_SUBVOLUME
 			switch string(data) {
 			case "true":
 				stat.Flags |= flag
@@ -1972,20 +2008,14 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			}
 			stat.Storage = ""
 			fs.txSetStat(tx, stat)
-		case "hafs.subvolume", "hafs.track-usage":
+		case "hafs.subvolume":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
 			if fs.txDirHasChildren(tx, stat.Ino) {
 				return nil, ErrInvalid
 			}
-			flag := uint64(0)
-			switch name {
-			case "hafs.subvolume":
-				flag = FLAG_SUBVOLUME
-			case "hafs.track-usage":
-				flag = FLAG_TRACK_USAGE
-			}
+			flag := FLAG_SUBVOLUME
 			stat.Flags &= ^flag
 			fs.txSetStat(tx, stat)
 		default:

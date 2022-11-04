@@ -705,7 +705,7 @@ func TestTruncate(t *testing.T) {
 			nWritten += int(n)
 		}
 
-		_, err = fs.ModStat(stat.Ino, ModStatOptions{
+		_, err = fs.ModStat(stat.Ino, ModStatOpts{
 			Valid: MODSTAT_SIZE,
 			Size:  5,
 		})
@@ -1589,7 +1589,7 @@ func TestSubvolumeByteAccounting(t *testing.T) {
 		t.Fatalf("unexpected usage xattr: %q", string(usageXattr))
 	}
 
-	fs.ModStat(fstat.Ino, ModStatOptions{
+	fs.ModStat(fstat.Ino, ModStatOpts{
 		Valid: MODSTAT_SIZE,
 		Size:  3,
 	})

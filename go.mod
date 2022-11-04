@@ -15,6 +15,7 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
+	github.com/detailyang/fastrand-go v0.0.0-20191106153122-53093851e761 // indirect
 	github.com/dustin/go-humanize v1.0.0 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/google/uuid v1.3.0 // indirect
