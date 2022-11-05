@@ -59,6 +59,7 @@ const (
 
 const (
 	FLAG_SUBVOLUME uint64 = 1 << iota
+	FLAG_OBJECT_STORAGE
 )
 
 type DirEnt struct {
@@ -192,15 +193,15 @@ func (stat *Stat) Ctime() time.Time {
 }
 
 type Fs struct {
-	db              fdb.Database
-	fsName          string
-	clientId        string
-	onEviction      func(fs *Fs)
-	clientDetached  atomicBool
-	txCounter       atomicUint64
-	inoChan         chan uint64
-	relMtime        time.Duration
-	externalStorage *StorageEngineCache
+	db             fdb.Database
+	fsName         string
+	clientId       string
+	onEviction     func(fs *Fs)
+	clientDetached atomicBool
+	txCounter      atomicUint64
+	inoChan        chan uint64
+	relMtime       time.Duration
+	objectStorage  *ObjectStorageEngineCache
 
 	workerWg      *sync.WaitGroup
 	cancelWorkers func()
@@ -387,17 +388,17 @@ func ListFilesystems(db fdb.Database) ([]string, error) {
 }
 
 type AttachOpts struct {
-	ClientDescription  string
-	OnEviction         func(fs *Fs)
-	Logf               func(string, ...interface{})
-	RelMtime           *time.Duration
-	StorageEngineCache *StorageEngineCache
+	ClientDescription        string
+	OnEviction               func(fs *Fs)
+	Logf                     func(string, ...interface{})
+	RelMtime                 *time.Duration
+	ObjectStorageEngineCache *ObjectStorageEngineCache
 }
 
 func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 
-	if opts.StorageEngineCache == nil {
-		opts.StorageEngineCache = &DefaultStorageEngineCache
+	if opts.ObjectStorageEngineCache == nil {
+		opts.ObjectStorageEngineCache = &DefaultObjectStorageEngineCache
 	}
 
 	if opts.RelMtime == nil {
@@ -471,16 +472,16 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 
 	fs := &Fs{
-		db:              db,
-		fsName:          fsName,
-		onEviction:      opts.OnEviction,
-		logf:            opts.Logf,
-		relMtime:        *opts.RelMtime,
-		clientId:        clientId,
-		cancelWorkers:   cancelWorkers,
-		externalStorage: opts.StorageEngineCache,
-		workerWg:        &sync.WaitGroup{},
-		inoChan:         make(chan uint64, _INO_CHAN_SIZE),
+		db:            db,
+		fsName:        fsName,
+		onEviction:    opts.OnEviction,
+		logf:          opts.Logf,
+		relMtime:      *opts.RelMtime,
+		clientId:      clientId,
+		cancelWorkers: cancelWorkers,
+		objectStorage: opts.ObjectStorageEngineCache,
+		workerWg:      &sync.WaitGroup{},
+		inoChan:       make(chan uint64, _INO_CHAN_SIZE),
 	}
 
 	fs.workerWg.Add(1)
@@ -810,7 +811,10 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 
 		if opts.Mode&S_IFMT == S_IFREG {
 			// Only files inherit storage from the parent directory.
-			stat.Storage = dirStat.Storage
+			if dirStat.Flags&FLAG_OBJECT_STORAGE != 0 {
+				stat.Flags |= FLAG_OBJECT_STORAGE
+				stat.Storage = dirStat.Storage
+			}
 		}
 
 		fs.txSubvolumeInodeDelta(tx, stat.Subvolume, 1)
@@ -1231,48 +1235,48 @@ func (f *invalidFile) ReadData(buf []byte, offset uint64) (uint32, error)  { ret
 func (f *invalidFile) Fsync() error                                        { return ErrInvalid }
 func (f *invalidFile) Close() error                                        { return nil }
 
-type externalStoreReadOnlyFile struct {
+type objectStoreReadOnlyFile struct {
 	storageObject ReaderAtCloser
 }
 
-func (f *externalStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+func (f *objectStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
 	return 0, ErrNotSupported
 }
 
-func (f *externalStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+func (f *objectStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 	n, err := f.storageObject.ReadAt(buf, int64(offset))
 	return uint32(n), err
 }
 
-func (f *externalStoreReadOnlyFile) Fsync() error {
+func (f *objectStoreReadOnlyFile) Fsync() error {
 	return nil
 }
 
-func (f *externalStoreReadOnlyFile) Close() error {
+func (f *objectStoreReadOnlyFile) Close() error {
 	return f.storageObject.Close()
 }
 
-type externalStoreReadWriteFile struct {
-	fs              *Fs
-	ino             uint64
-	dirty           atomicBool
-	externalStorage StorageEngine
-	flushLock       sync.Mutex
-	tmpFile         *os.File
+type objectStoreReadWriteFile struct {
+	fs            *Fs
+	ino           uint64
+	dirty         atomicBool
+	objectStorage ObjectStorageEngine
+	flushLock     sync.Mutex
+	tmpFile       *os.File
 }
 
-func (f *externalStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+func (f *objectStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
 	f.dirty.Store(true)
 	n, err := f.tmpFile.WriteAt(buf, int64(offset))
 	return uint32(n), err
 }
 
-func (f *externalStoreReadWriteFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+func (f *objectStoreReadWriteFile) ReadData(buf []byte, offset uint64) (uint32, error) {
 	n, err := f.tmpFile.ReadAt(buf, int64(offset))
 	return uint32(n), err
 }
 
-func (f *externalStoreReadWriteFile) Fsync() error {
+func (f *objectStoreReadWriteFile) Fsync() error {
 
 	dirty := f.dirty.Load()
 	if !dirty {
@@ -1282,7 +1286,7 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 	f.flushLock.Lock()
 	defer f.flushLock.Unlock()
 
-	size, err := f.externalStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
+	size, err := f.objectStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
 	if err != nil {
 		return err
 	}
@@ -1305,11 +1309,11 @@ func (f *externalStoreReadWriteFile) Fsync() error {
 	return nil
 }
 
-func (f *externalStoreReadWriteFile) Flush() error {
+func (f *objectStoreReadWriteFile) Flush() error {
 	return f.Fsync()
 }
 
-func (f *externalStoreReadWriteFile) Close() error {
+func (f *objectStoreReadWriteFile) Close() error {
 	_ = f.tmpFile.Close()
 	return nil
 }
@@ -1352,13 +1356,18 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 	})
 
 	var f HafsFile
-	if stat.Storage == "" {
+	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
 		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
 		}
 	} else {
-		if opts.Truncate || stat.Size == 0 {
+		objectStorage, err := fs.objectStorage.Get(stat.Storage)
+		if err != nil {
+			return nil, Stat{}, err
+		}
+
+		if stat.Size == 0 {
 			tmpFile, err := os.CreateTemp("", "")
 			if err != nil {
 				return nil, Stat{}, err
@@ -1368,36 +1377,20 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			if err != nil {
 				return nil, Stat{}, err
 			}
-			dirty := uint32(0)
-			if opts.Truncate {
-				dirty = 1
-			}
 
-			externalStorage, err := fs.externalStorage.Get(stat.Storage)
-			if err != nil {
-				return nil, Stat{}, err
+			f = &objectStoreReadWriteFile{
+				fs:            fs,
+				ino:           stat.Ino,
+				dirty:         atomicBool{0},
+				objectStorage: objectStorage,
+				tmpFile:       tmpFile,
 			}
-
-			f = &externalStoreReadWriteFile{
-				fs:              fs,
-				ino:             stat.Ino,
-				dirty:           atomicBool{dirty},
-				externalStorage: externalStorage,
-				tmpFile:         tmpFile,
-			}
-
 		} else {
-
-			externalStorage, err := fs.externalStorage.Get(stat.Storage)
+			storageObject, err := objectStorage.Open(fs.fsName, stat.Ino)
 			if err != nil {
 				return nil, Stat{}, err
 			}
-
-			storageObject, err := externalStorage.Open(fs.fsName, stat.Ino)
-			if err != nil {
-				return nil, Stat{}, err
-			}
-			f = &externalStoreReadOnlyFile{
+			f = &objectStoreReadOnlyFile{
 				storageObject: storageObject,
 			}
 		}
@@ -1425,7 +1418,7 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 	}
 
 	var f HafsFile
-	if stat.Storage == "" {
+	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
 		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
@@ -1441,16 +1434,16 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 			return nil, Stat{}, err
 		}
 
-		externalStorage, err := fs.externalStorage.Get(stat.Storage)
+		objectStorage, err := fs.objectStorage.Get(stat.Storage)
 		if err != nil {
 			return nil, Stat{}, err
 		}
 
-		f = &externalStoreReadWriteFile{
-			fs:              fs,
-			ino:             stat.Ino,
-			externalStorage: externalStorage,
-			tmpFile:         tmpFile,
+		f = &objectStoreReadWriteFile{
+			fs:            fs,
+			ino:           stat.Ino,
+			objectStorage: objectStorage,
+			tmpFile:       tmpFile,
 		}
 	}
 	return f, stat, err
@@ -1598,19 +1591,9 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 			return Stat{}, ErrInvalid
 		}
 
-		if stat.Size == 0 {
-			tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data"})
-			/*
-				if stat.Storage != "" {
-					// XXX We have no way to reclaim the space for this object.
-					// leaving it is relatively harmless as it will likely be overwritten.
-					//
-					// A good solution would be to add a generation count to object data and
-					// queue the deletion of the old generation in this transaction.
-				}
-			*/
-		} else {
-			if stat.Storage != "" {
+		if stat.Size != 0 {
+			if stat.Flags&FLAG_OBJECT_STORAGE != 0 {
+				// We don't support truncating object storage files for now.
 				return Stat{}, ErrNotSupported
 			}
 
@@ -1632,6 +1615,8 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 			if lastChunkSize == 0 {
 				tx.Clear(lastChunkKey)
 			}
+		} else {
+			tx.ClearRange(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data"})
 		}
 	}
 
@@ -1960,13 +1945,13 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 		tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr", name}, data)
 
 		switch name {
-		case "hafs.storage":
+		case "hafs.object-storage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
+			stat.Flags |= FLAG_OBJECT_STORAGE
 			stat.Storage = string(data)
-
-			err := fs.externalStorage.Validate(stat.Storage)
+			err := fs.objectStorage.Validate(stat.Storage)
 			if err != nil {
 				return nil, fmt.Errorf("unable to validate storage specification: %s", err)
 			}
@@ -2002,10 +1987,11 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			return nil, err
 		}
 		switch name {
-		case "hafs.storage":
+		case "hafs.object-storage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
+			stat.Flags &= ^FLAG_OBJECT_STORAGE
 			stat.Storage = ""
 			fs.txSetStat(tx, stat)
 		case "hafs.subvolume":
@@ -2317,11 +2303,11 @@ func (fs *Fs) RemoveExpiredUnlinked(opts RemoveExpiredUnlinkedOptions) (uint64, 
 				}
 
 				if stat.Storage != "" {
-					externalStorage, err := fs.externalStorage.Get(stat.Storage)
+					objectStorage, err := fs.objectStorage.Get(stat.Storage)
 					if err != nil {
 						return err
 					}
-					err = externalStorage.Remove(fs.fsName, stat.Ino)
+					err = objectStorage.Remove(fs.fsName, stat.Ino)
 					if err != nil {
 						return err
 					}

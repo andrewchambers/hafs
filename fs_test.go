@@ -261,12 +261,12 @@ func TestUnlink(t *testing.T) {
 	}
 }
 
-func TestUnlinkExternalStorage(t *testing.T) {
+func TestUnlinkObjectStorage(t *testing.T) {
 	fs := tmpFs(t)
 
 	storageDir := t.TempDir()
 
-	err := fs.SetXAttr(ROOT_INO, "hafs.storage", []byte("file://"+storageDir))
+	err := fs.SetXAttr(ROOT_INO, "hafs.object-storage", []byte("file://"+storageDir))
 	if err != nil {
 		t.Fatal(err)
 	}

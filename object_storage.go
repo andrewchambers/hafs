@@ -21,7 +21,7 @@ type ReaderAtCloser interface {
 	io.Closer
 }
 
-type StorageEngine interface {
+type ObjectStorageEngine interface {
 	Open(fs string, inode uint64) (ReaderAtCloser, error)
 	Write(fs string, inode uint64, data *os.File) (int64, error)
 	Remove(fs string, inode uint64) error
@@ -248,7 +248,7 @@ func (s *crushStoreStorageEngine) Close() error {
 	return s.client.Close()
 }
 
-func newStorageEngine(storage string) (StorageEngine, error) {
+func newObjectStorageEngine(storage string) (ObjectStorageEngine, error) {
 	if strings.HasPrefix(storage, "crushstore:") {
 		u, err := url.Parse(storage)
 		if err != nil {
@@ -332,30 +332,30 @@ func newStorageEngine(storage string) (StorageEngine, error) {
 	return nil, errors.New("unknown/invalid storage specification")
 }
 
-var DefaultStorageEngineCache StorageEngineCache
+var DefaultObjectStorageEngineCache ObjectStorageEngineCache
 
-type StorageEngineCache struct {
+type ObjectStorageEngineCache struct {
 	// This cache only ever grows - which is a good use for sync.Map.
 	// it doesn't seem like the infinite growth ever be a practical problem,
 	// but we can address that if it ever does.
 	cache sync.Map
 }
 
-func (c *StorageEngineCache) Get(storage string) (StorageEngine, error) {
+func (c *ObjectStorageEngineCache) Get(storage string) (ObjectStorageEngine, error) {
 	cached, ok := c.cache.Load(storage)
 	if !ok {
-		engine, err := newStorageEngine(storage)
+		engine, err := newObjectStorageEngine(storage)
 		if err != nil {
 			return nil, err
 		}
 		c.cache.Store(storage, engine)
 		return engine, nil
 	}
-	return cached.(StorageEngine), nil
+	return cached.(ObjectStorageEngine), nil
 }
 
-func (c *StorageEngineCache) Validate(storage string) error {
-	s, err := newStorageEngine(storage)
+func (c *ObjectStorageEngineCache) Validate(storage string) error {
+	s, err := newObjectStorageEngine(storage)
 	if err != nil {
 		return err
 	}

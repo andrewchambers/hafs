@@ -150,7 +150,7 @@ func (fs *FuseFs) GetAttr(cancel <-chan struct{}, in *fuse.GetAttrIn, out *fuse.
 
 func (fs *FuseFs) SetAttr(cancel <-chan struct{}, in *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
 
-	modStat := ModStatOptions{}
+	modStat := ModStatOpts{}
 
 	if mtime, ok := in.GetMTime(); ok {
 		modStat.SetMtime(mtime)
@@ -196,8 +196,13 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 		return fs.errToFuseStatus(err)
 	}
 
+	switch f.(type) {
+	// case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
+	default:
+		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
+	}
+
 	out.Fh = fs.nextFileHandle()
-	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 
 	fs.lock.Lock()
 	fs.fh2OpenFile[out.Fh] = &openFile{
@@ -218,10 +223,16 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 	if err != nil {
 		return fs.errToFuseStatus(err)
 	}
+
+	switch f.(type) {
+	// case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
+	default:
+		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
+	}
+
 	fs.fillFuseEntryOutFromStat(&stat, &out.EntryOut)
 
 	out.Fh = fs.nextFileHandle()
-	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 
 	fs.lock.Lock()
 	fs.fh2OpenFile[out.Fh] = &openFile{f: f}
