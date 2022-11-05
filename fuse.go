@@ -6,6 +6,7 @@ import (
 	iofs "io/fs"
 	"log"
 	mathrand "math/rand"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -27,7 +28,6 @@ type HafsFuseOptions struct {
 }
 
 type FuseFs struct {
-	fuse.RawFileSystem
 	server *fuse.Server
 
 	cacheDentries   time.Duration
@@ -49,7 +49,6 @@ func NewFuseFs(fs *Fs, opts HafsFuseOptions) *FuseFs {
 	}
 
 	return &FuseFs{
-		RawFileSystem:   fuse.NewDefaultRawFileSystem(),
 		cacheDentries:   opts.CacheDentries,
 		cacheAttributes: opts.CacheAttributes,
 		logf:            opts.Logf,
@@ -197,7 +196,7 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 	}
 
 	switch f.(type) {
-	// case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
+	case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
 	default:
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 	}
@@ -225,7 +224,7 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 	}
 
 	switch f.(type) {
-	// case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
+	case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
 	default:
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 	}
@@ -541,6 +540,10 @@ func (fs *FuseFs) releaseLocks(ino uint64, lockOwner uint64) {
 	}
 }
 
+func (fs *FuseFs) GetLk(cancel <-chan struct{}, in *fuse.LkIn, out *fuse.LkOut) fuse.Status {
+	return fuse.ENOSYS
+}
+
 func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
 	fs.lock.Lock()
 	f := fs.fh2OpenFile[in.Fh]
@@ -626,4 +629,27 @@ func (fs *FuseFs) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.St
 	out.NameLen = 4096
 
 	return fuse.OK
+}
+
+func (fs *FuseFs) Access(cancel <-chan struct{}, input *fuse.AccessIn) fuse.Status {
+	return fuse.ENOSYS
+}
+
+func (fs *FuseFs) CopyFileRange(cancel <-chan struct{}, input *fuse.CopyFileRangeIn) (uint32, fuse.Status) {
+	return 0, fuse.ENOSYS
+}
+
+func (fs *FuseFs) Fallocate(cancel <-chan struct{}, in *fuse.FallocateIn) fuse.Status {
+	return fuse.ENOSYS
+}
+
+func (fs *FuseFs) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name string, out *fuse.EntryOut) fuse.Status {
+	return fuse.ENOSYS
+}
+
+func (fs *FuseFs) SetDebug(dbg bool) {
+}
+
+func (fs *FuseFs) String() string {
+	return os.Args[0]
 }

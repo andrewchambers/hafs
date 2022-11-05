@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	iofs "io/fs"
 	"net/url"
 	"os"
 	"strings"
@@ -54,7 +53,7 @@ func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64
 func (s *fileStorageEngine) Remove(fs string, inode uint64) error {
 	err := os.Remove(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
 	if err != nil {
-		if err == iofs.ErrNotExist {
+		if os.IsNotExist(err) {
 			return nil
 		}
 		return err
@@ -173,6 +172,9 @@ type crushStoreStorageEngine struct {
 
 type crushStoreObjectReader struct {
 	lock          sync.Mutex
+	client        *crushstore.Client
+	fsName        string
+	inode         uint64
 	obj           *crushstore.ObjectReader
 	currentOffset int64
 }
@@ -181,7 +183,21 @@ func (r *crushStoreObjectReader) ReadAt(buf []byte, offset int64) (int, error) {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 	if offset != r.currentOffset {
-		return 0, ErrNotSupported
+		obj, ok, err := r.client.Get(
+			fmt.Sprintf("%d.%s", r.inode, r.fsName),
+			crushstore.GetOptions{
+				StartOffset: uint64(offset),
+			},
+		)
+		if err != nil {
+			return 0, err
+		}
+		if !ok {
+			return 0, io.ErrUnexpectedEOF
+		}
+		r.currentOffset = offset
+		_ = r.obj.Close()
+		r.obj = obj
 	}
 	n, err := io.ReadFull(r.obj, buf)
 	r.currentOffset += int64(n)
@@ -207,8 +223,11 @@ func (s *crushStoreStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser,
 		return nil, ErrNotExist
 	}
 	return &crushStoreObjectReader{
+		client:        s.client,
 		obj:           obj,
 		currentOffset: 0,
+		inode:         inode,
+		fsName:        fs,
 	}, nil
 }
 
