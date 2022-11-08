@@ -629,26 +629,56 @@ func (fs *Fs) Close() error {
 
 func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) (interface{}, error) {
 	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached"}
-	return fs.db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+	fWrapped := func(tx fdb.ReadTransaction) (interface{}, error) {
 		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
 		if attachCheck.MustGet() == nil {
 			return v, ErrDetached
 		}
 		return v, err
-	})
+	}
+	// XXX this loop should not be needed.
+	for {
+		v, err := fs.db.ReadTransact(fWrapped)
+		if err != nil {
+			if err, ok := err.(*fdb.Error); ok {
+				if err.Code == 2015 {
+					// XXX Bug in fdb 6.1?
+					// retry on future not ready errors.
+					log.Printf("retrying transaction due to error 2015")
+					continue
+				}
+			}
+		}
+		return v, err
+	}
 }
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
 	attachKey := tuple.Tuple{"hafs", fs.fsName, "client", fs.clientId, "attached"}
-	return fs.db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+	fWrapped := func(tx fdb.Transaction) (interface{}, error) {
 		attachCheck := tx.Get(attachKey)
 		v, err := f(tx)
 		if attachCheck.MustGet() == nil {
 			return v, ErrDetached
 		}
 		return v, err
-	})
+	}
+	// XXX this loop should not be needed.
+	for {
+		v, err := fs.db.Transact(fWrapped)
+		if err != nil {
+			if err, ok := err.(*fdb.Error); ok {
+				// XXX Bug in fdb 6.1?
+				// retry on future not ready errors.
+				if err.Code == 2015 {
+					log.Printf("retrying transaction due to error 2015")
+					continue
+				}
+			}
+		}
+		return v, err
+	}
 }
 
 type futureStat struct {
