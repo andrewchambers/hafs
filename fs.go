@@ -641,7 +641,7 @@ func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) 
 	for {
 		v, err := fs.db.ReadTransact(fWrapped)
 		if err != nil {
-			if err, ok := err.(*fdb.Error); ok {
+			if err, ok := err.(fdb.Error); ok {
 				if err.Code == 2015 {
 					// XXX Bug in fdb 6.1?
 					// retry on future not ready errors.
@@ -668,7 +668,7 @@ func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interfa
 	for {
 		v, err := fs.db.Transact(fWrapped)
 		if err != nil {
-			if err, ok := err.(*fdb.Error); ok {
+			if err, ok := err.(fdb.Error); ok {
 				// XXX Bug in fdb 6.1?
 				// retry on future not ready errors.
 				if err.Code == 2015 {
