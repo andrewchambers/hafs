@@ -40,7 +40,7 @@ var (
 
 const (
 	NAME_MAX                = 4096
-	CURRENT_FDB_API_VERSION = 600
+	CURRENT_FDB_API_VERSION = 710
 	CURRENT_SCHEMA_VERSION  = 1
 	ROOT_INO                = 1
 	CHUNK_SIZE              = 4096

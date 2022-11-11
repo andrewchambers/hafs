@@ -4,7 +4,7 @@ go 1.17
 
 require (
 	github.com/andrewchambers/crushstore v0.0.0-20221016095448-22cbeade24de
-	github.com/apple/foundationdb/bindings/go v0.0.0-20200504101018-dabcd52bcec5
+	github.com/apple/foundationdb/bindings/go v0.0.0-20221108203244-b4bd84bd1985
 	github.com/cheynewallace/tabby v1.1.1
 	github.com/hanwen/go-fuse/v2 v2.1.0
 	github.com/minio/minio-go/v7 v7.0.39
@@ -33,6 +33,7 @@ require (
 	golang.org/x/crypto v0.0.0-20220722155217-630584e8d5aa // indirect
 	golang.org/x/net v0.0.0-20220722155237-a158d28d115b // indirect
 	golang.org/x/text v0.3.7 // indirect
+	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543 // indirect
 	gopkg.in/ini.v1 v1.66.6 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	lukechampine.com/blake3 v1.1.7 // indirect
