@@ -6,6 +6,7 @@ require (
 	github.com/andrewchambers/crushstore v0.0.0-20221016095448-22cbeade24de
 	github.com/apple/foundationdb/bindings/go v0.0.0-20221108203244-b4bd84bd1985
 	github.com/cheynewallace/tabby v1.1.1
+	github.com/detailyang/fastrand-go v0.0.0-20191106153122-53093851e761
 	github.com/hanwen/go-fuse/v2 v2.1.0
 	github.com/minio/minio-go/v7 v7.0.39
 	github.com/valyala/fastjson v1.6.3
@@ -15,7 +16,6 @@ require (
 
 require (
 	github.com/cespare/xxhash/v2 v2.1.2 // indirect
-	github.com/detailyang/fastrand-go v0.0.0-20191106153122-53093851e761 // indirect
 	github.com/dustin/go-humanize v1.0.0 // indirect
 	github.com/google/shlex v0.0.0-20191202100458-e7afc7fbc510 // indirect
 	github.com/google/uuid v1.3.0 // indirect
