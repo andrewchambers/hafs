@@ -514,21 +514,7 @@ func (fs *Fs) ReadTransact(f func(tx fdb.ReadTransaction) (interface{}, error)) 
 		}
 		return v, err
 	}
-	// XXX this loop should not be needed.
-	for {
-		v, err := fs.db.ReadTransact(fWrapped)
-		if err != nil {
-			if err, ok := err.(fdb.Error); ok {
-				if err.Code == 2015 {
-					// XXX Bug in fdb 6.1?
-					// retry on future not ready errors.
-					log.Printf("retrying transaction due to error 2015")
-					continue
-				}
-			}
-		}
-		return v, err
-	}
+	return fs.db.ReadTransact(fWrapped)
 }
 
 func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interface{}, error) {
@@ -541,21 +527,7 @@ func (fs *Fs) Transact(f func(tx fdb.Transaction) (interface{}, error)) (interfa
 		}
 		return v, err
 	}
-	// XXX this loop should not be needed.
-	for {
-		v, err := fs.db.Transact(fWrapped)
-		if err != nil {
-			if err, ok := err.(fdb.Error); ok {
-				// XXX Bug in fdb 6.1?
-				// retry on future not ready errors.
-				if err.Code == 2015 {
-					log.Printf("retrying transaction due to error 2015")
-					continue
-				}
-			}
-		}
-		return v, err
-	}
+	return fs.db.Transact(fWrapped)
 }
 
 type futureStat struct {
