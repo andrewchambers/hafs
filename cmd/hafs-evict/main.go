@@ -5,16 +5,15 @@ import (
 	"fmt"
 	"os"
 
+	"github.com/andrewchambers/hafs"
 	"github.com/andrewchambers/hafs/cli"
 )
 
 func main() {
-	cli.RegisterDefaultFlags()
+	cli.RegisterClusterFileFlag()
+	cli.RegisterFsNameFlag()
 	flag.Parse()
-	fs := cli.MustAttach()
-	defer fs.Close()
-
-	cli.RegisterDefaultSignalHandlers(fs)
+	db := cli.MustOpenDatabase()
 
 	args := flag.Args()
 	if len(args) != 1 {
@@ -22,7 +21,7 @@ func main() {
 		os.Exit(1)
 	}
 
-	err := fs.EvictClient(args[0])
+	err := hafs.EvictClient(db, cli.FsName, args[0])
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error evicting client: %s\n", err)
 		os.Exit(1)

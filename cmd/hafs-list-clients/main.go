@@ -7,19 +7,18 @@ import (
 	"sort"
 	"time"
 
+	"github.com/andrewchambers/hafs"
 	"github.com/andrewchambers/hafs/cli"
 	"github.com/cheynewallace/tabby"
 )
 
 func main() {
-	cli.RegisterDefaultFlags()
+	cli.RegisterClusterFileFlag()
+	cli.RegisterFsNameFlag()
 	flag.Parse()
-	fs := cli.MustAttach()
-	defer fs.Close()
+	db := cli.MustOpenDatabase()
 
-	cli.RegisterDefaultSignalHandlers(fs)
-
-	clients, err := fs.ListClients()
+	clients, err := hafs.ListClients(db, cli.FsName)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error listing clients: %s\n", err)
 		os.Exit(1)

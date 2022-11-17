@@ -18,8 +18,9 @@ func usage() {
 }
 
 func main() {
-
-	cli.RegisterDefaultFlags()
+	cli.RegisterClusterFileFlag()
+	cli.RegisterClientDescriptionFlag()
+	cli.RegisterFsNameFlag()
 	debugFuse := flag.Bool("debug-fuse", false, "Log fuse messages.")
 	gcUnlinkedInterval := flag.Duration("gc-unlinked-interval", 8*time.Hour, "Unlinked inode garbage collection interval (0 to disable).")
 	unlinkRemovalDelay := flag.Duration("unlink-removal-delay", 15*time.Minute, "Grace period for removal of unlinked files.")
@@ -36,10 +37,11 @@ func main() {
 
 	mntDir := flag.Args()[0]
 
-	fs := cli.MustAttach()
+	db := cli.MustOpenDatabase()
+	fs := cli.MustAttach(db)
 	defer fs.Close()
 
-	cli.RegisterDefaultSignalHandlers(fs)
+	cli.RegisterFsSignalHandlers(fs)
 
 	server, err := fuse.NewServer(
 		hafs.NewFuseFs(fs, hafs.HafsFuseOptions{
@@ -90,7 +92,7 @@ func main() {
 			for {
 				time.Sleep(*gcClientInterval)
 				log.Printf("starting garbage collection of expired clients")
-				nEvicted, err := fs.EvictExpiredClients(hafs.EvictExpiredClientsOptions{
+				nEvicted, err := hafs.EvictExpiredClients(db, cli.FsName, hafs.EvictExpiredClientsOptions{
 					ClientExpiry: *clientExpiry,
 				})
 				log.Printf("garbage collection evicted %d expired clients", nEvicted)

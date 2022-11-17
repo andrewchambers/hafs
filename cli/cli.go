@@ -51,13 +51,7 @@ func RegisterFsNameFlag() {
 	)
 }
 
-func RegisterDefaultFlags() {
-	RegisterClusterFileFlag()
-	RegisterClientDescriptionFlag()
-	RegisterFsNameFlag()
-}
-
-func RegisterDefaultSignalHandlers(fs *hafs.Fs) {
+func RegisterFsSignalHandlers(fs *hafs.Fs) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, unix.SIGINT, unix.SIGTERM)
 
@@ -83,8 +77,8 @@ func MustOpenDatabase() fdb.Database {
 	return db
 }
 
-func MustAttach() *hafs.Fs {
-	fs, err := hafs.Attach(MustOpenDatabase(), FsName, hafs.AttachOpts{
+func MustAttach(db fdb.Database) *hafs.Fs {
+	fs, err := hafs.Attach(db, FsName, hafs.AttachOpts{
 		ClientDescription: ClientDescription,
 		OnEviction: func(fs *hafs.Fs) {
 			fmt.Fprintf(os.Stderr, "client evicted, aborting...\n")

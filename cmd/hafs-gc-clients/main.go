@@ -14,14 +14,12 @@ import (
 func main() {
 	verbose := flag.Bool("verbose", false, "Be verbose.")
 	clientExpiry := flag.Duration("client-expiry", 15*time.Minute, "Period of inactivity before a client is considered expired.")
-	cli.RegisterDefaultFlags()
+	cli.RegisterClusterFileFlag()
+	cli.RegisterFsNameFlag()
 	flag.Parse()
-	fs := cli.MustAttach()
-	defer fs.Close()
+	db := cli.MustOpenDatabase()
 
-	cli.RegisterDefaultSignalHandlers(fs)
-
-	nEvicted, err := fs.EvictExpiredClients(hafs.EvictExpiredClientsOptions{
+	nEvicted, err := hafs.EvictExpiredClients(cli.FsName, hafs.EvictExpiredClientsOptions{
 		ClientExpiry: *clientExpiry,
 		OnEviction: func(clientId string) {
 			if *verbose {
