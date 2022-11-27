@@ -58,7 +58,7 @@ const (
 
 const (
 	FLAG_SUBVOLUME uint64 = 1 << iota
-	FLAG_OBJECT_STORAGE
+	FLAG_EXTERNAL_STORAGE
 )
 
 type DirEnt struct {
@@ -690,8 +690,8 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 
 		if opts.Mode&S_IFMT == S_IFREG {
 			// Only files inherit storage from the parent directory.
-			if dirStat.Flags&FLAG_OBJECT_STORAGE != 0 {
-				stat.Flags |= FLAG_OBJECT_STORAGE
+			if dirStat.Flags&FLAG_EXTERNAL_STORAGE != 0 {
+				stat.Flags |= FLAG_EXTERNAL_STORAGE
 				stat.Storage = dirStat.Storage
 			}
 		}
@@ -1235,7 +1235,7 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 	})
 
 	var f HafsFile
-	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
+	if stat.Flags&FLAG_EXTERNAL_STORAGE == 0 {
 		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
@@ -1297,7 +1297,7 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 	}
 
 	var f HafsFile
-	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
+	if stat.Flags&FLAG_EXTERNAL_STORAGE == 0 {
 		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
@@ -1471,7 +1471,7 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 		}
 
 		if stat.Size != 0 {
-			if stat.Flags&FLAG_OBJECT_STORAGE != 0 {
+			if stat.Flags&FLAG_EXTERNAL_STORAGE != 0 {
 				// We don't support truncating object storage files for now.
 				return Stat{}, ErrNotSupported
 			}
@@ -1824,11 +1824,11 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 		tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr", name}, data)
 
 		switch name {
-		case "hafs.object-storage":
+		case "hafs.storage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
-			stat.Flags |= FLAG_OBJECT_STORAGE
+			stat.Flags |= FLAG_EXTERNAL_STORAGE
 			stat.Storage = string(data)
 			err := fs.objectStorage.Validate(stat.Storage)
 			if err != nil {
@@ -1866,11 +1866,11 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			return nil, err
 		}
 		switch name {
-		case "hafs.object-storage":
+		case "hafs.ostorage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
-			stat.Flags &= ^FLAG_OBJECT_STORAGE
+			stat.Flags &= ^FLAG_EXTERNAL_STORAGE
 			stat.Storage = ""
 			fs.txSetStat(tx, stat)
 		case "hafs.subvolume":

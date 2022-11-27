@@ -268,6 +268,13 @@ func (s *crushStoreStorageEngine) Close() error {
 }
 
 func newObjectStorageEngine(storage string) (ObjectStorageEngine, error) {
+
+	// Handle shortcodes.
+	switch storage {
+	case "cs":
+		storage = "crushstore:"
+	}
+
 	if strings.HasPrefix(storage, "crushstore:") {
 		u, err := url.Parse(storage)
 		if err != nil {
