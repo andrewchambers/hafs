@@ -250,12 +250,12 @@ func TestUnlink(t *testing.T) {
 	}
 }
 
-func TestUnlinkObjectStorage(t *testing.T) {
+func TestUnlinkExternalStorage(t *testing.T) {
 	fs := tmpFs(t)
 
 	storageDir := t.TempDir()
 
-	err := fs.SetXAttr(ROOT_INO, "hafs.object-storage", []byte("file://"+storageDir))
+	err := fs.SetXAttr(ROOT_INO, "hafs.storage", []byte("file://"+storageDir))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -530,6 +530,48 @@ func TestDirIter(t *testing.T) {
 		_, err := di.Next()
 		if errors.Is(err, io.EOF) {
 			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected error %s", err)
+		}
+		count += 1
+	}
+
+	if count != 500 {
+		t.Fatalf("unexpected count: %d", count)
+	}
+}
+
+func TestDirIterPlus(t *testing.T) {
+	fs := tmpFs(t)
+
+	for i := 0; i < 500; i += 1 {
+		_, err := fs.Mknod(ROOT_INO, fmt.Sprintf("a%d", i), MknodOpts{
+			Mode: S_IFDIR | 0o777,
+			Uid:  0,
+			Gid:  0,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	di, err := fs.IterDirEntsPlus(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	count := 0
+	for {
+		dirEnt, stat, err := di.NextPlus()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatalf("unexpected error %s", err)
+		}
+		if dirEnt.Ino != stat.Ino {
+			t.Fatalf("stat unexpectedly differs from dir ent: %#v %#v", dirEnt, stat)
 		}
 		count += 1
 	}

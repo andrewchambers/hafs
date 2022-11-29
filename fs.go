@@ -411,6 +411,7 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 	// Start with a small batch size, many clients  never allocate an inode.
 	inoBatchSize := uint64(_INO_STEP)
 	inoCounterKey := tuple.Tuple{"hafs", fs.fsName, "inocntr"}
+	defer close(fs.inoChan)
 	for {
 		v, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 			inoCounterBytes := tx.Get(inoCounterKey).MustGet()
@@ -432,6 +433,9 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 			return currentCount, nil
 		})
 		if err != nil {
+			if errors.Is(err, ErrDetached) {
+				return
+			}
 			fs.logf("unable to allocate inode batch: %s", err)
 			time.Sleep(1 * time.Second)
 			continue
@@ -448,7 +452,6 @@ func (fs *Fs) requestInosForever(ctx context.Context) {
 					select {
 					case fs.inoChan <- ino:
 					case <-ctx.Done():
-						close(fs.inoChan)
 						return
 					}
 				}
@@ -1645,98 +1648,153 @@ type DirIter struct {
 	fs        *Fs
 	iterRange fdb.KeyRange
 	ents      []DirEnt
+	stats     []Stat
+	isPlus    bool
 	done      bool
 }
 
 func (di *DirIter) fill() error {
-	const BATCH_SIZE = 128
+	const BATCH_SIZE = 512
 
-	v, err := di.fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+	_, err := di.fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 		// XXX should we confirm the directory still exists?
 		kvs := tx.GetRange(di.iterRange, fdb.RangeOptions{
 			Limit: BATCH_SIZE,
 		}).GetSliceOrPanic()
-		return kvs, nil
+
+		if len(kvs) != 0 {
+			nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
+			if err != nil {
+				return nil, err
+			}
+			di.iterRange.Begin = fdb.Key(nextBegin)
+		} else {
+			di.iterRange.Begin = di.iterRange.End
+		}
+
+		ents := make([]DirEnt, 0, len(kvs))
+
+		statFuts := []futureStat{}
+		if di.isPlus {
+			statFuts = make([]futureStat, 0, len(kvs))
+		}
+
+		for _, kv := range kvs {
+			keyTuple, err := tuple.Unpack(kv.Key)
+			if err != nil {
+				return nil, err
+			}
+			name := keyTuple[len(keyTuple)-1].(string)
+			dirEnt := DirEnt{}
+			err = dirEnt.UnmarshalBinary(kv.Value)
+			if err != nil {
+				return nil, err
+			}
+			dirEnt.Name = name
+			ents = append(ents, dirEnt)
+			if di.isPlus {
+				statFuts = append(statFuts, di.fs.txGetStat(tx, dirEnt.Ino))
+			}
+		}
+
+		// Reverse entries so we can pop them off in the right order.
+		for i, j := 0, len(ents)-1; i < j; i, j = i+1, j-1 {
+			ents[i], ents[j] = ents[j], ents[i]
+		}
+
+		stats := make([]Stat, 0, len(statFuts))
+		// Read stats in reverse order
+		for i := len(statFuts) - 1; i >= 0; i -= 1 {
+			stat, err := statFuts[i].Get()
+			if err != nil {
+				return nil, err
+			}
+			stats = append(stats, stat)
+		}
+
+		if len(ents) < BATCH_SIZE {
+			di.done = true
+		}
+
+		di.ents = ents
+		di.stats = stats
+		return nil, nil
 	})
 	if err != nil {
 		return err
 	}
-
-	kvs := v.([]fdb.KeyValue)
-
-	if len(kvs) != 0 {
-		nextBegin, err := fdb.Strinc(kvs[len(kvs)-1].Key)
-		if err != nil {
-			return err
-		}
-		di.iterRange.Begin = fdb.Key(nextBegin)
-	} else {
-		di.iterRange.Begin = di.iterRange.End
-	}
-
-	ents := make([]DirEnt, 0, len(kvs))
-
-	for _, kv := range kvs {
-		keyTuple, err := tuple.Unpack(kv.Key)
-		if err != nil {
-			return err
-		}
-		name := keyTuple[len(keyTuple)-1].(string)
-		dirEnt := DirEnt{}
-		err = dirEnt.UnmarshalBinary(kv.Value)
-		if err != nil {
-			return err
-		}
-		dirEnt.Name = name
-		ents = append(ents, dirEnt)
-	}
-
-	// Reverse entries so we can pop them off in the right order.
-	for i, j := 0, len(ents)-1; i < j; i, j = i+1, j-1 {
-		ents[i], ents[j] = ents[j], ents[i]
-	}
-
-	if len(ents) < BATCH_SIZE {
-		di.done = true
-	}
-
-	di.ents = ents
-
 	return nil
 }
 
-func (di *DirIter) Next() (DirEnt, error) {
+func (di *DirIter) next(ent *DirEnt, stat *Stat) error {
 	di.lock.Lock()
 	defer di.lock.Unlock()
 
 	if len(di.ents) == 0 && di.done {
-		return DirEnt{}, io.EOF
+		return io.EOF
 	}
 
 	// Fill initial listing, otherwise we should always have something.
 	if len(di.ents) == 0 {
 		err := di.fill()
 		if err != nil {
-			return DirEnt{}, err
+			return err
 		}
 		if len(di.ents) == 0 && di.done {
-			return DirEnt{}, io.EOF
+			return io.EOF
 		}
 	}
 
-	nextEnt := di.ents[len(di.ents)-1]
+	if ent != nil {
+		*ent = di.ents[len(di.ents)-1]
+	}
 	di.ents = di.ents[:len(di.ents)-1]
-	return nextEnt, nil
+
+	if di.isPlus {
+		if stat != nil {
+			*stat = di.stats[len(di.stats)-1]
+		}
+		di.stats = di.stats[:len(di.stats)-1]
+	}
+
+	return nil
+}
+
+func (di *DirIter) Next() (DirEnt, error) {
+	ent := DirEnt{}
+	err := di.next(&ent, nil)
+	return ent, err
+}
+
+func (di *DirIter) NextPlus() (DirEnt, Stat, error) {
+	ent := DirEnt{}
+	stat := Stat{}
+	err := di.next(&ent, &stat)
+	return ent, stat, err
 }
 
 func (di *DirIter) Unget(ent DirEnt) {
 	di.lock.Lock()
 	defer di.lock.Unlock()
+	if di.isPlus {
+		panic("api misuse")
+	}
 	di.ents = append(di.ents, ent)
 	di.done = false
 }
 
-func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
+func (di *DirIter) UngetPlus(ent DirEnt, stat Stat) {
+	di.lock.Lock()
+	defer di.lock.Unlock()
+	if !di.isPlus {
+		panic("api misuse")
+	}
+	di.ents = append(di.ents, ent)
+	di.stats = append(di.stats, stat)
+	di.done = false
+}
+
+func (fs *Fs) iterDirEnts(dirIno uint64, plus bool) (*DirIter, error) {
 	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child"}.FDBRangeKeys()
 	di := &DirIter{
 		fs: fs,
@@ -1744,11 +1802,20 @@ func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
 			Begin: iterBegin,
 			End:   iterEnd,
 		},
-		ents: []DirEnt{},
-		done: false,
+		ents:   []DirEnt{},
+		isPlus: plus,
+		done:   false,
 	}
 	err := di.fill()
 	return di, err
+}
+
+func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
+	return fs.iterDirEnts(dirIno, false)
+}
+
+func (fs *Fs) IterDirEntsPlus(dirIno uint64) (*DirIter, error) {
+	return fs.iterDirEnts(dirIno, true)
 }
 
 func (fs *Fs) GetXAttr(ino uint64, name string) ([]byte, error) {
@@ -1866,7 +1933,7 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			return nil, err
 		}
 		switch name {
-		case "hafs.ostorage":
+		case "hafs.storage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}

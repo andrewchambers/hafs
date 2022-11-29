@@ -420,7 +420,7 @@ func (fs *FuseFs) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Ope
 	return fuse.OK
 }
 
-func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList, plus bool) fuse.Status {
+func (fs *FuseFs) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
 	fs.lock.Lock()
 	d := fs.fh2OpenFile[in.Fh]
 	fs.lock.Unlock()
@@ -443,35 +443,46 @@ func (fs *FuseFs) readDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 			Mode: ent.Mode,
 			Ino:  ent.Ino,
 		}
-		if plus {
-			// XXX avoid multiple stats with DirPlusIter ?
-			entryOut := out.AddDirLookupEntry(fuseDirEnt)
-			if entryOut != nil {
-				stat, err := fs.fs.GetStat(ent.Ino)
-				if err != nil {
-					return fs.errToFuseStatus(err)
-				}
-				fs.fillFuseEntryOutFromStat(&stat, entryOut)
-			} else {
-				d.di.Unget(ent)
-				break
-			}
-		} else {
-			if !out.AddDirEntry(fuseDirEnt) {
-				d.di.Unget(ent)
-				break
-			}
+		if !out.AddDirEntry(fuseDirEnt) {
+			d.di.Unget(ent)
+			break
 		}
 	}
 	return fuse.OK
 }
 
-func (fs *FuseFs) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	return fs.readDir(cancel, in, out, false)
-}
-
 func (fs *FuseFs) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	return fs.readDir(cancel, in, out, true)
+	fs.lock.Lock()
+	d := fs.fh2OpenFile[in.Fh]
+	fs.lock.Unlock()
+
+	if d.di == nil {
+		return fuse.Status(unix.EBADF)
+	}
+
+	// XXX TODO verify offset is correct.
+	for {
+		ent, stat, err := d.di.NextPlus()
+		if err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			return fs.errToFuseStatus(err)
+		}
+		fuseDirEnt := fuse.DirEntry{
+			Name: ent.Name,
+			Mode: ent.Mode,
+			Ino:  ent.Ino,
+		}
+		entryOut := out.AddDirLookupEntry(fuseDirEnt)
+		if entryOut != nil {
+			fs.fillFuseEntryOutFromStat(&stat, entryOut)
+		} else {
+			d.di.UngetPlus(ent, stat)
+			break
+		}
+	}
+	return fuse.OK
 }
 
 func (fs *FuseFs) FsyncDir(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
