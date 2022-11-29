@@ -19,7 +19,7 @@ func main() {
 	flag.Parse()
 	db := cli.MustOpenDatabase()
 
-	nEvicted, err := hafs.EvictExpiredClients(cli.FsName, hafs.EvictExpiredClientsOptions{
+	nEvicted, err := hafs.EvictExpiredClients(db, cli.FsName, hafs.EvictExpiredClientsOptions{
 		ClientExpiry: *clientExpiry,
 		OnEviction: func(clientId string) {
 			if *verbose {
@@ -32,8 +32,5 @@ func main() {
 		os.Exit(1)
 	}
 
-	if *verbose {
-		log.Printf("evicted %d expired clients\n", nEvicted)
-	}
-
+	log.Printf("evicted %d expired clients\n", nEvicted)
 }

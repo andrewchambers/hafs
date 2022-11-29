@@ -13,7 +13,8 @@ import (
 )
 
 func usage() {
-	fmt.Printf("hafs-mount [OPTS] MOUNTPOINT\n")
+	fmt.Printf("hafs-fuse [OPTS] MOUNTPOINT\n\n")
+	flag.Usage()
 	os.Exit(1)
 }
 

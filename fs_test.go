@@ -556,7 +556,7 @@ func TestDirIterPlus(t *testing.T) {
 		}
 	}
 
-	di, err := fs.IterDirEntsPlus(ROOT_INO)
+	di, err := fs.IterDirEnts(ROOT_INO)
 	if err != nil {
 		t.Fatal(err)
 	}

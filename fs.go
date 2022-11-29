@@ -1644,20 +1644,21 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 }
 
 type DirIter struct {
-	lock      sync.Mutex
-	fs        *Fs
-	iterRange fdb.KeyRange
-	ents      []DirEnt
-	stats     []Stat
-	isPlus    bool
-	done      bool
+	lock       sync.Mutex
+	fs         *Fs
+	iterRange  fdb.KeyRange
+	ents       []DirEnt
+	stats      []Stat
+	nextCalled bool
+	isPlus     bool
+	done       bool
 }
 
 func (di *DirIter) fill() error {
 	const BATCH_SIZE = 512
 
 	_, err := di.fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-		// XXX should we confirm the directory still exists?
+
 		kvs := tx.GetRange(di.iterRange, fdb.RangeOptions{
 			Limit: BATCH_SIZE,
 		}).GetSliceOrPanic()
@@ -1670,6 +1671,8 @@ func (di *DirIter) fill() error {
 			di.iterRange.Begin = fdb.Key(nextBegin)
 		} else {
 			di.iterRange.Begin = di.iterRange.End
+			di.done = true
+			return nil, nil
 		}
 
 		ents := make([]DirEnt, 0, len(kvs))
@@ -1702,22 +1705,23 @@ func (di *DirIter) fill() error {
 			ents[i], ents[j] = ents[j], ents[i]
 		}
 
-		stats := make([]Stat, 0, len(statFuts))
-		// Read stats in reverse order
-		for i := len(statFuts) - 1; i >= 0; i -= 1 {
-			stat, err := statFuts[i].Get()
-			if err != nil {
-				return nil, err
+		if di.isPlus {
+			stats := make([]Stat, 0, len(statFuts))
+			// Read stats in reverse order.
+			for i := len(statFuts) - 1; i >= 0; i -= 1 {
+				stat, err := statFuts[i].Get()
+				if err != nil {
+					return nil, err
+				}
+				stats = append(stats, stat)
 			}
-			stats = append(stats, stat)
-		}
-
-		if len(ents) < BATCH_SIZE {
-			di.done = true
+			if len(ents) < BATCH_SIZE {
+				di.done = true
+			}
+			di.stats = stats
 		}
 
 		di.ents = ents
-		di.stats = stats
 		return nil, nil
 	})
 	if err != nil {
@@ -1727,18 +1731,17 @@ func (di *DirIter) fill() error {
 }
 
 func (di *DirIter) next(ent *DirEnt, stat *Stat) error {
-	di.lock.Lock()
-	defer di.lock.Unlock()
 
-	if len(di.ents) == 0 && di.done {
-		return io.EOF
-	}
-
-	// Fill initial listing, otherwise we should always have something.
 	if len(di.ents) == 0 {
-		err := di.fill()
-		if err != nil {
-			return err
+		if di.done {
+			return io.EOF
+		}
+		// Fill initial listing, otherwise we should always have something buffered.
+		if !di.done {
+			err := di.fill()
+			if err != nil {
+				return err
+			}
 		}
 		if len(di.ents) == 0 && di.done {
 			return io.EOF
@@ -1761,16 +1764,51 @@ func (di *DirIter) next(ent *DirEnt, stat *Stat) error {
 }
 
 func (di *DirIter) Next() (DirEnt, error) {
+	di.lock.Lock()
+	defer di.lock.Unlock()
+
+	if !di.nextCalled {
+		di.nextCalled = true
+		// First use was a plain Next, iterator
+		// will not gather stat information.
+		di.isPlus = false
+	}
+
 	ent := DirEnt{}
 	err := di.next(&ent, nil)
 	return ent, err
 }
 
 func (di *DirIter) NextPlus() (DirEnt, Stat, error) {
+	di.lock.Lock()
+	defer di.lock.Unlock()
+
 	ent := DirEnt{}
 	stat := Stat{}
+
+	if !di.nextCalled {
+		di.nextCalled = true
+		// First use was a NextPlus, iterator
+		// will gather stat information.
+		di.isPlus = true
+	}
+
 	err := di.next(&ent, &stat)
-	return ent, stat, err
+	if err != nil {
+		return ent, stat, err
+	}
+
+	if !di.isPlus {
+		// The iterator is not a 'plus' iterator, but
+		// we can still fill in the missing stat
+		// with a best effort fallback, manually its just slower.
+		stat, err = di.fs.GetStat(ent.Ino)
+		if err != nil {
+			return ent, stat, err
+		}
+	}
+
+	return ent, stat, nil
 }
 
 func (di *DirIter) Unget(ent DirEnt) {
@@ -1794,7 +1832,7 @@ func (di *DirIter) UngetPlus(ent DirEnt, stat Stat) {
 	di.done = false
 }
 
-func (fs *Fs) iterDirEnts(dirIno uint64, plus bool) (*DirIter, error) {
+func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
 	iterBegin, iterEnd := tuple.Tuple{"hafs", fs.fsName, "ino", dirIno, "child"}.FDBRangeKeys()
 	di := &DirIter{
 		fs: fs,
@@ -1802,20 +1840,12 @@ func (fs *Fs) iterDirEnts(dirIno uint64, plus bool) (*DirIter, error) {
 			Begin: iterBegin,
 			End:   iterEnd,
 		},
-		ents:   []DirEnt{},
-		isPlus: plus,
-		done:   false,
 	}
-	err := di.fill()
+	_, err := fs.GetStat(dirIno)
+	if err != nil {
+		return nil, err
+	}
 	return di, err
-}
-
-func (fs *Fs) IterDirEnts(dirIno uint64) (*DirIter, error) {
-	return fs.iterDirEnts(dirIno, false)
-}
-
-func (fs *Fs) IterDirEntsPlus(dirIno uint64) (*DirIter, error) {
-	return fs.iterDirEnts(dirIno, true)
 }
 
 func (fs *Fs) GetXAttr(ino uint64, name string) ([]byte, error) {
