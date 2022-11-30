@@ -456,6 +456,12 @@ func (fs *FuseFs) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse
 	d := fs.fh2OpenFile[in.Fh]
 	fs.lock.Unlock()
 
+	if fs.cacheAttributes == 0 {
+		// Supporting ReadDirPlus when we don't have any cache
+		// will do pointless work fetching the stats twice.
+		return fuse.ENOSYS
+	}
+
 	if d.di == nil {
 		return fuse.Status(unix.EBADF)
 	}
