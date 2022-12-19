@@ -35,6 +35,10 @@ of data or having high write throughput (unless you use the s3 backed file featu
 - Files backed by s3 or other object storage are not efficient for random access, only sequential access.
 - Because HAFS is built on top of foundationdb, it requires at least 4GB of ram per node, which can be a bit heavy depending on the use case and project budget (though it works great on an existing foundationDB deployment).
 
+## Caveats and Gotchas.
+
+- File locking is only effective at protecting updates to the filesystem, you should not coordinate
+  updates to resources outside the filesystem.
 
 ## Getting started
 
