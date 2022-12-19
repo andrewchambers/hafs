@@ -17,8 +17,9 @@ the failure modes I would encounter when using distributed file locks.
 
 ### Ideal use cases
 
-In general this filesystem is greate for configuration files and metadata that must be kept consistent across a whole cluster
-while also tolerating server failure.
+In general this filesystem is good for configuration files and metadata that must be kept consistent
+across a whole cluster while also tolerating server failure, it is not great at handling large volumes
+of data or having high write throughput (unless you use the s3 backed file feature).
 
 ## Features
 
