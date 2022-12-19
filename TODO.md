@@ -1,11 +1,12 @@
 # TODO
 
-There are things we need to address before we are production ready (if this meets our suitability criteria).
+The filesystem works well for many use cases, but there are many
+things that could still be improved.
 
 ## Permission checks
 
 Permission checks are all done via fuse - however because HAFS is a distributed filesystem there
-are still TOCTOU races - we need to do our own permission checks within transactions to be sure.
+are still TOCTOU races - we need to do our own permission checks within transactions to resolve this.
 
 It should be noted these might not be worth fixing if the various cases are documented - For example
 to prevent users affecting eachother they could simple deny other users any access to their directories at all.

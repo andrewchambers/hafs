@@ -1,27 +1,56 @@
 # High Availability Filesystem
 
-An experimental and vapourware distributed filesystem library and fuse filesystem built on FoundationDB.
+A distributed filesystem library and fuse filesystem built on FoundationDB meant
+for scalable serving of metadata and file locks across a cluster.
 
-# Goals
+You could think of HAFS like consul or etcd, but as a fuse filesystem - applications can use file locks and write + rename to do atomic updates across your entire cluster without any library support.
+
+The HAFS filesystem also has the ability to store file data in s3 and other
+external data to create horizontally scalable directories that work well
+sequential read workloads.
 
 ## Motivation
 
-[bupstash.io](https://bupstash.io/) needs a reliable and fault tolerant way to serve repository metadata 
-that is easy to administer and distribute across many machines. This project is an experiment to investigate the feasibiltiy
-and complexity of using FoundationDB as the base system for a metadata filesystem.
+My project [bupstash.io](https://bupstash.io/) needed a reliable and fault tolerant
+way to serve repository metadata that is easy to administer and distribute across many machines.
 
-## Status
+## Features
 
-Basic functionality is in place and works against real programs.
-See the [todos](./TODO.md) for what needs to be addressed.
+- A distributed horizontal filesystem suitable for metadata and configuration across a cluster.
+- Directories can efficiently scale to huge numbers of files.
+- Optional directories/files that are efficient for bulk data (s3 backed files).
+- Support for distributed posix whole file locks and BSD locks with client eviction - if
+  a lock is broken, that client can no longer read or write to the filesystem without remounting.
 
-## Initial Goals
+## Current Limitations
 
-- A distributed filesystem suitable for metadata.
-- Support for efficient distributed posix whole file locks with safe client eviction.
-- 100 percent test coverage.
+- Posix locks do not support partial file range locks (non exclusive sqlite3 doesn't work yet).
+- Files backed by s3 or other object storage are not efficient for random access, only sequential access.
 
-## Stretch goals
 
-- Optional directories that are efficient for bulk data (rados/s3/... backed files).
-- Directly level tuning of stat and dent caching.
+## Getting started
+
+You will need:
+
+- A running foundationdb cluster.
+- The hafs binaries added to your PATH.
+
+Create and mount a filesystem:
+
+```
+# Create the default 'fs' filesystem.
+$ hafs-mkfs
+$ hafs-fuse /mnt/hafs
+```
+
+From another terminal you can access hafs:
+
+```
+$ hafs-list-clients
+...
+$ ls /mnt/hafs
+$ echo foo > /mnt/hafs/test.txt
+```
+
+From any number of other machines mount the same filesystem and have a fully consistent distributed
+filesystem - including file locks.
