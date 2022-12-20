@@ -18,8 +18,7 @@ be confident in all the failure modes I would encounter when using distributed f
 ### Ideal use cases
 
 In general this filesystem is good for configuration files and metadata that must be kept consistent
-across a whole cluster while also tolerating server failure, it is not great at handling large volumes
-of data or having high single threaded write throughput (unless you use the s3 backed file feature).
+across a whole cluster while also tolerating server failure - it has very low single threaded write throughput (unless you use the s3 backed file feature).
 
 ## Features
 
@@ -36,6 +35,8 @@ of data or having high single threaded write throughput (unless you use the s3 b
 - Because HAFS is built on top of foundationdb, it requires at least 4GB of ram per node, which can be a bit heavy depending on the use case and project budget (though it works great on an existing foundationDB deployment).
 - Currently HAFS uses fuse permission checks and is thus subject to TOCTU races if you allow multiple
   users to modify files. Unless you understand this limitation it is better to use a single user fuse mount.
+- Inodes may be accessed after unlinking like a typical filesystem, but in HAFS they expire after a
+  configurable time limit, you cannot use an unlinked file indefinitely.
 
 ## Caveats and Gotchas.
 
