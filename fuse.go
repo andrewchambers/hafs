@@ -196,8 +196,9 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 	}
 
 	switch f.(type) {
-	case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
+	case *objectStoreReadOnlyFile:
 		// Write once, cache is always safe.
+		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	default:
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 	}
@@ -225,7 +226,7 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 	}
 
 	switch f.(type) {
-	case *objectStoreReadWriteFile, *objectStoreReadOnlyFile:
+	case *objectStoreReadOnlyFile:
 		// Write once, cache is always safe.
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	default:

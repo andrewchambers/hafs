@@ -1117,6 +1117,22 @@ func (f *invalidFile) ReadData(buf []byte, offset uint64) (uint32, error)  { ret
 func (f *invalidFile) Fsync() error                                        { return ErrInvalid }
 func (f *invalidFile) Close() error                                        { return nil }
 
+type zeroFile struct {
+	size uint64
+}
+
+func (f *zeroFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrNotSupported }
+func (f *zeroFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+	n := uint32(0)
+	for i := uint64(0); i < uint64(len(buf)) && offset+i < f.size; i++ {
+		buf[i] = 0
+		n += 1
+	}
+	return n, nil
+}
+func (f *zeroFile) Fsync() error { return nil }
+func (f *zeroFile) Close() error { return nil }
+
 type objectStoreReadOnlyFile struct {
 	storageObject ReaderAtCloser
 }
@@ -1141,14 +1157,11 @@ func (f *objectStoreReadOnlyFile) Close() error {
 type objectStoreReadWriteFile struct {
 	fs            *Fs
 	ino           uint64
-	dirty         atomicBool
 	objectStorage ObjectStorageEngine
-	flushLock     sync.Mutex
 	tmpFile       *os.File
 }
 
 func (f *objectStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
-	f.dirty.Store(true)
 	n, err := f.tmpFile.WriteAt(buf, int64(offset))
 	return uint32(n), err
 }
@@ -1160,15 +1173,7 @@ func (f *objectStoreReadWriteFile) ReadData(buf []byte, offset uint64) (uint32, 
 
 func (f *objectStoreReadWriteFile) Fsync() error {
 
-	dirty := f.dirty.Load()
-	if !dirty {
-		return nil
-	}
-
-	f.flushLock.Lock()
-	defer f.flushLock.Unlock()
-
-	size, err := f.objectStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
+	tmpFileStat, err := f.tmpFile.Stat()
 	if err != nil {
 		return err
 	}
@@ -1178,8 +1183,12 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 		if err != nil {
 			return nil, err
 		}
-		f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, size-int64(stat.Size))
-		stat.Size = uint64(size)
+		if stat.Size != 0 {
+			// Object storage files can only be written once.
+			return nil, ErrNotSupported
+		}
+		stat.Size = uint64(tmpFileStat.Size())
+		f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(stat.Size))
 		f.fs.txSetStat(tx, stat)
 		return nil, nil
 	})
@@ -1187,7 +1196,16 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 		return err
 	}
 
-	f.dirty.Store(false)
+	if tmpFileStat.Size() == 0 {
+		// Don't bother writing an empty object.
+		return nil
+	}
+
+	_, err = f.objectStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
+	if err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -1263,17 +1281,20 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			f = &objectStoreReadWriteFile{
 				fs:            fs,
 				ino:           stat.Ino,
-				dirty:         atomicBool{0},
 				objectStorage: objectStorage,
 				tmpFile:       tmpFile,
 			}
 		} else {
-			storageObject, err := objectStorage.Open(fs.fsName, stat.Ino)
+			storageObject, exists, err := objectStorage.Open(fs.fsName, stat.Ino)
 			if err != nil {
 				return nil, Stat{}, err
 			}
-			f = &objectStoreReadOnlyFile{
-				storageObject: storageObject,
+			if !exists {
+				f = &zeroFile{size: stat.Size}
+			} else {
+				f = &objectStoreReadOnlyFile{
+					storageObject: storageObject,
+				}
 			}
 		}
 	}

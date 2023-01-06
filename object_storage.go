@@ -21,7 +21,7 @@ type ReaderAtCloser interface {
 }
 
 type ObjectStorageEngine interface {
-	Open(fs string, inode uint64) (ReaderAtCloser, error)
+	Open(fs string, inode uint64) (ReaderAtCloser, bool, error)
 	Write(fs string, inode uint64, data *os.File) (int64, error)
 	Remove(fs string, inode uint64) error
 	Validate() error
@@ -32,9 +32,15 @@ type fileStorageEngine struct {
 	path string
 }
 
-func (s *fileStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, error) {
+func (s *fileStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
 	f, err := os.Open(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
-	return f, err
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	return f, true, nil
 }
 
 func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
@@ -104,20 +110,23 @@ func (r *s3Reader) Close() error {
 	return r.obj.Close()
 }
 
-func (s *s3StorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, error) {
-	obj, err := s.client.GetObject(
-		context.Background(),
-		s.bucket,
-		fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
-		minio.GetObjectOptions{},
-	)
-	if err != nil {
-		return nil, err
-	}
-	return &s3Reader{
-		obj:           obj,
-		currentOffset: 0,
-	}, nil
+func (s *s3StorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
+	panic("TODO")
+	/*
+		obj, err := s.client.GetObject(
+			context.Background(),
+			s.bucket,
+			fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
+			minio.GetObjectOptions{},
+		)
+		if err != nil {
+			return nil, err
+		}
+		return &s3Reader{
+			obj:           obj,
+			currentOffset: 0,
+		}, nil
+	*/
 }
 
 func (s *s3StorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
@@ -211,16 +220,16 @@ func (r *crushStoreObjectReader) Close() error {
 	return r.obj.Close()
 }
 
-func (s *crushStoreStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, error) {
+func (s *crushStoreStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
 	obj, ok, err := s.client.Get(
 		fmt.Sprintf("%d.%s", inode, fs),
 		crushstore.GetOptions{},
 	)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !ok {
-		return nil, ErrNotExist
+		return nil, false, nil
 	}
 	return &crushStoreObjectReader{
 		client:        s.client,
@@ -228,7 +237,7 @@ func (s *crushStoreStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser,
 		currentOffset: 0,
 		inode:         inode,
 		fsName:        fs,
-	}, nil
+	}, true, nil
 }
 
 func (s *crushStoreStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {

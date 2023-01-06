@@ -31,6 +31,7 @@ func tmpFs(t *testing.T) *Fs {
 }
 
 func TestExclusiveLockRecordMarshalAndUnmarshal(t *testing.T) {
+	t.Parallel()
 	lr1 := exclusiveLockRecord{
 		Owner:    0xffffffffffffffff,
 		ClientId: "foobar",
@@ -44,6 +45,7 @@ func TestExclusiveLockRecordMarshalAndUnmarshal(t *testing.T) {
 }
 
 func TestDirEntMarshalAndUnmarshal(t *testing.T) {
+	t.Parallel()
 	e1 := DirEnt{
 		Mode: S_IFDIR,
 		Ino:  12345,
@@ -57,6 +59,7 @@ func TestDirEntMarshalAndUnmarshal(t *testing.T) {
 }
 
 func TestStatMarshalAndUnmarshal(t *testing.T) {
+	t.Parallel()
 	s1 := Stat{
 		Size:      1,
 		Atimesec:  2,
@@ -81,6 +84,7 @@ func TestStatMarshalAndUnmarshal(t *testing.T) {
 }
 
 func TestMkfsAndAttach(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 	stat, err := fs.GetStat(ROOT_INO)
 	if err != nil {
@@ -96,6 +100,7 @@ func TestMkfsAndAttach(t *testing.T) {
 }
 
 func TestMknod(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	fooStat, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
@@ -137,6 +142,7 @@ func TestMknod(t *testing.T) {
 }
 
 func TestSymlink(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 	fooStat, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
 		Mode:       S_IFLNK | 0o777,
@@ -159,6 +165,7 @@ func TestSymlink(t *testing.T) {
 }
 
 func TestMknodTruncate(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	fooStat1, err := fs.Mknod(ROOT_INO, "foo", MknodOpts{
@@ -186,6 +193,7 @@ func TestMknodTruncate(t *testing.T) {
 }
 
 func TestUnlink(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	err := fs.Unlink(ROOT_INO, "foo")
@@ -250,7 +258,50 @@ func TestUnlink(t *testing.T) {
 	}
 }
 
+func TestExternalStorageWriteOnce(t *testing.T) {
+	t.Parallel()
+	fs := tmpFs(t)
+
+	storageDir := t.TempDir()
+
+	err := fs.SetXAttr(ROOT_INO, "hafs.storage", []byte("file://"+storageDir))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f1, stat, err := fs.CreateFile(ROOT_INO, "f", CreateFileOpts{
+		Mode: 0o777,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f1.Close()
+
+	_, err = f1.WriteData([]byte{1}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f1.Fsync()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f2, stat, err := fs.OpenFile(stat.Ino, OpenFileOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f2.Close()
+
+	_, err = f2.WriteData([]byte{1}, 0)
+	if err == nil {
+		t.Fatal(err)
+	}
+
+}
+
 func TestUnlinkExternalStorage(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	storageDir := t.TempDir()
@@ -308,6 +359,7 @@ func TestUnlinkExternalStorage(t *testing.T) {
 }
 
 func TestRenameSameDir(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
@@ -350,6 +402,7 @@ func TestRenameSameDir(t *testing.T) {
 }
 
 func TestRenameSameDirOverwrite(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
@@ -403,6 +456,7 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 }
 
 func TestRenameDifferentDir(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	dStat, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
@@ -445,6 +499,7 @@ func TestRenameDifferentDir(t *testing.T) {
 }
 
 func TestRenameDifferentDirOverwrite(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	dStat, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
@@ -507,6 +562,7 @@ func TestRenameDifferentDirOverwrite(t *testing.T) {
 }
 
 func TestDirIter(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	for i := 0; i < 500; i += 1 {
@@ -543,6 +599,7 @@ func TestDirIter(t *testing.T) {
 }
 
 func TestDirIterPlus(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	for i := 0; i < 500; i += 1 {
@@ -582,6 +639,7 @@ func TestDirIterPlus(t *testing.T) {
 }
 
 func TestWriteDataOneChunk(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	testSizes := []uint64{0, 1, 3, CHUNK_SIZE - 1, CHUNK_SIZE}
@@ -630,6 +688,7 @@ func TestWriteDataOneChunk(t *testing.T) {
 }
 
 func TestWriteDataTwoChunks(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	testSizes := []uint64{CHUNK_SIZE + 1, CHUNK_SIZE + 3, CHUNK_SIZE * 2}
@@ -700,6 +759,7 @@ func TestWriteDataTwoChunks(t *testing.T) {
 }
 
 func TestTruncate(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	testSizes := []uint64{
@@ -767,6 +827,7 @@ func TestTruncate(t *testing.T) {
 }
 
 func TestReadWriteData(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	// Random writes at different offsets to exercise the sparse code paths.
@@ -858,6 +919,7 @@ func TestReadWriteData(t *testing.T) {
 }
 
 func TestSetLock(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
@@ -957,6 +1019,7 @@ func TestSetLock(t *testing.T) {
 }
 
 func TestWaitForLockWithWatch(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
@@ -1014,6 +1077,7 @@ func TestWaitForLockWithWatch(t *testing.T) {
 }
 
 func TestWaitForLockWithPoll(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	stat, err := fs.Mknod(ROOT_INO, "f", MknodOpts{
@@ -1071,6 +1135,7 @@ func TestWaitForLockWithPoll(t *testing.T) {
 }
 
 func TestInodeAllocation(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 	seen := make(map[uint64]struct{})
 	for i := uint64(0); i < _INO_STEP*10; i++ {
@@ -1088,6 +1153,7 @@ func TestInodeAllocation(t *testing.T) {
 }
 
 func TestHardLink(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
@@ -1169,6 +1235,7 @@ func TestHardLink(t *testing.T) {
 }
 
 func TestHardLinkDirFails(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	foo1Stat, err := fs.Mknod(ROOT_INO, "foo1", MknodOpts{
@@ -1188,6 +1255,7 @@ func TestHardLinkDirFails(t *testing.T) {
 }
 
 func TestClientSelfEvictExclusiveLock(t *testing.T) {
+	t.Parallel()
 	db := tmpDB(t)
 	fs1, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
@@ -1237,6 +1305,7 @@ func TestClientSelfEvictExclusiveLock(t *testing.T) {
 }
 
 func TestClientSelfEvictSharedLock(t *testing.T) {
+	t.Parallel()
 	db := tmpDB(t)
 	fs1, err := Attach(db, "testfs", AttachOpts{})
 	if err != nil {
@@ -1286,6 +1355,7 @@ func TestClientSelfEvictSharedLock(t *testing.T) {
 }
 
 func TestSubvolume(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	dir, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
@@ -1376,6 +1446,7 @@ func TestSubvolume(t *testing.T) {
 }
 
 func TestSubvolumeNoCrossRenames(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	dir, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
@@ -1409,6 +1480,7 @@ func TestSubvolumeNoCrossRenames(t *testing.T) {
 }
 
 func TestSubvolumeNoCrossHardlinks(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	dir, err := fs.Mknod(ROOT_INO, "d", MknodOpts{
@@ -1442,6 +1514,7 @@ func TestSubvolumeNoCrossHardlinks(t *testing.T) {
 }
 
 func TestSubvolumeByteAccounting(t *testing.T) {
+	t.Parallel()
 	fs := tmpFs(t)
 
 	err := fs.SetXAttr(ROOT_INO, "hafs.track-usage", []byte("true"))

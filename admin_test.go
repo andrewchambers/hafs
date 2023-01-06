@@ -20,7 +20,7 @@ func tmpDB(t *testing.T) fdb.Database {
 }
 
 func TestClientTimedOut(t *testing.T) {
-
+	t.Parallel()
 	db := testutil.NewFDBTestServer(t).Dial()
 
 	err := Mkfs(db, "testfs", MkfsOpts{})
@@ -53,7 +53,7 @@ func TestClientTimedOut(t *testing.T) {
 }
 
 func TestClientInfo(t *testing.T) {
-
+	t.Parallel()
 	db := testutil.NewFDBTestServer(t).Dial()
 
 	err := Mkfs(db, "testfs", MkfsOpts{Overwrite: false})
@@ -92,7 +92,7 @@ func TestClientInfo(t *testing.T) {
 }
 
 func TestListFilesystems(t *testing.T) {
-
+	t.Parallel()
 	db := testutil.NewFDBTestServer(t).Dial()
 
 	for _, name := range []string{"myfs", "zzz"} {
@@ -114,6 +114,7 @@ func TestListFilesystems(t *testing.T) {
 }
 
 func TestEvictClient(t *testing.T) {
+	t.Parallel()
 	db := testutil.NewFDBTestServer(t).Dial()
 
 	err := Mkfs(db, "testfs", MkfsOpts{})
