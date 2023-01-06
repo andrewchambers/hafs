@@ -38,7 +38,7 @@ type FuseFs struct {
 
 	fileHandleCounter uint64
 
-	lock        sync.Mutex
+	lock        sync.RWMutex
 	fh2OpenFile map[uint64]*openFile
 }
 
@@ -196,9 +196,11 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 	}
 
 	switch f.(type) {
+	/* XXX broken by readahead causing out of order reads.
 	case *objectStoreReadOnlyFile:
 		// Write once, cache is always safe.
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	*/
 	default:
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 	}
@@ -226,9 +228,11 @@ func (fs *FuseFs) Create(cancel <-chan struct{}, in *fuse.CreateIn, name string,
 	}
 
 	switch f.(type) {
+	/* XXX broken by readahead causing out of order reads.
 	case *objectStoreReadOnlyFile:
 		// Write once, cache is always safe.
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	*/
 	default:
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
 	}
@@ -255,9 +259,9 @@ func (fs *FuseFs) Rename(cancel <-chan struct{}, in *fuse.RenameIn, fromName str
 }
 
 func (fs *FuseFs) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fuse.ReadResult, fuse.Status) {
-	fs.lock.Lock()
+	fs.lock.RLock()
 	f := fs.fh2OpenFile[in.Fh].f
-	fs.lock.Unlock()
+	fs.lock.RUnlock()
 
 	nTotal := uint32(0)
 	for nTotal != uint32(len(buf)) {
@@ -275,9 +279,9 @@ func (fs *FuseFs) Read(cancel <-chan struct{}, in *fuse.ReadIn, buf []byte) (fus
 }
 
 func (fs *FuseFs) Write(cancel <-chan struct{}, in *fuse.WriteIn, buf []byte) (uint32, fuse.Status) {
-	fs.lock.Lock()
+	fs.lock.RLock()
 	f := fs.fh2OpenFile[in.Fh].f
-	fs.lock.Unlock()
+	fs.lock.RUnlock()
 
 	nTotal := uint32(0)
 	for nTotal != uint32(len(buf)) {
@@ -299,9 +303,9 @@ func (fs *FuseFs) Lseek(cancel <-chan struct{}, in *fuse.LseekIn, out *fuse.Lsee
 }
 
 func (fs *FuseFs) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
-	fs.lock.Lock()
+	fs.lock.RLock()
 	f := fs.fh2OpenFile[in.Fh].f
-	fs.lock.Unlock()
+	fs.lock.RUnlock()
 
 	err := f.Fsync()
 	if err != nil {
@@ -312,9 +316,9 @@ func (fs *FuseFs) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
 }
 
 func (fs *FuseFs) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
-	fs.lock.Lock()
+	fs.lock.RLock()
 	f := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
+	fs.lock.RUnlock()
 
 	fsyncErr := f.f.Fsync()
 
@@ -422,9 +426,9 @@ func (fs *FuseFs) OpenDir(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.Ope
 }
 
 func (fs *FuseFs) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	fs.lock.Lock()
+	fs.lock.RLock()
 	d := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
+	fs.lock.RUnlock()
 
 	if d.di == nil {
 		return fuse.Status(unix.EBADF)
@@ -453,15 +457,9 @@ func (fs *FuseFs) ReadDir(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.Dir
 }
 
 func (fs *FuseFs) ReadDirPlus(cancel <-chan struct{}, in *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	fs.lock.Lock()
+	fs.lock.RLock()
 	d := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
-
-	if fs.cacheAttributes == 0 {
-		// Supporting ReadDirPlus when we don't have any cache
-		// will do pointless work fetching the stats twice.
-		return fuse.ENOSYS
-	}
+	fs.lock.RUnlock()
 
 	if d.di == nil {
 		return fuse.Status(unix.EBADF)
@@ -566,9 +564,9 @@ func (fs *FuseFs) GetLk(cancel <-chan struct{}, in *fuse.LkIn, out *fuse.LkOut) 
 }
 
 func (fs *FuseFs) SetLk(cancel <-chan struct{}, in *fuse.LkIn) fuse.Status {
-	fs.lock.Lock()
+	fs.lock.RLock()
 	f := fs.fh2OpenFile[in.Fh]
-	fs.lock.Unlock()
+	fs.lock.RUnlock()
 
 	var lockType LockType
 

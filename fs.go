@@ -1156,12 +1156,14 @@ func (f *objectStoreReadOnlyFile) Close() error {
 
 type objectStoreReadWriteFile struct {
 	fs            *Fs
+	dirty         atomicBool
 	ino           uint64
 	objectStorage ObjectStorageEngine
 	tmpFile       *os.File
 }
 
 func (f *objectStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+	f.dirty.Store(true)
 	n, err := f.tmpFile.WriteAt(buf, int64(offset))
 	return uint32(n), err
 }
@@ -1172,6 +1174,10 @@ func (f *objectStoreReadWriteFile) ReadData(buf []byte, offset uint64) (uint32, 
 }
 
 func (f *objectStoreReadWriteFile) Fsync() error {
+
+	if !f.dirty.Load() {
+		return nil
+	}
 
 	tmpFileStat, err := f.tmpFile.Stat()
 	if err != nil {
@@ -1185,6 +1191,10 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 		}
 		if stat.Size != 0 {
 			// Object storage files can only be written once.
+			return nil, ErrNotSupported
+		}
+		if stat.Nlink == 0 {
+			// This prevents us writing objects after this inode is removed.
 			return nil, ErrNotSupported
 		}
 		stat.Size = uint64(tmpFileStat.Size())
@@ -1205,6 +1215,8 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 	if err != nil {
 		return err
 	}
+
+	f.dirty.Store(false)
 
 	return nil
 }
@@ -1280,6 +1292,7 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 
 			f = &objectStoreReadWriteFile{
 				fs:            fs,
+				dirty:         atomicBool{},
 				ino:           stat.Ino,
 				objectStorage: objectStorage,
 				tmpFile:       tmpFile,
@@ -1344,6 +1357,7 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 
 		f = &objectStoreReadWriteFile{
 			fs:            fs,
+			dirty:         atomicBool{},
 			ino:           stat.Ino,
 			objectStorage: objectStorage,
 			tmpFile:       tmpFile,
@@ -1948,10 +1962,6 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 			}
 			stat.Flags |= FLAG_EXTERNAL_STORAGE
 			stat.Storage = string(data)
-			err := fs.objectStorage.Validate(stat.Storage)
-			if err != nil {
-				return nil, fmt.Errorf("unable to validate storage specification: %s", err)
-			}
 			fs.txSetStat(tx, stat)
 		case "hafs.total-bytes", "hafs.total-inodes", "hafs.totals":
 			return nil, ErrInvalid

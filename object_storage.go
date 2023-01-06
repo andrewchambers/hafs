@@ -24,7 +24,6 @@ type ObjectStorageEngine interface {
 	Open(fs string, inode uint64) (ReaderAtCloser, bool, error)
 	Write(fs string, inode uint64, data *os.File) (int64, error)
 	Remove(fs string, inode uint64) error
-	Validate() error
 	Close() error
 }
 
@@ -67,10 +66,6 @@ func (s *fileStorageEngine) Remove(fs string, inode uint64) error {
 	return nil
 }
 
-func (s *fileStorageEngine) Validate() error {
-	return nil
-}
-
 func (s *fileStorageEngine) Close() error {
 	return nil
 }
@@ -95,8 +90,10 @@ func (r *s3Reader) ReadAt(buf []byte, offset int64) (int, error) {
 	if offset != r.currentOffset {
 		newOffset, err := r.obj.Seek(offset, io.SeekStart)
 		if err != nil {
-			r.currentOffset = newOffset
+			r.currentOffset = ^0
+			return 0, err
 		}
+		r.currentOffset = newOffset
 	}
 	n, err := io.ReadFull(r.obj, buf)
 	r.currentOffset += int64(n)
@@ -111,22 +108,22 @@ func (r *s3Reader) Close() error {
 }
 
 func (s *s3StorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
-	panic("TODO")
-	/*
-		obj, err := s.client.GetObject(
-			context.Background(),
-			s.bucket,
-			fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
-			minio.GetObjectOptions{},
-		)
-		if err != nil {
-			return nil, err
+	obj, err := s.client.GetObject(
+		context.Background(),
+		s.bucket,
+		fmt.Sprintf("%s%d.%s", s.path, inode, fs),
+		minio.GetObjectOptions{},
+	)
+	if err != nil {
+		if minio.ToErrorResponse(err).StatusCode == 404 {
+			return nil, false, nil
 		}
-		return &s3Reader{
-			obj:           obj,
-			currentOffset: 0,
-		}, nil
-	*/
+		return nil, false, err
+	}
+	return &s3Reader{
+		obj:           obj,
+		currentOffset: 0,
+	}, true, nil
 }
 
 func (s *s3StorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
@@ -137,7 +134,7 @@ func (s *s3StorageEngine) Write(fs string, inode uint64, data *os.File) (int64, 
 	obj, err := s.client.PutObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
+		fmt.Sprintf("%s%d.%s", s.path, inode, fs),
 		data,
 		stat.Size(),
 		minio.PutObjectOptions{},
@@ -155,7 +152,7 @@ func (s *s3StorageEngine) Remove(fs string, inode uint64) error {
 	err := s.client.RemoveObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s/%d.%s", s.path, inode, fs),
+		fmt.Sprintf("%s%d.%s", s.path, inode, fs),
 		minio.RemoveObjectOptions{},
 	)
 	if err != nil {
@@ -164,10 +161,6 @@ func (s *s3StorageEngine) Remove(fs string, inode uint64) error {
 		}
 		return err
 	}
-	return nil
-}
-
-func (s *s3StorageEngine) Validate() error {
 	return nil
 }
 
@@ -260,14 +253,6 @@ func (s *crushStoreStorageEngine) Remove(fs string, inode uint64) error {
 	)
 	if err != nil {
 		return err
-	}
-	return nil
-}
-
-func (s *crushStoreStorageEngine) Validate() error {
-	_, _, err := s.client.Head("test-key", crushstore.HeadOptions{})
-	if err != nil {
-		return fmt.Errorf("unable to check test key: %w", err)
 	}
 	return nil
 }
@@ -387,13 +372,4 @@ func (c *ObjectStorageEngineCache) Get(storage string) (ObjectStorageEngine, err
 		return engine, nil
 	}
 	return cached.(ObjectStorageEngine), nil
-}
-
-func (c *ObjectStorageEngineCache) Validate(storage string) error {
-	s, err := newObjectStorageEngine(storage)
-	if err != nil {
-		return err
-	}
-	defer s.Close()
-	return s.Validate()
 }
