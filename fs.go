@@ -787,7 +787,12 @@ func (fs *Fs) HardLink(dirIno, ino uint64, name string) (Stat, error) {
 
 		stat.SetAtime(now)
 		stat.SetCtime(now)
+
 		stat.Nlink += 1
+		if stat.Nlink == 0 {
+			return Stat{}, ErrInvalid
+		}
+
 		fs.txSetStat(tx, stat)
 
 		fs.txSetDirEnt(tx, dirIno, DirEnt{
@@ -1184,6 +1189,8 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 		return err
 	}
 
+	var nLink uint32
+
 	_, err = f.fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		stat, err := f.fs.txGetStat(tx, f.ino).Get()
 		if err != nil {
@@ -1193,10 +1200,9 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 			// Object storage files can only be written once.
 			return nil, ErrNotSupported
 		}
-		if stat.Nlink == 0 {
-			// This prevents us writing objects after this inode is removed.
-			return nil, ErrNotSupported
-		}
+
+		nLink = stat.Nlink
+
 		stat.Size = uint64(tmpFileStat.Size())
 		f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(stat.Size))
 		f.fs.txSetStat(tx, stat)
@@ -1207,7 +1213,15 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 	}
 
 	if tmpFileStat.Size() == 0 {
-		// Don't bother writing an empty object.
+		// No point in uploading an empty object.
+		f.dirty.Store(false)
+		return nil
+	}
+
+	if nLink == 0 {
+		// We don't want to ever upload an object for an unlinked file
+		// as that could cause orphaned objects in the object store.
+		f.dirty.Store(false)
 		return nil
 	}
 
@@ -1217,7 +1231,6 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 	}
 
 	f.dirty.Store(false)
-
 	return nil
 }
 
