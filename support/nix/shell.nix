@@ -5,6 +5,6 @@ in
     buildInputs = [
       pkgs.go
       pkgs.gotools
-      ((pkgs.callPackage ./fdb.nix) {})
+      ((pkgs.callPackage ./foundationdb.nix) {})
     ];
   }

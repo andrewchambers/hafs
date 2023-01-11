@@ -10,7 +10,6 @@ import (
 	"strings"
 	"sync"
 
-	crushstore "github.com/andrewchambers/crushstore/client"
 	"github.com/minio/minio-go/v7"
 	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
 )
@@ -32,7 +31,7 @@ type fileStorageEngine struct {
 }
 
 func (s *fileStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
-	f, err := os.Open(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
+	f, err := os.Open(fmt.Sprintf("%s/%016x.%s", s.path, inode, fs))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, false, nil
@@ -43,7 +42,7 @@ func (s *fileStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool,
 }
 
 func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
-	f, err := os.Create(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
+	f, err := os.Create(fmt.Sprintf("%s/%016x.%s", s.path, inode, fs))
 	if err != nil {
 		return 0, err
 	}
@@ -56,7 +55,7 @@ func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64
 }
 
 func (s *fileStorageEngine) Remove(fs string, inode uint64) error {
-	err := os.Remove(fmt.Sprintf("%s/%d.%s", s.path, inode, fs))
+	err := os.Remove(fmt.Sprintf("%s/%016x.%s", s.path, inode, fs))
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil
@@ -111,7 +110,7 @@ func (s *s3StorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, e
 	obj, err := s.client.GetObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s%d.%s", s.path, inode, fs),
+		fmt.Sprintf("%s%016x.%s", s.path, inode, fs),
 		minio.GetObjectOptions{},
 	)
 	if err != nil {
@@ -134,7 +133,7 @@ func (s *s3StorageEngine) Write(fs string, inode uint64, data *os.File) (int64, 
 	obj, err := s.client.PutObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s%d.%s", s.path, inode, fs),
+		fmt.Sprintf("%s%016x.%s", s.path, inode, fs),
 		data,
 		stat.Size(),
 		minio.PutObjectOptions{},
@@ -152,7 +151,7 @@ func (s *s3StorageEngine) Remove(fs string, inode uint64) error {
 	err := s.client.RemoveObject(
 		context.Background(),
 		s.bucket,
-		fmt.Sprintf("%s%d.%s", s.path, inode, fs),
+		fmt.Sprintf("%s%016x.%s", s.path, inode, fs),
 		minio.RemoveObjectOptions{},
 	)
 	if err != nil {
@@ -168,132 +167,7 @@ func (s *s3StorageEngine) Close() error {
 	return nil
 }
 
-type crushStoreStorageEngine struct {
-	client *crushstore.Client
-}
-
-type crushStoreObjectReader struct {
-	lock          sync.Mutex
-	client        *crushstore.Client
-	fsName        string
-	inode         uint64
-	obj           *crushstore.ObjectReader
-	currentOffset int64
-}
-
-func (r *crushStoreObjectReader) ReadAt(buf []byte, offset int64) (int, error) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	if offset != r.currentOffset {
-		obj, ok, err := r.client.Get(
-			fmt.Sprintf("%d.%s", r.inode, r.fsName),
-			crushstore.GetOptions{
-				StartOffset: uint64(offset),
-			},
-		)
-		if err != nil {
-			return 0, err
-		}
-		if !ok {
-			return 0, io.ErrUnexpectedEOF
-		}
-		r.currentOffset = offset
-		_ = r.obj.Close()
-		r.obj = obj
-	}
-	n, err := io.ReadFull(r.obj, buf)
-	r.currentOffset += int64(n)
-	if err == io.ErrUnexpectedEOF {
-		err = io.EOF
-	}
-	return n, err
-}
-
-func (r *crushStoreObjectReader) Close() error {
-	return r.obj.Close()
-}
-
-func (s *crushStoreStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
-	obj, ok, err := s.client.Get(
-		fmt.Sprintf("%d.%s", inode, fs),
-		crushstore.GetOptions{},
-	)
-	if err != nil {
-		return nil, false, err
-	}
-	if !ok {
-		return nil, false, nil
-	}
-	return &crushStoreObjectReader{
-		client:        s.client,
-		obj:           obj,
-		currentOffset: 0,
-		inode:         inode,
-		fsName:        fs,
-	}, true, nil
-}
-
-func (s *crushStoreStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
-	stat, err := data.Stat()
-	if err != nil {
-		return 0, err
-	}
-	err = s.client.Put(
-		fmt.Sprintf("%d.%s", inode, fs),
-		data,
-		crushstore.PutOptions{},
-	)
-	return stat.Size(), err
-}
-
-func (s *crushStoreStorageEngine) Remove(fs string, inode uint64) error {
-	err := s.client.Delete(
-		fmt.Sprintf("%d.%s", inode, fs),
-		crushstore.DeleteOptions{},
-	)
-	if err != nil {
-		return err
-	}
-	return nil
-}
-
-func (s *crushStoreStorageEngine) Close() error {
-	return s.client.Close()
-}
-
 func newObjectStorageEngine(storage string) (ObjectStorageEngine, error) {
-
-	// Handle shortcodes.
-	switch storage {
-	case "cs":
-		storage = "crushstore:"
-	}
-
-	if strings.HasPrefix(storage, "crushstore:") {
-		u, err := url.Parse(storage)
-		if err != nil {
-			return nil, err
-		}
-		cfg := u.Query().Get("cluster_config")
-		if cfg == "" {
-			cfg = os.Getenv("CRUSHSTORE_CLUSTER_CONFIG")
-			if cfg == "" {
-				_, err := os.Stat("./crushstore-cluster.conf")
-				if err == nil {
-					cfg = "./crushstore-cluster.conf"
-				} else {
-					cfg = "/etc/crushstore/crushstore-cluster.conf"
-				}
-			}
-			client, err := crushstore.New(cfg, crushstore.ClientOptions{})
-			if err != nil {
-				return nil, err
-			}
-			return &crushStoreStorageEngine{
-				client: client,
-			}, nil
-		}
-	}
 
 	if strings.HasPrefix(storage, "file:") {
 		return &fileStorageEngine{
