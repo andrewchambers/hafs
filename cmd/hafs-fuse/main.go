@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"time"
 
 	"github.com/andrewchambers/hafs"
@@ -29,6 +30,7 @@ func main() {
 	clientExpiry := flag.Duration("client-expiry", 15*time.Minute, "Period of inactivity before a client is considered expired.")
 	cacheDentries := flag.Duration("cache-dentries", 0, "Duration to cache dentry lookups, use with great care.")
 	cacheAttributes := flag.Duration("cache-attributes", 0, "Duration to cache file attribute lookups, use with great care.")
+	notifyCommand := flag.String("notify-command", "", "A command to run via sh -c \"$CMD\" once filesystem is successfully mounted.")
 
 	flag.Parse()
 
@@ -71,6 +73,7 @@ func main() {
 		fmt.Fprintf(os.Stderr, "unable wait for mount: %s\n", err)
 		os.Exit(1)
 	}
+	log.Printf("filesystem successfully mounted")
 
 	if *gcUnlinkedInterval != 0 {
 		go func() {
@@ -102,6 +105,13 @@ func main() {
 				}
 			}
 		}()
+	}
+
+	if *notifyCommand != "" {
+		cmdOut, err := exec.Command("sh", "-c", *notifyCommand).CombinedOutput()
+		if err != nil {
+			log.Fatalf("error running notify command: %s, output: %q", err, string(cmdOut))
+		}
 	}
 
 	// Serve the file system, until unmounted by calling fusermount -u
