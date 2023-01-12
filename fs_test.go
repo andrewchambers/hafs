@@ -73,7 +73,6 @@ func TestStatMarshalAndUnmarshal(t *testing.T) {
 		Uid:       10,
 		Gid:       11,
 		Rdev:      12,
-		Storage:   "foobar",
 	}
 	s2 := Stat{}
 	buf, _ := s1.MarshalBinary()
@@ -258,13 +257,24 @@ func TestUnlink(t *testing.T) {
 	}
 }
 
-func TestExternalStorageWriteOnce(t *testing.T) {
+func TestObjectStorageWriteOnce(t *testing.T) {
 	t.Parallel()
-	fs := tmpFs(t)
+	db := tmpDB(t)
 
 	storageDir := t.TempDir()
 
-	err := fs.SetXAttr(ROOT_INO, "hafs.storage", []byte("file://"+storageDir))
+	err := SetObjectStorage(db, "testfs", "file://"+storageDir, SetObjectStorageOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs, err := Attach(db, "testfs", AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	err = fs.SetXAttr(ROOT_INO, "hafs.object-storage", []byte("true"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -300,13 +310,24 @@ func TestExternalStorageWriteOnce(t *testing.T) {
 
 }
 
-func TestUnlinkExternalStorage(t *testing.T) {
+func TestObjectStorageUnlink(t *testing.T) {
 	t.Parallel()
-	fs := tmpFs(t)
+	db := tmpDB(t)
 
 	storageDir := t.TempDir()
 
-	err := fs.SetXAttr(ROOT_INO, "hafs.storage", []byte("file://"+storageDir))
+	err := SetObjectStorage(db, "testfs", "file://"+storageDir, SetObjectStorageOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs, err := Attach(db, "testfs", AttachOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	err = fs.SetXAttr(ROOT_INO, "hafs.object-storage", []byte("true"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1516,11 +1537,6 @@ func TestSubvolumeNoCrossHardlinks(t *testing.T) {
 func TestSubvolumeByteAccounting(t *testing.T) {
 	t.Parallel()
 	fs := tmpFs(t)
-
-	err := fs.SetXAttr(ROOT_INO, "hafs.track-usage", []byte("true"))
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	b, err := fs.SubvolumeByteCount(ROOT_INO)
 	if err != nil {

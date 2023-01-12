@@ -46,7 +46,7 @@ func RegisterFsNameFlag() {
 	flag.StringVar(
 		&FsName,
 		"fs-name",
-		"fs",
+		"",
 		"Name of the filesystem to interact with.",
 	)
 }

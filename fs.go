@@ -35,6 +35,7 @@ var (
 	ErrPermission   = unix.EPERM
 	ErrIntr         = unix.EINTR
 	ErrNameTooLong  = unix.ENAMETOOLONG
+	ErrNotFormatted = errors.New("filesystem is not formatted")
 	ErrDetached     = errors.New("filesystem detached")
 )
 
@@ -58,7 +59,7 @@ const (
 
 const (
 	FLAG_SUBVOLUME uint64 = 1 << iota
-	FLAG_EXTERNAL_STORAGE
+	FLAG_OBJECT_STORAGE
 )
 
 type DirEnt struct {
@@ -104,11 +105,10 @@ type Stat struct {
 	Uid       uint32
 	Gid       uint32
 	Rdev      uint32
-	Storage   string
 }
 
 func (s *Stat) MarshalBinary() ([]byte, error) {
-	bufsz := 15*binary.MaxVarintLen64 + len(s.Storage)
+	bufsz := 14 * binary.MaxVarintLen64
 	buf := make([]byte, bufsz, bufsz)
 	b := buf
 	b = b[binary.PutUvarint(b, s.Subvolume):]
@@ -125,8 +125,6 @@ func (s *Stat) MarshalBinary() ([]byte, error) {
 	b = b[binary.PutUvarint(b, uint64(s.Uid)):]
 	b = b[binary.PutUvarint(b, uint64(s.Gid)):]
 	b = b[binary.PutUvarint(b, uint64(s.Rdev)):]
-	b = b[binary.PutUvarint(b, uint64(len(s.Storage))):]
-	b = b[copy(b, s.Storage):]
 	return buf[:len(buf)-len(b)], nil
 }
 
@@ -154,11 +152,6 @@ func (s *Stat) UnmarshalBinary(buf []byte) error {
 	s.Gid = uint32(v)
 	v, _ = binary.ReadUvarint(r)
 	s.Rdev = uint32(v)
-	v, _ = binary.ReadUvarint(r)
-	var sb strings.Builder
-	sb.Grow(int(v))
-	io.CopyN(&sb, r, int64(v))
-	s.Storage = sb.String()
 	return nil
 }
 
@@ -200,7 +193,7 @@ type Fs struct {
 	txCounter      atomicUint64
 	inoChan        chan uint64
 	relMtime       time.Duration
-	objectStorage  *ObjectStorageEngineCache
+	objectStorage  ObjectStorageEngine
 
 	workerWg      *sync.WaitGroup
 	cancelWorkers func()
@@ -266,18 +259,13 @@ func ListFilesystems(db fdb.Database) ([]string, error) {
 }
 
 type AttachOpts struct {
-	ClientDescription        string
-	OnEviction               func(fs *Fs)
-	Logf                     func(string, ...interface{})
-	RelMtime                 *time.Duration
-	ObjectStorageEngineCache *ObjectStorageEngineCache
+	ClientDescription string
+	OnEviction        func(fs *Fs)
+	Logf              func(string, ...interface{})
+	RelMtime          *time.Duration
 }
 
 func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
-
-	if opts.ObjectStorageEngineCache == nil {
-		opts.ObjectStorageEngineCache = &DefaultObjectStorageEngineCache
-	}
 
 	if opts.RelMtime == nil {
 		defaultRelMtime := 24 * time.Hour
@@ -327,15 +315,18 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 
 	initialHeartBeatBytes := [8]byte{}
 	binary.LittleEndian.PutUint64(initialHeartBeatBytes[:], uint64(now.Unix()))
+	objectStorageSpec := ""
 
 	_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
 		version := tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet()
 		if version == nil {
-			return nil, errors.New("filesystem is not formatted")
+			return nil, ErrNotFormatted
 		}
 		if !bytes.Equal(version, []byte{CURRENT_SCHEMA_VERSION}) {
 			return nil, fmt.Errorf("filesystem has different version - expected %d but got %d", CURRENT_SCHEMA_VERSION, version[0])
 		}
+
+		objectStorageSpec = string(tx.Get(tuple.Tuple{"hafs", fsName, "object-storage"}).MustGet())
 
 		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "info"}, clientInfoBytes)
 		tx.Set(tuple.Tuple{"hafs", fsName, "client", clientId, "heartbeat"}, initialHeartBeatBytes[:])
@@ -345,6 +336,11 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("unable to add mount: %w", err)
+	}
+
+	objectStorage, err := NewObjectStorageEngine(objectStorageSpec)
+	if err != nil {
+		return nil, fmt.Errorf("unable to initialize the object storage engine: %w", err)
 	}
 
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
@@ -357,7 +353,7 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 		relMtime:      *opts.RelMtime,
 		clientId:      clientId,
 		cancelWorkers: cancelWorkers,
-		objectStorage: opts.ObjectStorageEngineCache,
+		objectStorage: objectStorage,
 		workerWg:      &sync.WaitGroup{},
 		inoChan:       make(chan uint64, _INO_CHAN_SIZE),
 	}
@@ -684,7 +680,6 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 			Uid:       opts.Uid,
 			Gid:       opts.Gid,
 			Rdev:      opts.Rdev,
-			Storage:   "",
 		}
 
 		if dirStat.Flags&FLAG_SUBVOLUME != 0 {
@@ -693,10 +688,7 @@ func (fs *Fs) txMknod(tx fdb.Transaction, dirIno uint64, name string, opts Mknod
 
 		if opts.Mode&S_IFMT == S_IFREG {
 			// Only files inherit storage from the parent directory.
-			if dirStat.Flags&FLAG_EXTERNAL_STORAGE != 0 {
-				stat.Flags |= FLAG_EXTERNAL_STORAGE
-				stat.Storage = dirStat.Storage
-			}
+			stat.Flags |= dirStat.Flags & FLAG_OBJECT_STORAGE
 		}
 
 		fs.txSubvolumeInodeDelta(tx, stat.Subvolume, 1)
@@ -1160,11 +1152,10 @@ func (f *objectStoreReadOnlyFile) Close() error {
 }
 
 type objectStoreReadWriteFile struct {
-	fs            *Fs
-	dirty         atomicBool
-	ino           uint64
-	objectStorage ObjectStorageEngine
-	tmpFile       *os.File
+	fs      *Fs
+	dirty   atomicBool
+	ino     uint64
+	tmpFile *os.File
 }
 
 func (f *objectStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
@@ -1225,7 +1216,7 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 		return nil
 	}
 
-	_, err = f.objectStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
+	_, err = f.fs.objectStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
 	if err != nil {
 		return err
 	}
@@ -1281,16 +1272,12 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 	})
 
 	var f HafsFile
-	if stat.Flags&FLAG_EXTERNAL_STORAGE == 0 {
+	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
 		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
 		}
 	} else {
-		objectStorage, err := fs.objectStorage.Get(stat.Storage)
-		if err != nil {
-			return nil, Stat{}, err
-		}
 
 		if stat.Size == 0 {
 			tmpFile, err := os.CreateTemp("", "")
@@ -1304,14 +1291,13 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			}
 
 			f = &objectStoreReadWriteFile{
-				fs:            fs,
-				dirty:         atomicBool{},
-				ino:           stat.Ino,
-				objectStorage: objectStorage,
-				tmpFile:       tmpFile,
+				fs:      fs,
+				dirty:   atomicBool{},
+				ino:     stat.Ino,
+				tmpFile: tmpFile,
 			}
 		} else {
-			storageObject, exists, err := objectStorage.Open(fs.fsName, stat.Ino)
+			storageObject, exists, err := fs.objectStorage.Open(fs.fsName, stat.Ino)
 			if err != nil {
 				return nil, Stat{}, err
 			}
@@ -1347,7 +1333,8 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 	}
 
 	var f HafsFile
-	if stat.Flags&FLAG_EXTERNAL_STORAGE == 0 {
+
+	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
 		f = &foundationDBFile{
 			fs:  fs,
 			ino: stat.Ino,
@@ -1363,19 +1350,14 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 			return nil, Stat{}, err
 		}
 
-		objectStorage, err := fs.objectStorage.Get(stat.Storage)
-		if err != nil {
-			return nil, Stat{}, err
-		}
-
 		f = &objectStoreReadWriteFile{
-			fs:            fs,
-			dirty:         atomicBool{},
-			ino:           stat.Ino,
-			objectStorage: objectStorage,
-			tmpFile:       tmpFile,
+			fs:      fs,
+			dirty:   atomicBool{},
+			ino:     stat.Ino,
+			tmpFile: tmpFile,
 		}
 	}
+
 	return f, stat, err
 }
 
@@ -1522,7 +1504,8 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 		}
 
 		if stat.Size != 0 {
-			if stat.Flags&FLAG_EXTERNAL_STORAGE != 0 {
+
+			if stat.Flags&FLAG_OBJECT_STORAGE != 0 {
 				// We don't support truncating object storage files for now.
 				return Stat{}, ErrNotSupported
 			}
@@ -1966,18 +1949,21 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 		if err != nil {
 			return nil, err
 		}
+
 		tx.Set(tuple.Tuple{"hafs", fs.fsName, "ino", ino, "xattr", name}, data)
 
 		switch name {
-		case "hafs.storage":
+		case "hafs.object-storage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
-			stat.Flags |= FLAG_EXTERNAL_STORAGE
-			stat.Storage = string(data)
+			switch string(data) {
+			case "true":
+				stat.Flags |= FLAG_OBJECT_STORAGE
+			default:
+				return nil, ErrInvalid
+			}
 			fs.txSetStat(tx, stat)
-		case "hafs.total-bytes", "hafs.total-inodes", "hafs.totals":
-			return nil, ErrInvalid
 		case "hafs.subvolume":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
@@ -1985,15 +1971,19 @@ func (fs *Fs) SetXAttr(ino uint64, name string, data []byte) error {
 			if fs.txDirHasChildren(tx, stat.Ino) {
 				return nil, ErrInvalid
 			}
-			flag := FLAG_SUBVOLUME
 			switch string(data) {
 			case "true":
-				stat.Flags |= flag
+				stat.Flags |= FLAG_SUBVOLUME
 			default:
 				return nil, ErrInvalid
 			}
 			fs.txSetStat(tx, stat)
+		case "hafs.total-bytes", "hafs.total-inodes", "hafs.totals":
+			return nil, ErrInvalid
 		default:
+			if strings.HasPrefix(name, "hafs.") {
+				return nil, ErrInvalid
+			}
 		}
 		return nil, nil
 	})
@@ -2007,12 +1997,11 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			return nil, err
 		}
 		switch name {
-		case "hafs.storage":
+		case "hafs.object-storage":
 			if stat.Mode&S_IFMT != S_IFDIR {
 				return nil, ErrInvalid
 			}
-			stat.Flags &= ^FLAG_EXTERNAL_STORAGE
-			stat.Storage = ""
+			stat.Flags &= ^FLAG_OBJECT_STORAGE
 			fs.txSetStat(tx, stat)
 		case "hafs.subvolume":
 			if stat.Mode&S_IFMT != S_IFDIR {
@@ -2021,8 +2010,7 @@ func (fs *Fs) RemoveXAttr(ino uint64, name string) error {
 			if fs.txDirHasChildren(tx, stat.Ino) {
 				return nil, ErrInvalid
 			}
-			flag := FLAG_SUBVOLUME
-			stat.Flags &= ^flag
+			stat.Flags &= ^FLAG_SUBVOLUME
 			fs.txSetStat(tx, stat)
 		default:
 		}
@@ -2310,13 +2298,8 @@ func (fs *Fs) RemoveExpiredUnlinked(opts RemoveExpiredUnlinkedOptions) (uint64, 
 				if stat.Mode&S_IFMT != S_IFREG {
 					continue
 				}
-
-				if stat.Storage != "" {
-					objectStorage, err := fs.objectStorage.Get(stat.Storage)
-					if err != nil {
-						return err
-					}
-					err = objectStorage.Remove(fs.fsName, stat.Ino)
+				if stat.Flags&FLAG_OBJECT_STORAGE != 0 {
+					err = fs.objectStorage.Remove(fs.fsName, stat.Ino)
 					if err != nil {
 						return err
 					}

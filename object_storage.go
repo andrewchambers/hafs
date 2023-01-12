@@ -26,6 +26,26 @@ type ObjectStorageEngine interface {
 	Close() error
 }
 
+var ErrStorageEngineNotConfigured error = errors.New("storage engine not configured")
+
+type unconfiguredStorageEngine struct{}
+
+func (s *unconfiguredStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
+	return nil, false, ErrStorageEngineNotConfigured
+}
+
+func (s *unconfiguredStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
+	return 0, ErrStorageEngineNotConfigured
+}
+
+func (s *unconfiguredStorageEngine) Remove(fs string, inode uint64) error {
+	return ErrStorageEngineNotConfigured
+}
+
+func (s *unconfiguredStorageEngine) Close() error {
+	return ErrStorageEngineNotConfigured
+}
+
 type fileStorageEngine struct {
 	path string
 }
@@ -167,18 +187,18 @@ func (s *s3StorageEngine) Close() error {
 	return nil
 }
 
-func newObjectStorageEngine(storage string) (ObjectStorageEngine, error) {
+func NewObjectStorageEngine(storageSpec string) (ObjectStorageEngine, error) {
 
-	if strings.HasPrefix(storage, "file:") {
+	if strings.HasPrefix(storageSpec, "file:") {
 		return &fileStorageEngine{
-			path: storage[5:],
+			path: storageSpec[5:],
 		}, nil
 	}
 
-	if strings.HasPrefix(storage, "s3:") {
+	if strings.HasPrefix(storageSpec, "s3:") {
 		var creds *miniocredentials.Credentials
 
-		u, err := url.Parse(storage)
+		u, err := url.Parse(storageSpec)
 		if err != nil {
 			return nil, err
 		}
@@ -223,27 +243,9 @@ func newObjectStorageEngine(storage string) (ObjectStorageEngine, error) {
 		}, nil
 	}
 
-	return nil, errors.New("unknown/invalid storage specification")
-}
-
-var DefaultObjectStorageEngineCache ObjectStorageEngineCache
-
-type ObjectStorageEngineCache struct {
-	// This cache only ever grows - which is a good use for sync.Map.
-	// it doesn't seem like the infinite growth ever be a practical problem,
-	// but we can address that if it ever does.
-	cache sync.Map
-}
-
-func (c *ObjectStorageEngineCache) Get(storage string) (ObjectStorageEngine, error) {
-	cached, ok := c.cache.Load(storage)
-	if !ok {
-		engine, err := newObjectStorageEngine(storage)
-		if err != nil {
-			return nil, err
-		}
-		c.cache.Store(storage, engine)
-		return engine, nil
+	if storageSpec == "" {
+		return &unconfiguredStorageEngine{}, nil
 	}
-	return cached.(ObjectStorageEngine), nil
+
+	return nil, errors.New("unknown/invalid storage specification")
 }

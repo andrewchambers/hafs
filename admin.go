@@ -25,6 +25,10 @@ type MkfsOpts struct {
 
 func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 
+	if fsName == "" {
+		return errors.New("filesystem name must not be empty")
+	}
+
 	if len(fsName) > 255 {
 		return errors.New("filesystem name must be less than 256 bytes")
 	}
@@ -85,6 +89,7 @@ func Mkfs(db fdb.Database, fsName string, opts MkfsOpts) error {
 		}
 
 		tx.ClearRange(tuple.Tuple{"hafs", fsName})
+		tx.Set(tuple.Tuple{"hafs", fsName, "object-storage"}, []byte(""))
 		tx.Set(tuple.Tuple{"hafs", fsName, "version"}, []byte{CURRENT_SCHEMA_VERSION})
 		tx.Set(tuple.Tuple{"hafs", fsName, "ino", ROOT_INO, "stat"}, rootStatBytes)
 		tx.Set(tuple.Tuple{"hafs", fsName, "inocntr"}, []byte{0, 0, 0, 0, 0, 0, 0, 1})
@@ -155,6 +160,10 @@ func GetClientInfo(db fdb.Database, fsName, clientId string) (ClientInfo, bool, 
 		info = ClientInfo{}
 		ok = false
 
+		if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() == nil {
+			return nil, ErrNotFormatted
+		}
+
 		infoBytes := tx.Get(tuple.Tuple{"hafs", fsName, "client", clientId, "info"}).MustGet()
 		if infoBytes == nil {
 			return nil, nil
@@ -191,6 +200,9 @@ func ListClients(db fdb.Database, fsName string) ([]ClientInfo, error) {
 
 	for {
 		v, err := db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+			if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() == nil {
+				return nil, ErrNotFormatted
+			}
 			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
 				Limit: 100,
 			}).GetSliceOrPanic()
@@ -287,8 +299,10 @@ func txBreakLock(tx fdb.Transaction, fsName, clientId string, ino uint64, owner 
 }
 
 func EvictClient(db fdb.Database, fsName, clientId string) error {
-
 	_, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() == nil {
+			return nil, ErrNotFormatted
+		}
 		// Invalidate all the clients in progress transactions.
 		tx.ClearRange(tuple.Tuple{"hafs", fsName, "client", clientId, "attached"})
 		return nil, nil
@@ -385,6 +399,9 @@ func EvictExpiredClients(db fdb.Database, fsName string, opts EvictExpiredClient
 
 	for {
 		v, err := db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+			if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() == nil {
+				return nil, ErrNotFormatted
+			}
 			kvs := tx.GetRange(iterRange, fdb.RangeOptions{
 				Limit: 100,
 			}).GetSliceOrPanic()
@@ -440,4 +457,50 @@ func EvictExpiredClients(db fdb.Database, fsName string, opts EvictExpiredClient
 	}
 
 	return nEvicted, nil
+}
+
+func GetObjectStorageSpec(db fdb.Database, fsName string) (string, error) {
+	v, err := db.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
+		if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() == nil {
+			return nil, ErrNotFormatted
+		}
+		v := tx.Get(tuple.Tuple{"hafs", fsName, "object-storage"}).MustGet()
+		return string(v), nil
+	})
+	if err != nil {
+		return "", err
+	}
+	return v.(string), nil
+}
+
+type SetObjectStorageSpecOpts struct {
+	Force bool
+}
+
+func SetObjectStorageSpec(db fdb.Database, fsName string, objectStorageSpec string, opts SetObjectStorageSpecOpts) error {
+
+	objectStorage, err := NewObjectStorageEngine(objectStorageSpec)
+	if err != nil {
+		return fmt.Errorf("unable to validate storage engine spec: %w", err)
+	}
+	defer objectStorage.Close()
+
+	_, err = db.Transact(func(tx fdb.Transaction) (interface{}, error) {
+		if tx.Get(tuple.Tuple{"hafs", fsName, "version"}).MustGet() == nil {
+			return nil, ErrNotFormatted
+		}
+		kvs := tx.GetRange(tuple.Tuple{"hafs", fsName, "clients"}, fdb.RangeOptions{
+			Limit: 1,
+		}).GetSliceOrPanic()
+		if len(kvs) != 0 && !opts.Force {
+			return nil, fmt.Errorf("unable to set object storage with active clients without the 'force' option")
+		}
+		tx.Set(tuple.Tuple{"hafs", fsName, "object-storage"}, []byte(objectStorageSpec))
+		return nil, nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
