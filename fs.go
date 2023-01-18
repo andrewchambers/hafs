@@ -1278,7 +1278,6 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 			ino: stat.Ino,
 		}
 	} else {
-
 		if stat.Size == 0 {
 			tmpFile, err := os.CreateTemp("", "")
 			if err != nil {
