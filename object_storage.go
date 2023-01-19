@@ -21,6 +21,7 @@ type ReaderAtCloser interface {
 
 type ObjectStorageEngine interface {
 	Open(fs string, inode uint64) (ReaderAtCloser, bool, error)
+	ReadAll(fs string, inode uint64, w io.Writer) (bool, error)
 	Write(fs string, inode uint64, data *os.File) (int64, error)
 	Remove(fs string, inode uint64) error
 	Close() error
@@ -32,6 +33,10 @@ type unconfiguredStorageEngine struct{}
 
 func (s *unconfiguredStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
 	return nil, false, ErrStorageEngineNotConfigured
+}
+
+func (s *unconfiguredStorageEngine) ReadAll(fs string, inode uint64, w io.Writer) (bool, error) {
+	return false, ErrStorageEngineNotConfigured
 }
 
 func (s *unconfiguredStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
@@ -72,6 +77,22 @@ func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64
 		return n, err
 	}
 	return n, f.Sync()
+}
+
+func (s *fileStorageEngine) ReadAll(fs string, inode uint64, w io.Writer) (bool, error) {
+	f, err := os.Open(fmt.Sprintf("%s/%016x.%s", s.path, inode, fs))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer f.Close()
+	_, err = io.Copy(w, f)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *fileStorageEngine) Remove(fs string, inode uint64) error {
@@ -143,6 +164,27 @@ func (s *s3StorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, e
 		obj:           obj,
 		currentOffset: 0,
 	}, true, nil
+}
+
+func (s *s3StorageEngine) ReadAll(fs string, inode uint64, w io.Writer) (bool, error) {
+	obj, err := s.client.GetObject(
+		context.Background(),
+		s.bucket,
+		fmt.Sprintf("%s%016x.%s", s.path, inode, fs),
+		minio.GetObjectOptions{},
+	)
+	defer obj.Close()
+	if err != nil {
+		if minio.ToErrorResponse(err).StatusCode == 404 {
+			return false, nil
+		}
+		return false, err
+	}
+	_, err = io.Copy(w, obj)
+	if err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (s *s3StorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {

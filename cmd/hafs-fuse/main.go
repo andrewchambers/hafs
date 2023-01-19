@@ -23,6 +23,7 @@ func main() {
 	cli.RegisterClusterFileFlag()
 	cli.RegisterClientDescriptionFlag()
 	cli.RegisterFsNameFlag()
+	cli.RegisterSmallObjectOptimizationThresholdFlag()
 	debugFuse := flag.Bool("debug-fuse", false, "Log fuse messages.")
 	gcUnlinkedInterval := flag.Duration("gc-unlinked-interval", 8*time.Hour, "Unlinked inode garbage collection interval (0 to disable).")
 	unlinkRemovalDelay := flag.Duration("unlink-removal-delay", 15*time.Minute, "Grace period for removal of unlinked files.")

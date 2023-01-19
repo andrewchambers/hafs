@@ -263,7 +263,7 @@ func TestObjectStorageWriteOnce(t *testing.T) {
 
 	storageDir := t.TempDir()
 
-	err := SetObjectStorage(db, "testfs", "file://"+storageDir, SetObjectStorageOpts{})
+	err := SetObjectStorageSpec(db, "testfs", "file://"+storageDir, SetObjectStorageSpecOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -310,13 +310,93 @@ func TestObjectStorageWriteOnce(t *testing.T) {
 
 }
 
+func TestObjectStorageReadWrite(t *testing.T) {
+	t.Parallel()
+	db := tmpDB(t)
+
+	storageDir := t.TempDir()
+
+	err := SetObjectStorageSpec(db, "testfs", "file://"+storageDir, SetObjectStorageSpecOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	smallObjectOptimizationThreshold := int64(1024)
+
+	fs, err := Attach(db, "testfs", AttachOpts{
+		SmallObjectOptimizationThreshold: uint64(smallObjectOptimizationThreshold),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fs.Close()
+
+	err = fs.SetXAttr(ROOT_INO, "hafs.object-storage", []byte("true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for i, sz := range []int64{1, 2, 10, smallObjectOptimizationThreshold, smallObjectOptimizationThreshold * 2} {
+
+		f, stat, err := fs.CreateFile(ROOT_INO, fmt.Sprintf("f%d", i), CreateFileOpts{
+			Mode: 0o777,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+
+		expectedBuffer := make([]byte, 0, sz)
+		for j := int64(0); j < sz; j += 1 {
+			expectedBuffer = append(expectedBuffer, byte(j%256))
+		}
+
+		_, err = f.WriteData(expectedBuffer, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		f, stat, err = fs.OpenFile(stat.Ino, OpenFileOpts{})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer f.Close()
+
+		buf := make([]byte, sz*2, sz*2)
+
+		n, err := f.ReadData(buf, 0)
+		if err != io.EOF {
+			t.Fatal(err)
+		}
+		if int64(n) != sz {
+			t.Fatal(n)
+		}
+
+		if !bytes.Equal(buf[:n], expectedBuffer) {
+			t.Fatal(buf)
+		}
+
+		if sz < smallObjectOptimizationThreshold {
+			_ = f.(*objectStoreSmallReadOnlyFile)
+		} else {
+			_ = f.(*objectStoreReadOnlyFile)
+		}
+	}
+
+}
+
 func TestObjectStorageUnlink(t *testing.T) {
 	t.Parallel()
 	db := tmpDB(t)
 
 	storageDir := t.TempDir()
 
-	err := SetObjectStorage(db, "testfs", "file://"+storageDir, SetObjectStorageOpts{})
+	err := SetObjectStorageSpec(db, "testfs", "file://"+storageDir, SetObjectStorageSpecOpts{})
 	if err != nil {
 		t.Fatal(err)
 	}

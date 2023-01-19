@@ -212,7 +212,16 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 		return fs.errToFuseStatus(err)
 	}
 
-	out.OpenFlags |= fuse.FOPEN_DIRECT_IO
+	switch f.(type) {
+	case *objectStoreSmallReadOnlyFile:
+		// For now only the small read only files support readahead,
+		// and are immutable plus cacheable. The streaming files
+		// can't do this because the kernel readahead makes the
+		// read offset bounce around.
+		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
+	default:
+		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
+	}
 
 	out.Fh = fs.newFileHandle(&openFile{f: f})
 

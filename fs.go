@@ -185,15 +185,16 @@ func (stat *Stat) Ctime() time.Time {
 }
 
 type Fs struct {
-	db             fdb.Database
-	fsName         string
-	clientId       string
-	onEviction     func(fs *Fs)
-	clientDetached atomicBool
-	txCounter      atomicUint64
-	inoChan        chan uint64
-	relMtime       time.Duration
-	objectStorage  ObjectStorageEngine
+	db                   fdb.Database
+	fsName               string
+	clientId             string
+	onEviction           func(fs *Fs)
+	clientDetached       atomicBool
+	txCounter            atomicUint64
+	inoChan              chan uint64
+	relMtime             time.Duration
+	smallObjectThreshold uint64
+	objectStorage        ObjectStorageEngine
 
 	workerWg      *sync.WaitGroup
 	cancelWorkers func()
@@ -260,9 +261,12 @@ func ListFilesystems(db fdb.Database) ([]string, error) {
 
 type AttachOpts struct {
 	ClientDescription string
-	OnEviction        func(fs *Fs)
-	Logf              func(string, ...interface{})
-	RelMtime          *time.Duration
+	// External storage objects smaller than this are loaded into and
+	// served from memory - this is purely an optimization.
+	SmallObjectOptimizationThreshold uint64
+	OnEviction                       func(fs *Fs)
+	Logf                             func(string, ...interface{})
+	RelMtime                         *time.Duration
 }
 
 func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
@@ -346,16 +350,17 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 
 	fs := &Fs{
-		db:            db,
-		fsName:        fsName,
-		onEviction:    opts.OnEviction,
-		logf:          opts.Logf,
-		relMtime:      *opts.RelMtime,
-		clientId:      clientId,
-		cancelWorkers: cancelWorkers,
-		objectStorage: objectStorage,
-		workerWg:      &sync.WaitGroup{},
-		inoChan:       make(chan uint64, _INO_CHAN_SIZE),
+		db:                   db,
+		fsName:               fsName,
+		onEviction:           opts.OnEviction,
+		logf:                 opts.Logf,
+		relMtime:             *opts.RelMtime,
+		clientId:             clientId,
+		cancelWorkers:        cancelWorkers,
+		objectStorage:        objectStorage,
+		smallObjectThreshold: opts.SmallObjectOptimizationThreshold,
+		workerWg:             &sync.WaitGroup{},
+		inoChan:              make(chan uint64, _INO_CHAN_SIZE),
 	}
 
 	fs.workerWg.Add(1)
@@ -920,11 +925,6 @@ type HafsFile interface {
 	Close() error
 }
 
-type foundationDBFile struct {
-	fs  *Fs
-	ino uint64
-}
-
 func zeroTrimChunk(chunk []byte) []byte {
 	i := len(chunk) - 1
 	for ; i >= 0; i-- {
@@ -939,6 +939,11 @@ var _zeroChunk [CHUNK_SIZE]byte
 
 func zeroExpandChunk(chunk *[]byte) {
 	*chunk = append(*chunk, _zeroChunk[len(*chunk):CHUNK_SIZE]...)
+}
+
+type foundationDBFile struct {
+	fs  *Fs
+	ino uint64
 }
 
 func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) {
@@ -1151,6 +1156,50 @@ func (f *objectStoreReadOnlyFile) Close() error {
 	return f.storageObject.Close()
 }
 
+type objectStoreSmallReadOnlyFile struct {
+	fs             *Fs
+	ino            uint64
+	size           uint64
+	readObjectOnce sync.Once
+	objectError    error
+	objectData     *bytes.Reader
+}
+
+func (f *objectStoreSmallReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
+	return 0, ErrNotSupported
+}
+
+func (f *objectStoreSmallReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
+	// Lazily read the data.
+	f.readObjectOnce.Do(func() {
+		buf := bytes.NewBuffer(make([]byte, 0, f.size))
+		ok, err := f.fs.objectStorage.ReadAll(f.fs.fsName, f.ino, buf)
+		if err != nil {
+			f.objectError = err
+			return
+		}
+		if !ok {
+			f.objectData = bytes.NewReader(make([]byte, f.size, f.size))
+			return
+		}
+		f.objectData = bytes.NewReader(buf.Bytes())
+		return
+	})
+	if f.objectError != nil {
+		return 0, f.objectError
+	}
+	n, err := f.objectData.ReadAt(buf, int64(offset))
+	return uint32(n), err
+}
+
+func (f *objectStoreSmallReadOnlyFile) Fsync() error {
+	return nil
+}
+
+func (f *objectStoreSmallReadOnlyFile) Close() error {
+	return nil
+}
+
 type objectStoreReadWriteFile struct {
 	fs      *Fs
 	dirty   atomicBool
@@ -1225,13 +1274,10 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 	return nil
 }
 
-func (f *objectStoreReadWriteFile) Flush() error {
-	return f.Fsync()
-}
-
 func (f *objectStoreReadWriteFile) Close() error {
+	err := f.Fsync()
 	_ = f.tmpFile.Close()
-	return nil
+	return err
 }
 
 type OpenFileOpts struct {
@@ -1296,15 +1342,23 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 				tmpFile: tmpFile,
 			}
 		} else {
-			storageObject, exists, err := fs.objectStorage.Open(fs.fsName, stat.Ino)
-			if err != nil {
-				return nil, Stat{}, err
-			}
-			if !exists {
-				f = &zeroFile{size: stat.Size}
+			if stat.Size >= fs.smallObjectThreshold {
+				storageObject, exists, err := fs.objectStorage.Open(fs.fsName, stat.Ino)
+				if err != nil {
+					return nil, Stat{}, err
+				}
+				if !exists {
+					f = &zeroFile{size: stat.Size}
+				} else {
+					f = &objectStoreReadOnlyFile{
+						storageObject: storageObject,
+					}
+				}
 			} else {
-				f = &objectStoreReadOnlyFile{
-					storageObject: storageObject,
+				f = &objectStoreSmallReadOnlyFile{
+					fs:   fs,
+					ino:  stat.Ino,
+					size: stat.Size,
 				}
 			}
 		}

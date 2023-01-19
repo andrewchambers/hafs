@@ -14,6 +14,7 @@ import (
 var FsName string
 var ClientDescription string
 var ClusterFile string
+var SmallObjectOptimizationThreshold uint64 = 1024 * 1024 * 4
 
 func RegisterClusterFileFlag() {
 	defaultClusterFile := os.Getenv("FDB_CLUSTER_FILE")
@@ -51,6 +52,15 @@ func RegisterFsNameFlag() {
 	)
 }
 
+func RegisterSmallObjectOptimizationThresholdFlag() {
+	flag.Uint64Var(
+		&SmallObjectOptimizationThreshold,
+		"small-object-optimization-threshold",
+		SmallObjectOptimizationThreshold,
+		"External object storage files smaller than this size in bytes are loaded and served from ram instead of streamed.",
+	)
+}
+
 func RegisterFsSignalHandlers(fs *hafs.Fs) {
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, unix.SIGINT, unix.SIGTERM)
@@ -79,7 +89,8 @@ func MustOpenDatabase() fdb.Database {
 
 func MustAttach(db fdb.Database) *hafs.Fs {
 	fs, err := hafs.Attach(db, FsName, hafs.AttachOpts{
-		ClientDescription: ClientDescription,
+		ClientDescription:                ClientDescription,
+		SmallObjectOptimizationThreshold: SmallObjectOptimizationThreshold,
 		OnEviction: func(fs *hafs.Fs) {
 			fmt.Fprintf(os.Stderr, "client evicted, aborting...\n")
 			os.Exit(1)
