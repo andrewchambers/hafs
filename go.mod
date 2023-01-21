@@ -32,3 +32,5 @@ require (
 	golang.org/x/xerrors v0.0.0-20191204190536-9bdfabe68543 // indirect
 	gopkg.in/ini.v1 v1.66.6 // indirect
 )
+
+replace github.com/hanwen/go-fuse/v2 => github.com/andrewchambers/go-fuse/v2 v2.0.0-20230121043514-3c9647baf8ee
