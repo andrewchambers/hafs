@@ -356,6 +356,11 @@ func TestObjectStorageReadWrite(t *testing.T) {
 			t.Fatal(err)
 		}
 
+		err = f.Fsync()
+		if err != nil {
+			t.Fatal(err)
+		}
+
 		err = f.Close()
 		if err != nil {
 			t.Fatal(err)
