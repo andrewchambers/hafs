@@ -1279,9 +1279,8 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 }
 
 func (f *objectStoreReadWriteFile) Close() error {
-	err := f.Fsync()
 	_ = f.tmpFile.Close()
-	return err
+	return nil
 }
 
 type OpenFileOpts struct {

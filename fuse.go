@@ -317,7 +317,6 @@ func (fs *FuseFs) Fsync(cancel <-chan struct{}, in *fuse.FsyncIn) fuse.Status {
 	if err != nil {
 		return fs.errToFuseStatus(err)
 	}
-	// XXX are we supposed to release locks here or in release.
 	return fuse.OK
 }
 
