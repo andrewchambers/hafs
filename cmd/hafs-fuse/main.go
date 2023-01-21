@@ -63,7 +63,7 @@ func main() {
 			Debug:                *debugFuse,
 			DisableReadDirPlus:   !*readdirPlus,
 			MaxWrite:             fuse.MAX_KERNEL_WRITE,
-			MaxReadAhead:         4 * 1024 * 1024, // XXX what is a good value for this?
+			MaxReadAhead:         fuse.MAX_KERNEL_WRITE, // XXX Use the max write as a guide for now, is this good?
 		})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create fuse server: %s\n", err)
