@@ -338,7 +338,6 @@ func (fs *FuseFs) Flush(cancel <-chan struct{}, in *fuse.FlushIn) fuse.Status {
 		// We *could* implement the full semantics, but at increased complexity, reduced
 		// performance, and mainly to support potentially questionable use cases. For now
 		// we will instead document our semantics and keep it simple.
-		f.maybeHasPosixLock.Store(false)
 		fs.releaseLocks(in.NodeId, in.LockOwner)
 	}
 	return fs.errToFuseStatus(fsyncErr)
