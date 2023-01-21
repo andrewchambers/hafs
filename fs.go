@@ -1007,7 +1007,9 @@ func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) 
 
 		if stat.Size < offset+nWritten {
 			newSize := offset + nWritten
-			f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(newSize)-int64(stat.Size))
+			if stat.Nlink != 0 {
+				f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(newSize)-int64(stat.Size))
+			}
 			stat.Size = newSize
 		}
 		stat.SetMtime(time.Now())
@@ -1244,7 +1246,9 @@ func (f *objectStoreReadWriteFile) Fsync() error {
 		nLink = stat.Nlink
 
 		stat.Size = uint64(tmpFileStat.Size())
-		f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(stat.Size))
+		if stat.Nlink != 0 {
+			f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(stat.Size))
+		}
 		f.fs.txSetStat(tx, stat)
 		return nil, nil
 	})
@@ -1549,7 +1553,9 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 
 	if opts.Valid&MODSTAT_SIZE != 0 {
 
-		fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(opts.Size)-int64(stat.Size))
+		if stat.Nlink != 0 {
+			fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(opts.Size)-int64(stat.Size))
+		}
 		stat.Size = opts.Size
 
 		if stat.Mode&S_IFMT != S_IFREG {
