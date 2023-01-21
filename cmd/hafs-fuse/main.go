@@ -25,6 +25,7 @@ func main() {
 	cli.RegisterFsNameFlag()
 	cli.RegisterSmallObjectOptimizationThresholdFlag()
 	debugFuse := flag.Bool("debug-fuse", false, "Log fuse messages.")
+	readdirPlus := flag.Bool("readdir-plus", false, "Enable readdir plus when listing directories (stat and readdir calls are batched together).")
 	gcUnlinkedInterval := flag.Duration("gc-unlinked-interval", 8*time.Hour, "Unlinked inode garbage collection interval (0 to disable).")
 	unlinkRemovalDelay := flag.Duration("unlink-removal-delay", 15*time.Minute, "Grace period for removal of unlinked files.")
 	gcClientInterval := flag.Duration("gc-clients-interval", 24*time.Hour, "Client eviction interval (0 to disable).")
@@ -60,7 +61,9 @@ func main() {
 			EnableLocks:          true,
 			IgnoreSecurityLabels: true, // option?
 			Debug:                *debugFuse,
+			DisableReadDirPlus:   !*readdirPlus,
 			MaxWrite:             fuse.MAX_KERNEL_WRITE,
+			MaxReadAhead:         4 * 1024 * 1024, // XXX what is a good value for this?
 		})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "unable to create fuse server: %s\n", err)

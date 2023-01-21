@@ -711,7 +711,9 @@ func TestDirIter(t *testing.T) {
 	t.Parallel()
 	fs := tmpFs(t)
 
-	for i := 0; i < 500; i += 1 {
+	const COUNT = _DIR_ITER_BATCH_SIZE*3 + _DIR_ITER_BATCH_SIZE/3
+
+	for i := 0; i < COUNT; i += 1 {
 		_, err := fs.Mknod(ROOT_INO, fmt.Sprintf("a%d", i), MknodOpts{
 			Mode: S_IFDIR | 0o777,
 			Uid:  0,
@@ -739,7 +741,7 @@ func TestDirIter(t *testing.T) {
 		count += 1
 	}
 
-	if count != 500 {
+	if count != COUNT {
 		t.Fatalf("unexpected count: %d", count)
 	}
 }
@@ -748,7 +750,9 @@ func TestDirIterPlus(t *testing.T) {
 	t.Parallel()
 	fs := tmpFs(t)
 
-	for i := 0; i < 500; i += 1 {
+	const COUNT = _DIR_ITER_BATCH_SIZE*2 + 57
+
+	for i := 0; i < COUNT; i += 1 {
 		_, err := fs.Mknod(ROOT_INO, fmt.Sprintf("a%d", i), MknodOpts{
 			Mode: S_IFDIR | 0o777,
 			Uid:  0,
@@ -779,7 +783,7 @@ func TestDirIterPlus(t *testing.T) {
 		count += 1
 	}
 
-	if count != 500 {
+	if count != COUNT {
 		t.Fatalf("unexpected count: %d", count)
 	}
 }

@@ -1746,13 +1746,14 @@ type DirIter struct {
 	done       bool
 }
 
+const _DIR_ITER_BATCH_SIZE = 512
+
 func (di *DirIter) fill() error {
-	const BATCH_SIZE = 512
 
 	_, err := di.fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 
 		kvs := tx.GetRange(di.iterRange, fdb.RangeOptions{
-			Limit: BATCH_SIZE,
+			Limit: _DIR_ITER_BATCH_SIZE,
 		}).GetSliceOrPanic()
 
 		if len(kvs) != 0 {
@@ -1807,7 +1808,7 @@ func (di *DirIter) fill() error {
 				}
 				stats = append(stats, stat)
 			}
-			if len(ents) < BATCH_SIZE {
+			if len(ents) < _DIR_ITER_BATCH_SIZE {
 				di.done = true
 			}
 			di.stats = stats
