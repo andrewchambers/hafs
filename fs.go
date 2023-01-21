@@ -787,6 +787,7 @@ func (fs *Fs) HardLink(dirIno, ino uint64, name string) (Stat, error) {
 
 		stat.Nlink += 1
 		if stat.Nlink == 0 {
+			// Nlink overflow.
 			return Stat{}, ErrInvalid
 		}
 
@@ -1686,6 +1687,8 @@ func (fs *Fs) Rename(fromDirIno, toDirIno uint64, fromName, toName string) error
 			fs.txSetStat(tx, toStat)
 
 			if toStat.Nlink == 0 {
+				fs.txSubvolumeByteDelta(tx, toStat.Subvolume, -int64(toStat.Size))
+				fs.txSubvolumeInodeDelta(tx, toStat.Subvolume, -1)
 				tx.Set(tuple.Tuple{"hafs", fs.fsName, "unlinked", toStat.Ino}, []byte{})
 			}
 		}

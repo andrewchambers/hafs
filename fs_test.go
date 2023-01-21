@@ -520,13 +520,37 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	_, err = fs.Mknod(ROOT_INO, "bar1", MknodOpts{
-		Mode: S_IFREG | 0o777,
-		Uid:  0,
-		Gid:  0,
+	f, _, err := fs.CreateFile(ROOT_INO, "bar1", CreateFileOpts{
+		Mode: 0o777,
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+
+	_, err = f.WriteData([]byte{1, 2, 3, 4, 5}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = f.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	bcnt, err := fs.SubvolumeByteCount(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bcnt != 5 {
+		t.Fatal(bcnt)
+	}
+
+	icnt, err := fs.SubvolumeInodeCount(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if icnt != 2 {
+		t.Fatal(icnt)
 	}
 
 	err = fs.Rename(ROOT_INO, ROOT_INO, "foo1", "bar1")
@@ -557,6 +581,22 @@ func TestRenameSameDirOverwrite(t *testing.T) {
 
 	if nRemoved != 1 {
 		t.Fatal("expected file to be removed")
+	}
+
+	bcnt, err = fs.SubvolumeByteCount(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bcnt != 0 {
+		t.Fatal(bcnt)
+	}
+
+	icnt, err = fs.SubvolumeInodeCount(ROOT_INO)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if icnt != 1 {
+		t.Fatal(icnt)
 	}
 
 }
