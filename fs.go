@@ -843,6 +843,10 @@ func (fs *Fs) txSubvolumeCount(tx fdb.ReadTransaction, subvolume uint64, counter
 		}
 		v += int64(binary.LittleEndian.Uint64(kv.Value))
 	}
+	if v < 0 {
+		// Underflow - this must be caused by a bug in our accounting.
+		v = 0
+	}
 	return uint64(v), nil
 }
 
