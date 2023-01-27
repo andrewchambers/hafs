@@ -106,7 +106,7 @@ func (fs *FuseFs) fillFuseAttrFromStat(stat *Stat, out *fuse.Attr) {
 	out.Ino = stat.Ino
 	out.Size = stat.Size
 	out.Blocks = stat.Size / 512
-	out.Blksize = CHUNK_SIZE
+	out.Blksize = PAGE_SIZE
 	out.Atime = stat.Atimesec
 	out.Atimensec = stat.Atimensec
 	out.Mtime = stat.Mtimesec
@@ -213,11 +213,8 @@ func (fs *FuseFs) Open(cancel <-chan struct{}, in *fuse.OpenIn, out *fuse.OpenOu
 	}
 
 	switch f.(type) {
-	case *objectStoreSmallReadOnlyFile:
-		// For now only the small read only files support readahead,
-		// and are immutable plus cacheable. The streaming files
-		// can't do this because the kernel readahead makes the
-		// read offset bounce around.
+	case *objectStoreReadOnlyFile:
+		// Object store files are immutable, cacheable and support readahead.
 		out.OpenFlags |= fuse.FOPEN_KEEP_CACHE
 	default:
 		out.OpenFlags |= fuse.FOPEN_DIRECT_IO
@@ -646,9 +643,9 @@ func (fs *FuseFs) StatFs(cancel <-chan struct{}, in *fuse.InHeader, out *fuse.St
 		return fs.errToFuseStatus(err)
 	}
 
-	out.Bsize = CHUNK_SIZE
-	out.Blocks = stats.UsedBytes / CHUNK_SIZE
-	out.Bfree = stats.FreeBytes / CHUNK_SIZE
+	out.Bsize = PAGE_SIZE
+	out.Blocks = stats.UsedBytes / PAGE_SIZE
+	out.Bfree = stats.FreeBytes / PAGE_SIZE
 	out.Bavail = out.Bfree
 	out.NameLen = 4096
 

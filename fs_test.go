@@ -2,6 +2,7 @@ package hafs
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -13,6 +14,7 @@ import (
 
 	"github.com/apple/foundationdb/bindings/go/src/fdb"
 	"github.com/apple/foundationdb/bindings/go/src/fdb/tuple"
+	"golang.org/x/sync/errgroup"
 )
 
 func tmpFs(t *testing.T) *Fs {
@@ -257,7 +259,7 @@ func TestUnlink(t *testing.T) {
 	}
 }
 
-func TestObjectStorageWriteOnce(t *testing.T) {
+func TestObjectStorageOnlyWriteOnce(t *testing.T) {
 	t.Parallel()
 	db := tmpDB(t)
 
@@ -306,91 +308,6 @@ func TestObjectStorageWriteOnce(t *testing.T) {
 	_, err = f2.WriteData([]byte{1}, 0)
 	if err == nil {
 		t.Fatal(err)
-	}
-
-}
-
-func TestObjectStorageReadWrite(t *testing.T) {
-	t.Parallel()
-	db := tmpDB(t)
-
-	storageDir := t.TempDir()
-
-	err := SetObjectStorageSpec(db, "testfs", "file://"+storageDir, SetObjectStorageSpecOpts{})
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	smallObjectOptimizationThreshold := int64(1024)
-
-	fs, err := Attach(db, "testfs", AttachOpts{
-		SmallObjectOptimizationThreshold: uint64(smallObjectOptimizationThreshold),
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer fs.Close()
-
-	err = fs.SetXAttr(ROOT_INO, "hafs.object-storage", []byte("true"))
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	for i, sz := range []int64{1, 2, 10, smallObjectOptimizationThreshold, smallObjectOptimizationThreshold * 2} {
-
-		f, stat, err := fs.CreateFile(ROOT_INO, fmt.Sprintf("f%d", i), CreateFileOpts{
-			Mode: 0o777,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer f.Close()
-
-		expectedBuffer := make([]byte, 0, sz)
-		for j := int64(0); j < sz; j += 1 {
-			expectedBuffer = append(expectedBuffer, byte(j%256))
-		}
-
-		_, err = f.WriteData(expectedBuffer, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		err = f.Fsync()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		err = f.Close()
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		f, stat, err = fs.OpenFile(stat.Ino, OpenFileOpts{})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer f.Close()
-
-		buf := make([]byte, sz*2, sz*2)
-
-		n, err := f.ReadData(buf, 0)
-		if err != io.EOF {
-			t.Fatal(err)
-		}
-		if int64(n) != sz {
-			t.Fatal(n)
-		}
-
-		if !bytes.Equal(buf[:n], expectedBuffer) {
-			t.Fatal(buf)
-		}
-
-		if sz < smallObjectOptimizationThreshold {
-			_ = f.(*objectStoreSmallReadOnlyFile)
-		} else {
-			_ = f.(*objectStoreReadOnlyFile)
-		}
 	}
 
 }
@@ -788,136 +705,16 @@ func TestDirIterPlus(t *testing.T) {
 	}
 }
 
-func TestWriteDataOneChunk(t *testing.T) {
-	t.Parallel()
-	fs := tmpFs(t)
-
-	testSizes := []uint64{0, 1, 3, CHUNK_SIZE - 1, CHUNK_SIZE}
-
-	for i, n := range testSizes {
-		name := fmt.Sprintf("d%d", i)
-		f, stat, err := fs.CreateFile(ROOT_INO, name, CreateFileOpts{
-			Mode: 0o777,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		data := make([]byte, n, n)
-
-		for j := 0; j < len(data); j += 1 {
-			data[j] = byte(j % 256)
-		}
-
-		nWritten, err := f.WriteData(data, 0)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if nWritten != uint32(len(data)) {
-			t.Fatalf("unexpected write amount %d != %d", nWritten, len(data))
-		}
-
-		fetchedData, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 0}).MustGet()
-			zeroExpandChunk(&data)
-			return data, nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if len(fetchedData.([]byte)) != CHUNK_SIZE {
-			t.Fatalf("unexpected chunk size: %d", fetchedData)
-		}
-
-		if !bytes.Equal(data, fetchedData.([]byte)[:len(data)]) {
-			t.Fatalf("%v != %v", data, fetchedData)
-		}
-
-	}
-}
-
-func TestWriteDataTwoChunks(t *testing.T) {
-	t.Parallel()
-	fs := tmpFs(t)
-
-	testSizes := []uint64{CHUNK_SIZE + 1, CHUNK_SIZE + 3, CHUNK_SIZE * 2}
-
-	for i, n := range testSizes {
-		name := fmt.Sprintf("d%d", i)
-		f, stat, err := fs.CreateFile(ROOT_INO, name, CreateFileOpts{
-			Mode: 0o777,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		data := make([]byte, n, n)
-
-		for j := 0; j < len(data); j += 1 {
-			data[j] = byte(j % 256)
-		}
-
-		data1 := data[:CHUNK_SIZE]
-		data2 := data[CHUNK_SIZE:]
-
-		nWritten := 0
-		for nWritten != len(data) {
-			n, err := f.WriteData(data[nWritten:], uint64(nWritten))
-			if err != nil {
-				t.Fatal(err)
-			}
-			nWritten += int(n)
-		}
-
-		fetchedData1, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 0}).MustGet()
-			zeroExpandChunk(&data)
-			return data, nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		fetchedData2, err := fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
-			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 1}).MustGet()
-			zeroExpandChunk(&data)
-			return data, nil
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if !bytes.Equal(data1, fetchedData1.([]byte)[:len(data1)]) {
-			t.Fatalf("%v != %v", data, fetchedData1)
-		}
-
-		if !bytes.Equal(data2, fetchedData2.([]byte)[:len(data2)]) {
-			t.Fatalf("%v != %v", data, fetchedData2)
-		}
-
-		stat, err = fs.GetStat(stat.Ino)
-		if err != nil {
-			t.Fatal(err)
-		}
-
-		if stat.Size != uint64(len(data)) {
-			t.Fatalf("unexpected size - %d != %d", stat.Size, len(data))
-		}
-
-	}
-}
-
 func TestTruncate(t *testing.T) {
 	t.Parallel()
 	fs := tmpFs(t)
 
 	testSizes := []uint64{
-		CHUNK_SIZE - 1,
-		CHUNK_SIZE + 1,
-		CHUNK_SIZE*2 - 1,
-		CHUNK_SIZE * 2,
-		CHUNK_SIZE*2 + 1,
+		PAGE_SIZE - 1,
+		PAGE_SIZE + 1,
+		PAGE_SIZE*2 - 1,
+		PAGE_SIZE * 2,
+		PAGE_SIZE*2 + 1,
 	}
 
 	for i, n := range testSizes {
@@ -957,11 +754,11 @@ func TestTruncate(t *testing.T) {
 		_, err = fs.ReadTransact(func(tx fdb.ReadTransaction) (interface{}, error) {
 			kvs := tx.GetRange(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data"}, fdb.RangeOptions{}).GetSliceOrPanic()
 			if len(kvs) != 1 {
-				t.Fatalf("bad number of data chunks: %d", len(kvs))
+				t.Fatalf("bad number of data pages: %d", len(kvs))
 			}
 			data := tx.Get(tuple.Tuple{"hafs", fs.fsName, "ino", stat.Ino, "data", 0}).MustGet()
-			zeroExpandChunk(&data)
-			if len(data) != CHUNK_SIZE {
+			zeroExpandPage(&data)
+			if len(data) != PAGE_SIZE {
 				t.Fatalf("bad data size: %d", len(data))
 			}
 			if !bytes.Equal(data[:5], []byte{0, 1, 2, 3, 4}) {
@@ -976,29 +773,46 @@ func TestTruncate(t *testing.T) {
 	}
 }
 
-func TestReadWriteData(t *testing.T) {
-	t.Parallel()
-	fs := tmpFs(t)
+func testReadWriteFile(t *testing.T, fs *Fs) {
+
+	// Disable for deterministic.
+	mathrand.Seed(time.Now().UnixNano())
+	tmpDir := t.TempDir()
+
+	const N_TESTS = 100
 
 	// Random writes at different offsets to exercise the sparse code paths.
-	for i := 0; i < 100; i++ {
-		f, stat, err := fs.CreateFile(ROOT_INO, "f", CreateFileOpts{
+	for i := 0; i < N_TESTS; i++ {
+		t.Logf("write file test %d/%d", i+1, N_TESTS)
+
+		fileName := fmt.Sprintf("f%d", i)
+
+		f, stat, err := fs.CreateFile(ROOT_INO, fileName, CreateFileOpts{
 			Mode: 0o777,
 		})
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		referenceFile, err := os.CreateTemp("", "")
+		referenceFile, err := os.CreateTemp(tmpDir, "")
 		if err != nil {
 			t.Fatal(err)
 		}
-		size := mathrand.Int()%(CHUNK_SIZE*3) + CHUNK_SIZE/2
-		nwrites := mathrand.Int() % 5
-		for i := 0; i < nwrites; i++ {
+
+		err = os.Remove(referenceFile.Name())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		size := mathrand.Int() % (64 * 1024)
+		nwrites := 1 + mathrand.Int()%10
+		for j := 0; j < nwrites; j++ {
 			writeOffset := mathrand.Int() % size
 			writeSize := mathrand.Int() % (size - writeOffset)
-			writeData := make([]byte, writeSize, writeSize)
+			if writeSize == 0 {
+				writeSize = 1
+			}
+			writeData := make([]byte, writeSize)
 			n, err := mathrand.Read(writeData)
 			if err != nil || n != len(writeData) {
 				t.Fatalf("%s %d", err, n)
@@ -1017,55 +831,128 @@ func TestReadWriteData(t *testing.T) {
 			}
 		}
 
-		referenceData, err := io.ReadAll(referenceFile)
+		err = f.Fsync()
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		stat, err = fs.Lookup(ROOT_INO, "f")
+		err = f.Close()
 		if err != nil {
 			t.Fatal(err)
 		}
 
-		if stat.Size != uint64(len(referenceData)) {
-			t.Fatalf("read lengths differ:\n%v\n!=%v\n", stat.Size, len(referenceData))
+		stat, err = fs.Lookup(ROOT_INO, fileName)
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		actualData := &bytes.Buffer{}
-		nRead := uint64(0)
-		readSize := (mathrand.Int() % 2 * CHUNK_SIZE) + 100
-		readBuf := make([]byte, readSize, readSize)
-		for {
-			n, err := f.ReadData(readBuf, nRead)
-			nRead += uint64(n)
-			_, _ = actualData.Write(readBuf[:n])
-			if err == io.EOF {
-				break
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if nRead > uint64(len(referenceData)) {
-				t.Fatalf("file too large - expected %d bytes, but read %d ", len(referenceData), nRead)
-			}
+		f, _, err = fs.OpenFile(stat.Ino, OpenFileOpts{})
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		if len(referenceData) != actualData.Len() {
-			t.Fatalf("read lengths differ:\n%v\n!=%v\n", len(referenceData), actualData.Len())
+		referenceStat, err := referenceFile.Stat()
+		if err != nil {
+			t.Fatal(err)
 		}
 
-		if !bytes.Equal(referenceData, actualData.Bytes()) {
-			t.Fatalf("read corrupt:\n%v\n!=%v\n", referenceData, actualData.Bytes())
+		if stat.Size != uint64(referenceStat.Size()) {
+			t.Fatalf("read lengths differ:\n%v\n!=%v\n", stat.Size, referenceStat.Size())
 		}
 
-		_ = referenceFile.Close()
+		errg, _ := errgroup.WithContext(context.Background())
+		const N_READS = 50
+		for j := 0; j < N_READS; j++ {
+			errg.Go(func() error {
+				readOffset := mathrand.Int63() % referenceStat.Size()
+				// Deliberately read past the end of the file to test that.
+				readSize := mathrand.Int63() % referenceStat.Size()
+				referenceData := make([]byte, readSize)
+				actualData := make([]byte, readSize)
 
-		err = fs.Unlink(ROOT_INO, "f")
+				n, err := referenceFile.ReadAt(referenceData, readOffset)
+				if err != nil {
+					if err != io.EOF {
+						return err
+					}
+				}
+				referenceData = referenceData[:n]
+
+				readBuf := actualData
+				totalRead := uint64(0)
+				for len(readBuf) != 0 {
+					n, err := f.ReadData(readBuf, uint64(readOffset))
+					readOffset += int64(n)
+					totalRead += uint64(n)
+					readBuf = readBuf[n:]
+					if err != nil {
+						if err == io.EOF {
+							break
+						}
+						return err
+					}
+				}
+
+				actualData = actualData[:totalRead]
+
+				if !bytes.Equal(referenceData, actualData) {
+					return errors.New("bytes differ")
+				}
+
+				return nil
+			})
+		}
+
+		err = errg.Wait()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = referenceFile.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = f.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		err = fs.Unlink(ROOT_INO, fileName)
 		if err != nil {
 			t.Fatal(err)
 		}
 	}
+}
 
+func TestReadWriteFdbFile(t *testing.T) {
+	t.Parallel()
+	testReadWriteFile(t, tmpFs(t))
+}
+
+func TestReadWriteObjectStorageFile(t *testing.T) {
+	t.Parallel()
+	db := tmpDB(t)
+
+	storageDir := t.TempDir()
+	err := SetObjectStorageSpec(db, "testfs", "file://"+storageDir, SetObjectStorageSpecOpts{})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	fs, err := Attach(db, "testfs", AttachOpts{
+		ObjectPartSize: 4096,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	err = fs.SetXAttr(ROOT_INO, "hafs.object-storage", []byte("true"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	testReadWriteFile(t, fs)
 }
 
 func TestSetLock(t *testing.T) {

@@ -4,7 +4,6 @@ in
   pkgs.mkShell {
     buildInputs = [
       pkgs.go
-      pkgs.gotools
       ((pkgs.callPackage ./foundationdb.nix) {})
     ];
   }

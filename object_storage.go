@@ -8,20 +8,13 @@ import (
 	"net/url"
 	"os"
 	"strings"
-	"sync"
 
 	"github.com/minio/minio-go/v7"
 	miniocredentials "github.com/minio/minio-go/v7/pkg/credentials"
 )
 
-type ReaderAtCloser interface {
-	io.ReaderAt
-	io.Closer
-}
-
 type ObjectStorageEngine interface {
-	Open(fs string, inode uint64) (ReaderAtCloser, bool, error)
-	ReadAll(fs string, inode uint64, w io.Writer) (bool, error)
+	Read(fs string, inode uint64, offset uint64, buf []byte) (uint64, error)
 	Write(fs string, inode uint64, data *os.File) (int64, error)
 	Remove(fs string, inode uint64) error
 	Close() error
@@ -31,12 +24,8 @@ var ErrStorageEngineNotConfigured error = errors.New("storage engine not configu
 
 type unconfiguredStorageEngine struct{}
 
-func (s *unconfiguredStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
-	return nil, false, ErrStorageEngineNotConfigured
-}
-
-func (s *unconfiguredStorageEngine) ReadAll(fs string, inode uint64, w io.Writer) (bool, error) {
-	return false, ErrStorageEngineNotConfigured
+func (s *unconfiguredStorageEngine) Read(fs string, inode uint64, offset uint64, buf []byte) (uint64, error) {
+	return 0, ErrStorageEngineNotConfigured
 }
 
 func (s *unconfiguredStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
@@ -55,17 +44,6 @@ type fileStorageEngine struct {
 	path string
 }
 
-func (s *fileStorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
-	f, err := os.Open(fmt.Sprintf("%s/%016x.%s", s.path, inode, fs))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	return f, true, nil
-}
-
 func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {
 	f, err := os.Create(fmt.Sprintf("%s/%016x.%s", s.path, inode, fs))
 	if err != nil {
@@ -79,20 +57,20 @@ func (s *fileStorageEngine) Write(fs string, inode uint64, data *os.File) (int64
 	return n, f.Sync()
 }
 
-func (s *fileStorageEngine) ReadAll(fs string, inode uint64, w io.Writer) (bool, error) {
+func (s *fileStorageEngine) Read(fs string, inode uint64, offset uint64, buf []byte) (uint64, error) {
 	f, err := os.Open(fmt.Sprintf("%s/%016x.%s", s.path, inode, fs))
 	if err != nil {
 		if os.IsNotExist(err) {
-			return false, nil
+			for i := 0; i < len(buf); i += 1 {
+				buf[i] = 0
+			}
+			return uint64(len(buf)), nil
 		}
-		return false, err
+		return 0, err
 	}
 	defer f.Close()
-	_, err = io.Copy(w, f)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	n, err := f.ReadAt(buf, int64(offset))
+	return uint64(n), err
 }
 
 func (s *fileStorageEngine) Remove(fs string, inode uint64) error {
@@ -116,57 +94,7 @@ type s3StorageEngine struct {
 	client *minio.Client
 }
 
-// Wrapper around a minio object that implements ReaderAt in a nicer way than
-// the minio client does when it comes to sequential reading.
-type s3Reader struct {
-	lock          sync.Mutex
-	obj           *minio.Object
-	currentOffset int64
-}
-
-func (r *s3Reader) ReadAt(buf []byte, offset int64) (int, error) {
-	r.lock.Lock()
-	defer r.lock.Unlock()
-	if offset != r.currentOffset {
-		newOffset, err := r.obj.Seek(offset, io.SeekStart)
-		if err != nil {
-			r.currentOffset = ^0
-			return 0, err
-		}
-		r.currentOffset = newOffset
-	}
-	n, err := io.ReadFull(r.obj, buf)
-	r.currentOffset += int64(n)
-	if err == io.ErrUnexpectedEOF {
-		err = io.EOF
-	}
-	return n, err
-}
-
-func (r *s3Reader) Close() error {
-	return r.obj.Close()
-}
-
-func (s *s3StorageEngine) Open(fs string, inode uint64) (ReaderAtCloser, bool, error) {
-	obj, err := s.client.GetObject(
-		context.Background(),
-		s.bucket,
-		fmt.Sprintf("%s%016x.%s", s.path, inode, fs),
-		minio.GetObjectOptions{},
-	)
-	if err != nil {
-		if minio.ToErrorResponse(err).StatusCode == 404 {
-			return nil, false, nil
-		}
-		return nil, false, err
-	}
-	return &s3Reader{
-		obj:           obj,
-		currentOffset: 0,
-	}, true, nil
-}
-
-func (s *s3StorageEngine) ReadAll(fs string, inode uint64, w io.Writer) (bool, error) {
+func (s *s3StorageEngine) Read(fs string, inode uint64, offset uint64, buf []byte) (uint64, error) {
 	obj, err := s.client.GetObject(
 		context.Background(),
 		s.bucket,
@@ -176,15 +104,15 @@ func (s *s3StorageEngine) ReadAll(fs string, inode uint64, w io.Writer) (bool, e
 	defer obj.Close()
 	if err != nil {
 		if minio.ToErrorResponse(err).StatusCode == 404 {
-			return false, nil
+			for i := 0; i < len(buf); i += 1 {
+				buf[i] = 0
+			}
+			return uint64(len(buf)), nil
 		}
-		return false, err
+		return 0, err
 	}
-	_, err = io.Copy(w, obj)
-	if err != nil {
-		return false, err
-	}
-	return true, nil
+	n, err := obj.ReadAt(buf, int64(offset))
+	return uint64(n), err
 }
 
 func (s *s3StorageEngine) Write(fs string, inode uint64, data *os.File) (int64, error) {

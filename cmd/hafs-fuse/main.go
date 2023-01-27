@@ -23,7 +23,7 @@ func main() {
 	cli.RegisterClusterFileFlag()
 	cli.RegisterClientDescriptionFlag()
 	cli.RegisterFsNameFlag()
-	cli.RegisterSmallObjectOptimizationThresholdFlag()
+	cli.RegisterObjectPartSizeFlag()
 	debugFuse := flag.Bool("debug-fuse", false, "Log fuse messages.")
 	readdirPlus := flag.Bool("readdir-plus", false, "Enable readdir plus when listing directories (stat and readdir calls are batched together).")
 	gcUnlinkedInterval := flag.Duration("gc-unlinked-interval", 8*time.Hour, "Unlinked inode garbage collection interval (0 to disable).")

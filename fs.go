@@ -40,10 +40,11 @@ var (
 )
 
 const (
-	NAME_MAX               = 4096
-	CURRENT_SCHEMA_VERSION = 1
-	ROOT_INO               = 1
-	CHUNK_SIZE             = 4096
+	NAME_MAX                 = 4096
+	CURRENT_SCHEMA_VERSION   = 1
+	ROOT_INO                 = 1
+	PAGE_SIZE                = 4096
+	DEFAULT_OBJECT_PART_SIZE = 32 * 1024 * 1024
 )
 
 const (
@@ -194,6 +195,7 @@ type Fs struct {
 	inoChan              chan uint64
 	relMtime             time.Duration
 	smallObjectThreshold uint64
+	objectPartSize       uint64
 	objectStorage        ObjectStorageEngine
 
 	workerWg      *sync.WaitGroup
@@ -261,12 +263,11 @@ func ListFilesystems(db fdb.Database) ([]string, error) {
 
 type AttachOpts struct {
 	ClientDescription string
-	// External storage objects smaller than this are loaded into and
-	// served from memory - this is purely an optimization.
-	SmallObjectOptimizationThreshold uint64
-	OnEviction                       func(fs *Fs)
-	Logf                             func(string, ...interface{})
-	RelMtime                         *time.Duration
+	// Large objects are fetched incrementally in chunks of this size.
+	ObjectPartSize uint64
+	OnEviction     func(fs *Fs)
+	Logf           func(string, ...interface{})
+	RelMtime       *time.Duration
 }
 
 func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
@@ -278,6 +279,10 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 
 	if opts.Logf == nil {
 		opts.Logf = log.Printf
+	}
+
+	if opts.ObjectPartSize == 0 {
+		opts.ObjectPartSize = DEFAULT_OBJECT_PART_SIZE
 	}
 
 	hostname, _ := os.Hostname()
@@ -350,17 +355,17 @@ func Attach(db fdb.Database, fsName string, opts AttachOpts) (*Fs, error) {
 	workerCtx, cancelWorkers := context.WithCancel(context.Background())
 
 	fs := &Fs{
-		db:                   db,
-		fsName:               fsName,
-		onEviction:           opts.OnEviction,
-		logf:                 opts.Logf,
-		relMtime:             *opts.RelMtime,
-		clientId:             clientId,
-		cancelWorkers:        cancelWorkers,
-		objectStorage:        objectStorage,
-		smallObjectThreshold: opts.SmallObjectOptimizationThreshold,
-		workerWg:             &sync.WaitGroup{},
-		inoChan:              make(chan uint64, _INO_CHAN_SIZE),
+		db:             db,
+		fsName:         fsName,
+		onEviction:     opts.OnEviction,
+		logf:           opts.Logf,
+		relMtime:       *opts.RelMtime,
+		clientId:       clientId,
+		cancelWorkers:  cancelWorkers,
+		objectPartSize: opts.ObjectPartSize,
+		objectStorage:  objectStorage,
+		workerWg:       &sync.WaitGroup{},
+		inoChan:        make(chan uint64, _INO_CHAN_SIZE),
 	}
 
 	fs.workerWg.Add(1)
@@ -923,371 +928,6 @@ func (fs *Fs) Unlink(dirIno uint64, name string) error {
 	return err
 }
 
-type HafsFile interface {
-	WriteData([]byte, uint64) (uint32, error)
-	ReadData([]byte, uint64) (uint32, error)
-	Fsync() error
-	Close() error
-}
-
-func zeroTrimChunk(chunk []byte) []byte {
-	i := len(chunk) - 1
-	for ; i >= 0; i-- {
-		if chunk[i] != 0 {
-			break
-		}
-	}
-	return chunk[:i+1]
-}
-
-var _zeroChunk [CHUNK_SIZE]byte
-
-func zeroExpandChunk(chunk *[]byte) {
-	*chunk = append(*chunk, _zeroChunk[len(*chunk):CHUNK_SIZE]...)
-}
-
-type foundationDBFile struct {
-	fs  *Fs
-	ino uint64
-}
-
-func (f *foundationDBFile) WriteData(buf []byte, offset uint64) (uint32, error) {
-	const MAX_WRITE = 32 * CHUNK_SIZE
-
-	// FoundationDB has a transaction time limit and a transaction size limit,
-	// limit the write to something that can fit.
-	if len(buf) > MAX_WRITE {
-		buf = buf[:MAX_WRITE]
-	}
-
-	nWritten, err := f.fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-
-		futureStat := f.fs.txGetStat(tx, f.ino)
-		currentOffset := offset
-		remainingBuf := buf
-
-		// Deal with the first unaligned and undersized chunks.
-		if currentOffset%CHUNK_SIZE != 0 || len(remainingBuf) < CHUNK_SIZE {
-			firstChunkNo := currentOffset / CHUNK_SIZE
-			firstChunkOffset := currentOffset % CHUNK_SIZE
-			firstWriteCount := CHUNK_SIZE - firstChunkOffset
-			if firstWriteCount > uint64(len(buf)) {
-				firstWriteCount = uint64(len(buf))
-			}
-			firstChunkKey := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", firstChunkNo}
-			chunk := tx.Get(firstChunkKey).MustGet()
-			zeroExpandChunk(&chunk)
-			copy(chunk[firstChunkOffset:firstChunkOffset+firstWriteCount], remainingBuf)
-			currentOffset += firstWriteCount
-			remainingBuf = remainingBuf[firstWriteCount:]
-			tx.Set(firstChunkKey, zeroTrimChunk(chunk))
-		}
-
-		for {
-			key := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", currentOffset / CHUNK_SIZE}
-			if len(remainingBuf) >= CHUNK_SIZE {
-				tx.Set(key, zeroTrimChunk(remainingBuf[:CHUNK_SIZE]))
-				currentOffset += CHUNK_SIZE
-				remainingBuf = remainingBuf[CHUNK_SIZE:]
-			} else {
-				chunk := tx.Get(key).MustGet()
-				zeroExpandChunk(&chunk)
-				copy(chunk, remainingBuf)
-				tx.Set(key, zeroTrimChunk(chunk))
-				currentOffset += uint64(len(remainingBuf))
-				break
-			}
-		}
-
-		stat, err := futureStat.Get()
-		if err != nil {
-			return nil, err
-		}
-
-		if stat.Mode&S_IFMT != S_IFREG {
-			return nil, ErrInvalid
-		}
-
-		nWritten := currentOffset - offset
-
-		if stat.Size < offset+nWritten {
-			newSize := offset + nWritten
-			if stat.Nlink != 0 {
-				f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(newSize)-int64(stat.Size))
-			}
-			stat.Size = newSize
-		}
-		stat.SetMtime(time.Now())
-		f.fs.txSetStat(tx, stat)
-		return uint32(nWritten), nil
-	})
-	if err != nil {
-		return 0, err
-	}
-	return nWritten.(uint32), nil
-}
-func (f *foundationDBFile) ReadData(buf []byte, offset uint64) (uint32, error) {
-
-	const MAX_READ = 32 * CHUNK_SIZE
-
-	if len(buf) > MAX_READ {
-		buf = buf[:MAX_READ]
-	}
-
-	nRead, err := f.fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		currentOffset := offset
-		remainingBuf := buf
-
-		stat, err := f.fs.txGetStat(tx, f.ino).Get()
-		if err != nil {
-			return nil, err
-		}
-
-		if stat.Mode&S_IFMT != S_IFREG {
-			return nil, ErrInvalid
-		}
-
-		// Don't read past the end of the file.
-		if stat.Size < currentOffset+uint64(len(remainingBuf)) {
-			overshoot := (currentOffset + uint64(len(remainingBuf))) - stat.Size
-			if overshoot >= uint64(len(remainingBuf)) {
-				return 0, io.EOF
-			}
-			remainingBuf = remainingBuf[:uint64(len(remainingBuf))-overshoot]
-		}
-
-		// Deal with the first unaligned and undersized chunk.
-		if currentOffset%CHUNK_SIZE != 0 || len(remainingBuf) < CHUNK_SIZE {
-
-			firstChunkNo := currentOffset / CHUNK_SIZE
-			firstChunkOffset := currentOffset % CHUNK_SIZE
-			firstReadCount := CHUNK_SIZE - firstChunkOffset
-			if firstReadCount > uint64(len(remainingBuf)) {
-				firstReadCount = uint64(len(remainingBuf))
-			}
-
-			firstChunkKey := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", firstChunkNo}
-			chunk := tx.Get(firstChunkKey).MustGet()
-			if chunk != nil {
-				zeroExpandChunk(&chunk)
-				copy(remainingBuf[:firstReadCount], chunk[firstChunkOffset:firstChunkOffset+firstReadCount])
-			} else {
-				// Sparse read.
-				for i := uint64(0); i < firstReadCount; i += 1 {
-					remainingBuf[i] = 0
-				}
-			}
-			remainingBuf = remainingBuf[firstReadCount:]
-			currentOffset += firstReadCount
-		}
-
-		nChunks := uint64(len(remainingBuf)) / CHUNK_SIZE
-		if (len(remainingBuf) % CHUNK_SIZE) != 0 {
-			nChunks += 1
-		}
-		chunkFutures := make([]fdb.FutureByteSlice, 0, nChunks)
-
-		// Read all chunks in parallel using futures.
-		for i := uint64(0); i < nChunks; i++ {
-			key := tuple.Tuple{"hafs", f.fs.fsName, "ino", f.ino, "data", (currentOffset / CHUNK_SIZE) + i}
-			chunkFutures = append(chunkFutures, tx.Get(key))
-		}
-
-		for i := uint64(0); i < nChunks; i++ {
-			chunk := chunkFutures[i].MustGet()
-			zeroExpandChunk(&chunk)
-			n := copy(remainingBuf, chunk)
-			currentOffset += uint64(n)
-			remainingBuf = remainingBuf[n:]
-		}
-
-		nRead := currentOffset - offset
-
-		if (offset + nRead) == stat.Size {
-			return uint32(nRead), io.EOF
-		}
-
-		return uint32(nRead), nil
-	})
-	nReadInt, ok := nRead.(uint32)
-	if ok {
-		return nReadInt, err
-	} else {
-		return 0, err
-	}
-}
-func (f *foundationDBFile) Fsync() error { return nil }
-func (f *foundationDBFile) Close() error { return nil }
-
-type invalidFile struct{}
-
-func (f *invalidFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrInvalid }
-func (f *invalidFile) ReadData(buf []byte, offset uint64) (uint32, error)  { return 0, ErrInvalid }
-func (f *invalidFile) Fsync() error                                        { return ErrInvalid }
-func (f *invalidFile) Close() error                                        { return nil }
-
-type zeroFile struct {
-	size uint64
-}
-
-func (f *zeroFile) WriteData(buf []byte, offset uint64) (uint32, error) { return 0, ErrNotSupported }
-func (f *zeroFile) ReadData(buf []byte, offset uint64) (uint32, error) {
-	n := uint32(0)
-	for i := uint64(0); i < uint64(len(buf)) && offset+i < f.size; i++ {
-		buf[i] = 0
-		n += 1
-	}
-	return n, nil
-}
-func (f *zeroFile) Fsync() error { return nil }
-func (f *zeroFile) Close() error { return nil }
-
-type objectStoreReadOnlyFile struct {
-	storageObject ReaderAtCloser
-}
-
-func (f *objectStoreReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
-	return 0, ErrNotSupported
-}
-
-func (f *objectStoreReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
-	n, err := f.storageObject.ReadAt(buf, int64(offset))
-	return uint32(n), err
-}
-
-func (f *objectStoreReadOnlyFile) Fsync() error {
-	return nil
-}
-
-func (f *objectStoreReadOnlyFile) Close() error {
-	return f.storageObject.Close()
-}
-
-type objectStoreSmallReadOnlyFile struct {
-	fs             *Fs
-	ino            uint64
-	size           uint64
-	readObjectOnce sync.Once
-	objectError    error
-	objectData     *bytes.Reader
-}
-
-func (f *objectStoreSmallReadOnlyFile) WriteData(buf []byte, offset uint64) (uint32, error) {
-	return 0, ErrNotSupported
-}
-
-func (f *objectStoreSmallReadOnlyFile) ReadData(buf []byte, offset uint64) (uint32, error) {
-	// Lazily read the data.
-	f.readObjectOnce.Do(func() {
-		buf := bytes.NewBuffer(make([]byte, 0, f.size))
-		ok, err := f.fs.objectStorage.ReadAll(f.fs.fsName, f.ino, buf)
-		if err != nil {
-			f.objectError = err
-			return
-		}
-		if !ok {
-			f.objectData = bytes.NewReader(make([]byte, f.size, f.size))
-			return
-		}
-		f.objectData = bytes.NewReader(buf.Bytes())
-		return
-	})
-	if f.objectError != nil {
-		return 0, f.objectError
-	}
-	n, err := f.objectData.ReadAt(buf, int64(offset))
-	return uint32(n), err
-}
-
-func (f *objectStoreSmallReadOnlyFile) Fsync() error {
-	return nil
-}
-
-func (f *objectStoreSmallReadOnlyFile) Close() error {
-	return nil
-}
-
-type objectStoreReadWriteFile struct {
-	fs      *Fs
-	dirty   atomicBool
-	ino     uint64
-	tmpFile *os.File
-}
-
-func (f *objectStoreReadWriteFile) WriteData(buf []byte, offset uint64) (uint32, error) {
-	f.dirty.Store(true)
-	n, err := f.tmpFile.WriteAt(buf, int64(offset))
-	return uint32(n), err
-}
-
-func (f *objectStoreReadWriteFile) ReadData(buf []byte, offset uint64) (uint32, error) {
-	n, err := f.tmpFile.ReadAt(buf, int64(offset))
-	return uint32(n), err
-}
-
-func (f *objectStoreReadWriteFile) Fsync() error {
-
-	if !f.dirty.Load() {
-		return nil
-	}
-
-	tmpFileStat, err := f.tmpFile.Stat()
-	if err != nil {
-		return err
-	}
-
-	var nLink uint32
-
-	_, err = f.fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-		stat, err := f.fs.txGetStat(tx, f.ino).Get()
-		if err != nil {
-			return nil, err
-		}
-		if stat.Size != 0 {
-			// Object storage files can only be written once.
-			return nil, ErrNotSupported
-		}
-
-		nLink = stat.Nlink
-
-		stat.Size = uint64(tmpFileStat.Size())
-		if stat.Nlink != 0 {
-			f.fs.txSubvolumeByteDelta(tx, stat.Subvolume, int64(stat.Size))
-		}
-		f.fs.txSetStat(tx, stat)
-		return nil, nil
-	})
-	if err != nil {
-		return err
-	}
-
-	if tmpFileStat.Size() == 0 {
-		// No point in uploading an empty object.
-		f.dirty.Store(false)
-		return nil
-	}
-
-	if nLink == 0 {
-		// We don't want to ever upload an object for an unlinked file
-		// as that could cause orphaned objects in the object store.
-		f.dirty.Store(false)
-		return nil
-	}
-
-	_, err = f.fs.objectStorage.Write(f.fs.fsName, f.ino, f.tmpFile)
-	if err != nil {
-		return err
-	}
-
-	f.dirty.Store(false)
-	return nil
-}
-
-func (f *objectStoreReadWriteFile) Close() error {
-	_ = f.tmpFile.Close()
-	return nil
-}
-
 type OpenFileOpts struct {
 	Truncate bool
 }
@@ -1295,7 +935,6 @@ type OpenFileOpts struct {
 func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 	var stat Stat
 	_, err := fs.Transact(func(tx fdb.Transaction) (interface{}, error) {
-
 		existingStat, err := fs.txGetStat(tx, ino).Get()
 		if err != nil {
 			return nil, err
@@ -1324,55 +963,31 @@ func (fs *Fs) OpenFile(ino uint64, opts OpenFileOpts) (HafsFile, Stat, error) {
 
 		return nil, nil
 	})
+	if err != nil {
+		return nil, Stat{}, err
+	}
 
-	var f HafsFile
-	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
-		f = &foundationDBFile{
-			fs:  fs,
-			ino: stat.Ino,
-		}
-	} else {
+	if stat.Flags&FLAG_OBJECT_STORAGE != 0 {
 		if stat.Size == 0 {
-			tmpFile, err := os.CreateTemp("", "")
+			f, err := newObjectStoreReadWriteFile(fs, stat.Ino)
 			if err != nil {
 				return nil, Stat{}, err
 			}
-			// XXX Make file anonymous, it would be nice to create it like this.
-			err = os.Remove(tmpFile.Name())
-			if err != nil {
-				return nil, Stat{}, err
-			}
-
-			f = &objectStoreReadWriteFile{
-				fs:      fs,
-				dirty:   atomicBool{},
-				ino:     stat.Ino,
-				tmpFile: tmpFile,
-			}
+			return f, stat, nil
 		} else {
-			if stat.Size >= fs.smallObjectThreshold {
-				storageObject, exists, err := fs.objectStorage.Open(fs.fsName, stat.Ino)
-				if err != nil {
-					return nil, Stat{}, err
-				}
-				if !exists {
-					f = &zeroFile{size: stat.Size}
-				} else {
-					f = &objectStoreReadOnlyFile{
-						storageObject: storageObject,
-					}
-				}
-			} else {
-				f = &objectStoreSmallReadOnlyFile{
-					fs:   fs,
-					ino:  stat.Ino,
-					size: stat.Size,
-				}
+			f, err := newObjectStoreReadOnlyFile(fs, stat.Ino, stat.Size)
+			if err != nil {
+				return nil, Stat{}, err
 			}
+			return f, stat, nil
 		}
 	}
 
-	return f, stat, err
+	f := &fdbBackedFile{
+		fs:  fs,
+		ino: stat.Ino,
+	}
+	return f, stat, nil
 }
 
 type CreateFileOpts struct {
@@ -1393,32 +1008,18 @@ func (fs *Fs) CreateFile(dirIno uint64, name string, opts CreateFileOpts) (HafsF
 		return nil, Stat{}, err
 	}
 
-	var f HafsFile
-
-	if stat.Flags&FLAG_OBJECT_STORAGE == 0 {
-		f = &foundationDBFile{
-			fs:  fs,
-			ino: stat.Ino,
-		}
-	} else {
-		tmpFile, err := os.CreateTemp("", "")
+	if stat.Flags&FLAG_OBJECT_STORAGE != 0 {
+		f, err := newObjectStoreReadWriteFile(fs, stat.Ino)
 		if err != nil {
 			return nil, Stat{}, err
 		}
-		// XXX Make file anonymous, it would be nice to create it like this.
-		err = os.Remove(tmpFile.Name())
-		if err != nil {
-			return nil, Stat{}, err
-		}
-
-		f = &objectStoreReadWriteFile{
-			fs:      fs,
-			dirty:   atomicBool{},
-			ino:     stat.Ino,
-			tmpFile: tmpFile,
-		}
+		return f, stat, nil
 	}
 
+	f := &fdbBackedFile{
+		fs:  fs,
+		ino: stat.Ino,
+	}
 	return f, stat, err
 }
 
@@ -1579,14 +1180,14 @@ func (fs *Fs) txModStat(tx fdb.Transaction, ino uint64, opts ModStatOpts) (Stat,
 				return Stat{}, ErrInvalid
 			}
 
-			clearBegin := (stat.Size + (CHUNK_SIZE - stat.Size%4096)) / CHUNK_SIZE
+			clearBegin := (stat.Size + (PAGE_SIZE - stat.Size%4096)) / PAGE_SIZE
 			_, clearEnd := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data"}.FDBRangeKeys()
 			tx.ClearRange(fdb.KeyRange{
 				Begin: tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data", clearBegin},
 				End:   clearEnd,
 			})
-			lastChunkIdx := stat.Size / CHUNK_SIZE
-			lastChunkSize := stat.Size % CHUNK_SIZE
+			lastChunkIdx := stat.Size / PAGE_SIZE
+			lastChunkSize := stat.Size % PAGE_SIZE
 			lastChunkKey := tuple.Tuple{"hafs", fs.fsName, "ino", ino, "data", lastChunkIdx}
 			if lastChunkSize == 0 {
 				tx.Clear(lastChunkKey)

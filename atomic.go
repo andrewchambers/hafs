@@ -31,3 +31,31 @@ func (b *atomicUint64) Add(n uint64) uint64 {
 func (b *atomicUint64) Load() uint64 {
 	return atomic.LoadUint64(&b.v)
 }
+
+func (b *atomicUint64) CompareAndSwap(old, new uint64) bool {
+	return atomic.CompareAndSwapUint64(&b.v, old, new)
+}
+
+type AtomicBitset []atomicUint64
+
+func NewAtomicBitset(size uint) AtomicBitset {
+	size = (size + 63) &^ 63
+	return make(AtomicBitset, size/64)
+}
+
+func (a AtomicBitset) index(bit uint) (ptr *atomicUint64, mask uint64) {
+	return &a[bit/64], 1 << (bit & 63)
+}
+
+func (a AtomicBitset) Set(bit uint) {
+	ptr, mask := a.index(bit)
+	old := ptr.Load()
+	for !ptr.CompareAndSwap(old, old|mask) {
+		old = ptr.Load()
+	}
+}
+
+func (a AtomicBitset) IsSet(bit uint) bool {
+	ptr, mask := a.index(bit)
+	return ptr.Load()&mask != 0
+}
